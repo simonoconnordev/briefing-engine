@@ -1,0 +1,468 @@
+<title>Briefing Engine Skills</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+<style>
+/* Layout: a printed booklet on screen. A cover sheet, then one white sheet per skill group stacked on a paper ground, each with a running footer and page number. Light only by choice, to match the field guide and portfolio pages. */
+:root {
+  --paper:   #E9EDF2;
+  --sheet:   #FFFFFF;
+  --ink:     #16202E;
+  --muted:   #5A6676;
+  --line:    #D5DCE4;
+  --accent:  #B5501A;
+  --tint:    #FBEEE4;
+  --chip:    #EEF2F6;
+  --ok:      #1B7A5A;
+  color-scheme: light;
+  --font-display: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+  --font-body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+}
+
+body { background: var(--paper); color: var(--ink); font: 400 16.5px/1.7 var(--font-body); }
+.book {
+  max-width: 860px; margin: 0 auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 40px 64px;
+  display: grid; gap: 28px;
+}
+.sheet {
+  background: var(--sheet); border: 1px solid var(--line); border-radius: 4px;
+  box-shadow: 0 1px 2px rgba(22, 32, 46, 0.05), 0 8px 24px rgba(22, 32, 46, 0.06);
+  padding: clamp(24px, 6vw, 56px) clamp(20px, 6vw, 64px) 22px;
+  min-width: 0; display: flex; flex-direction: column;
+}
+.sheet-body { flex: 1; min-width: 0; }
+.folio {
+  margin-top: 36px; padding-top: 12px; border-top: 1px solid var(--line);
+  display: flex; justify-content: space-between; gap: 12px;
+  font: 400 12px/1.4 var(--font-mono); color: var(--muted); letter-spacing: 0.04em;
+}
+
+/* Cover */
+.cover { padding-top: clamp(32px, 8vw, 72px); }
+.eyebrow { font: 500 12px/1.4 var(--font-mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent); margin: 0 0 14px; }
+h1 { font: 700 clamp(2.1rem, 6vw, 3.4rem)/1.04 var(--font-display); letter-spacing: -0.015em; margin: 0 0 18px; text-wrap: balance; max-width: 16ch; }
+.lede { font-size: 1.14rem; color: var(--muted); max-width: 60ch; margin: 0 0 8px; }
+.contents { margin: 34px 0 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 0 32px; border-top: 1px solid var(--line); }
+.contents li { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--line); }
+.contents a { color: var(--ink); text-decoration: none; }
+.contents a:hover { color: var(--accent); }
+.contents .pg { font: 400 13px/1.7 var(--font-mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+
+/* Group pages */
+.group-tag { font: 500 12px/1.4 var(--font-mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent); margin: 0 0 8px; }
+h2 { font: 700 clamp(1.6rem, 4vw, 2.2rem)/1.12 var(--font-display); letter-spacing: -0.01em; margin: 0 0 16px; text-wrap: balance; }
+p { margin: 0 0 0.9em; max-width: 66ch; }
+.intro { font-size: 1.06rem; }
+.skill { margin-top: 28px; padding-top: 22px; border-top: 1px solid var(--line); }
+.skill-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 16px; margin-bottom: 8px; }
+h3 { font: 600 1.2rem/1.3 var(--font-display); margin: 0; text-wrap: balance; }
+.ref { font: 400 12px/1.4 var(--font-mono); color: var(--muted); background: var(--chip); padding: 3px 8px; border-radius: 4px; white-space: nowrap; }
+.skill p:last-child { margin-bottom: 0; }
+code { font: 400 0.87em/1 var(--font-mono); background: var(--chip); padding: 2px 5px; border-radius: 4px; }
+
+/* Figures */
+figure { margin: 30px 0; }
+.diagram { overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; padding: 12px; background: var(--sheet); }
+.diagram svg { display: block; width: 100%; min-width: 640px; height: auto; font-family: var(--font-body); }
+figcaption { font-size: 0.9rem; color: var(--muted); margin-top: 10px; max-width: 66ch; }
+figcaption b { color: var(--ink); font-weight: 600; }
+svg text { fill: var(--ink); }
+svg .t-head { font-weight: 600; font-size: 14px; }
+svg .t-sm { font-size: 11.5px; fill: var(--muted); }
+svg .t-acc { font: 500 11px var(--font-mono); fill: var(--accent); letter-spacing: 0.06em; }
+svg .bx { fill: var(--sheet); stroke: var(--line); stroke-width: 1.5; }
+svg .bx-pg { fill: var(--tint); stroke: var(--accent); stroke-width: 1.5; }
+svg .bx-ghost { fill: none; stroke: var(--muted); stroke-width: 1.2; stroke-dasharray: 5 4; }
+svg .bx-band { fill: var(--chip); stroke: var(--line); stroke-width: 1.2; }
+svg .wire { fill: none; stroke: var(--muted); stroke-width: 1.4; }
+svg .wire-acc { fill: none; stroke: var(--accent); stroke-width: 1.5; }
+svg .wire-dash { fill: none; stroke: var(--muted); stroke-width: 1.2; stroke-dasharray: 4 4; }
+svg .ah { fill: var(--muted); }
+svg .ah-acc { fill: var(--accent); }
+
+/* Closing page */
+.questions { margin: 8px 0 0; padding-left: 1.3em; }
+.questions li { margin: 0 0 0.6em; max-width: 64ch; }
+.questions li::marker { color: var(--accent); }
+
+a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+@media (max-width: 520px) { body { font-size: 16px; } .folio span:first-child { display: none; } }
+</style>
+
+<div class="book">
+
+  <!-- Cover -->
+  <section class="sheet cover" aria-labelledby="cover-title">
+    <div class="sheet-body">
+      <p class="eyebrow">Briefing engine</p>
+      <h1 id="cover-title">Skills for a backend developer</h1>
+      <p class="lede">The briefing engine collects news from RSS feeds, scores each article with a language model against each reader's interests, and delivers a short written briefing every morning. It is small enough for one developer to build and understand completely, yet it meets almost every problem that larger backend systems face, from duplicate work and concurrent spending to unreliable networks and unpredictable model output.</p>
+      <p class="lede">The project is at the design stage. The plan is written and reviewed, and the code is about to begin, so the skills described here are the ones the build is designed to teach.</p>
+      <ol class="contents">
+        <li><a href="#project">The project and its lessons</a><span class="pg">2</span></li>
+        <li><a href="#reliability">Reliability and correctness</a><span class="pg">3</span></li>
+        <li><a href="#databases">Databases</a><span class="pg">4</span></li>
+        <li><a href="#apis">APIs and integration</a><span class="pg">5</span></li>
+        <li><a href="#llms">Working with LLMs in production</a><span class="pg">6</span></li>
+        <li><a href="#cloud">Cloud and operations</a><span class="pg">7</span></li>
+        <li><a href="#testing">Testing</a><span class="pg">8</span></li>
+        <li><a href="#judgement">Engineering judgement</a><span class="pg">9</span></li>
+        <li><a href="#interview">Why it matters in an interview</a><span class="pg">10</span></li>
+      </ol>
+    </div>
+    <div class="folio"><span>Briefing engine · Skills for a backend developer</span><span>1</span></div>
+  </section>
+
+  <!-- Project -->
+  <section class="sheet" id="project" aria-labelledby="project-title">
+    <div class="sheet-body">
+      <p class="group-tag">Overview</p>
+      <h2 id="project-title">The project and its lessons</h2>
+      <p class="intro">The briefing engine replaces Horizon, an open-source news aggregator that produced a daily AI briefing from a scheduled task on a single machine. Getting Horizon to run reliably exposed three bugs: the model API rejected a parameter that the fallback code did not recognise, Reddit's feed returned <code>429 Too Many Requests</code> when requests arrived in bursts, and the email's HTML was escaped twice. Each of those failures became a requirement for the new design.</p>
+      <p>The replacement is designed as one Python codebase that runs as two kinds of process, an API and a worker, with a single PostgreSQL database holding both the data and the queue of work. It will be built in three stages, each with a clear definition of done. The first stage serves one user, the second turns it into a multi-user service on AWS, and the third adds shared caching, enforced budgets, signed webhooks and a load test.</p>
+      <p>The first stage is itself split into four checkpoints: one complete briefing, then making it repeatable and recoverable, then the full daily briefing, and finally a week running alongside Horizon. Each checkpoint ends in something that can be run and inspected, so problems surface while they are still easy to trace.</p>
+      <p>Figure 1 places the skills on a map of the system. Every component teaches something, and several skills, such as reliability and testing, run through all of them.</p>
+
+      <figure>
+        <div class="diagram">
+          <svg viewBox="0 0 900 446" role="img" aria-label="Map of the skills the briefing engine teaches. At the top, engineering judgement covers the written design, decision records and measured results. A dashed frame labelled cloud and operations surrounds the running system: ECS Fargate, RDS, Terraform, CI/CD with OIDC, logs, metrics and alarms. Inside it, the REST API box covers keys, cursors and idempotency keys. The pipeline runs from fetch, which covers rate limits, ETag and Retry-After, to score, using Haiku 5.5 with JSON output cached per rubric, to write up, using Sonnet 5.5 with per-user budgets, to deliver, which covers escaping once and signed webhooks. The API, fetch and deliver are marked as APIs and integration; score and write up are marked as LLMs in production. Beneath them, a PostgreSQL band labelled databases and reliability holds the data, the job queue with leases and SKIP LOCKED, rate limits and budgets. At the bottom, a testing strip lists real Postgres, fake feed and Anthropic servers, property tests, golden files, k6 load tests and outage drills.">
+            <defs>
+              <marker id="map-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+            </defs>
+
+            <rect class="bx-band" x="20" y="16" width="860" height="38" rx="6"/>
+            <text class="t-head" x="36" y="40">Engineering judgement</text>
+            <text class="t-sm" x="214" y="40">a written design, decision records with rejected options, and measured results</text>
+
+            <rect class="bx-ghost" x="20" y="70" width="860" height="300" rx="10"/>
+            <text class="t-head" x="36" y="96">Cloud and operations</text>
+            <text class="t-sm" x="196" y="96">ECS Fargate, RDS, Terraform, CI/CD with GitHub OIDC, logs, metrics, alarms</text>
+
+            <line class="wire" x1="40" y1="134" x2="340" y2="134"/>
+            <line class="wire" x1="40" y1="134" x2="40" y2="141"/>
+            <line class="wire" x1="340" y1="134" x2="340" y2="141"/>
+            <text class="t-acc" x="190" y="126" text-anchor="middle">APIS AND INTEGRATION</text>
+            <line class="wire" x1="380" y1="134" x2="680" y2="134"/>
+            <line class="wire" x1="380" y1="134" x2="380" y2="141"/>
+            <line class="wire" x1="680" y1="134" x2="680" y2="141"/>
+            <text class="t-acc" x="530" y="126" text-anchor="middle">LLMS IN PRODUCTION</text>
+            <line class="wire" x1="720" y1="134" x2="860" y2="134"/>
+            <line class="wire" x1="720" y1="134" x2="720" y2="141"/>
+            <line class="wire" x1="860" y1="134" x2="860" y2="141"/>
+            <text class="t-acc" x="790" y="126" text-anchor="middle">INTEGRATION</text>
+
+            <rect class="bx" x="40" y="150" width="130" height="80" rx="8"/>
+            <text class="t-head" x="105" y="178" text-anchor="middle">REST API</text>
+            <text class="t-sm" x="105" y="198" text-anchor="middle">keys, cursors</text>
+            <text class="t-sm" x="105" y="214" text-anchor="middle">idempotency keys</text>
+
+            <rect class="bx" x="210" y="150" width="130" height="80" rx="8"/>
+            <text class="t-head" x="275" y="178" text-anchor="middle">Fetch</text>
+            <text class="t-sm" x="275" y="198" text-anchor="middle">per-host limits</text>
+            <text class="t-sm" x="275" y="214" text-anchor="middle">ETag, Retry-After</text>
+
+            <rect class="bx" x="380" y="150" width="130" height="80" rx="8"/>
+            <text class="t-head" x="445" y="178" text-anchor="middle">Score</text>
+            <text class="t-sm" x="445" y="198" text-anchor="middle">Haiku 5.5, JSON</text>
+            <text class="t-sm" x="445" y="214" text-anchor="middle">cached per rubric</text>
+
+            <rect class="bx" x="550" y="150" width="130" height="80" rx="8"/>
+            <text class="t-head" x="615" y="178" text-anchor="middle">Write up</text>
+            <text class="t-sm" x="615" y="198" text-anchor="middle">Sonnet 5.5</text>
+            <text class="t-sm" x="615" y="214" text-anchor="middle">per-user budgets</text>
+
+            <rect class="bx" x="720" y="150" width="140" height="80" rx="8"/>
+            <text class="t-head" x="790" y="178" text-anchor="middle">Deliver</text>
+            <text class="t-sm" x="790" y="198" text-anchor="middle">escape exactly once</text>
+            <text class="t-sm" x="790" y="214" text-anchor="middle">signed webhooks</text>
+
+            <line class="wire-acc" x1="340" y1="190" x2="378" y2="190" marker-end="url(#map-a)"/>
+            <line class="wire-acc" x1="510" y1="190" x2="548" y2="190" marker-end="url(#map-a)"/>
+            <line class="wire-acc" x1="680" y1="190" x2="718" y2="190" marker-end="url(#map-a)"/>
+
+            <line class="wire-dash" x1="105" y1="230" x2="105" y2="270"/>
+            <line class="wire-dash" x1="275" y1="230" x2="275" y2="270"/>
+            <line class="wire-dash" x1="445" y1="230" x2="445" y2="270"/>
+            <line class="wire-dash" x1="615" y1="230" x2="615" y2="270"/>
+            <line class="wire-dash" x1="790" y1="230" x2="790" y2="270"/>
+
+            <rect class="bx-pg" x="40" y="270" width="820" height="72" rx="8"/>
+            <text class="t-head" x="56" y="298">Databases and reliability</text>
+            <text class="t-sm" x="56" y="322">PostgreSQL holds the data, the job queue with leases and SKIP LOCKED, the rate limits and the budgets</text>
+
+            <rect class="bx-band" x="20" y="388" width="860" height="42" rx="6"/>
+            <text class="t-head" x="36" y="414">Testing</text>
+            <text class="t-sm" x="104" y="414">real Postgres, fake feed and Anthropic servers, property tests, golden files, k6 load tests, outage drills</text>
+          </svg>
+        </div>
+        <figcaption><b>Figure 1</b> Where each group of skills appears in the system. Work flows from left to right, and every hand-off between stages is a row committed to PostgreSQL.</figcaption>
+      </figure>
+
+      <p>The skills are not all learnt at once. Each stage of the build introduces a new set, as Figure 2 shows, so the project grows in difficulty at the same pace as the system grows in scope.</p>
+
+      <figure>
+        <div class="diagram">
+          <svg viewBox="0 0 900 236" role="img" aria-label="The three build stages and the skills each one introduces. Stage 1, replacing Horizon for one user: Postgres schema and migrations, the job queue with leases and retries, polite fetching and deduplication, LLM scoring with a cache and cost ledger, and email escaping with golden tests. Stage 2, a multi-user service on AWS: the REST API with keys and cursors, Idempotency-Key handling, Terraform and ECS Fargate, CI/CD with GitHub OIDC, and logs, metrics and health checks. Stage 3, shared caching and proof: budgets with reservations, signed webhooks with dead letters, shared caching across users, a k6 load test with outage drills, and a case study with real numbers.">
+            <defs>
+              <marker id="stg-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+            </defs>
+            <rect class="bx" x="20" y="20" width="266" height="196" rx="8"/>
+            <text class="t-acc" x="38" y="46">STAGE 1</text>
+            <text class="t-head" x="38" y="68">Replace Horizon for one user</text>
+            <text class="t-sm" x="38" y="100">Postgres schema and migrations</text>
+            <text class="t-sm" x="38" y="122">job queue, leases and retries</text>
+            <text class="t-sm" x="38" y="144">polite fetching and deduplication</text>
+            <text class="t-sm" x="38" y="166">LLM scoring, cache, cost ledger</text>
+            <text class="t-sm" x="38" y="188">email escaping, golden tests</text>
+
+            <rect class="bx" x="317" y="20" width="266" height="196" rx="8"/>
+            <text class="t-acc" x="335" y="46">STAGE 2</text>
+            <text class="t-head" x="335" y="68">Multi-user service on AWS</text>
+            <text class="t-sm" x="335" y="100">REST API, keys and cursors</text>
+            <text class="t-sm" x="335" y="122">Idempotency-Key handling</text>
+            <text class="t-sm" x="335" y="144">Terraform and ECS Fargate</text>
+            <text class="t-sm" x="335" y="166">CI/CD with GitHub OIDC</text>
+            <text class="t-sm" x="335" y="188">logs, metrics, health checks</text>
+
+            <rect class="bx" x="614" y="20" width="266" height="196" rx="8"/>
+            <text class="t-acc" x="632" y="46">STAGE 3</text>
+            <text class="t-head" x="632" y="68">Shared caching and proof</text>
+            <text class="t-sm" x="632" y="100">budgets with reservations</text>
+            <text class="t-sm" x="632" y="122">signed webhooks, dead letters</text>
+            <text class="t-sm" x="632" y="144">shared caching across users</text>
+            <text class="t-sm" x="632" y="166">k6 load test, outage drills</text>
+            <text class="t-sm" x="632" y="188">case study with real numbers</text>
+
+            <line class="wire-acc" x1="287" y1="118" x2="315" y2="118" marker-end="url(#stg-a)"/>
+            <line class="wire-acc" x1="584" y1="118" x2="612" y2="118" marker-end="url(#stg-a)"/>
+          </svg>
+        </div>
+        <figcaption><b>Figure 2</b> The skills each stage of the build introduces. Every stage ends with a definition of done that can be checked, and stage 1 reaches it through four smaller checkpoints.</figcaption>
+      </figure>
+
+      <p>The thread that connects all of these skills is a single goal: the system must keep working correctly when things go wrong. That goal is where the skills begin.</p>
+    </div>
+    <div class="folio"><span>Briefing engine · Skills for a backend developer</span><span>2</span></div>
+  </section>
+
+  <!-- Reliability -->
+  <section class="sheet" id="reliability" aria-labelledby="rel-title">
+    <div class="sheet-body">
+      <p class="group-tag">Skill group</p>
+      <h2 id="rel-title">Reliability and correctness</h2>
+      <p class="intro">Most of what makes the briefing engine more than a script is the work it does to stay correct when something fails. In a system with several workers, crashes, timeouts and retries are normal events, so the design has to make each of them harmless.</p>
+
+      <div class="skill">
+        <div class="skill-head"><h3>Idempotency</h3><span class="ref">plan §2, §6.6, §5.1</span></div>
+        <p>An operation is idempotent when running it twice has the same effect as running it once. Every step in the briefing engine is designed this way, using upserts, unique constraints, idempotency keys and cached model results. The goal is that re-running a job, or an entire day, stores no duplicate rows, sends no second email and costs close to nothing, and the second checkpoint exists to prove it.</p>
+        <p>This is the most transferable skill in the project, because any system that retries work depends on it.</p>
+      </div>
+
+      <div class="skill">
+        <div class="skill-head"><h3>Concurrency control</h3><span class="ref">plan §9.1, §7.7</span></div>
+        <p>Several workers run at the same time, and they must share both work and money without interfering with each other. Workers claim jobs with <code>SELECT … FOR UPDATE SKIP LOCKED</code>, so two of them never take the same job. A Postgres advisory lock ensures that only one copy of the scheduler runs, and a conditional <code>UPDATE</code> protects each user's budget when many jobs try to spend it at once.</p>
+        <p>Each job also commits its result together with the jobs that follow it, in one transaction, so a crash can never leave the system with half of a step recorded.</p>
+      </div>
+
+      <div class="skill">
+        <div class="skill-head"><h3>Failure handling</h3><span class="ref">plan §6.3, §9.1, §8.3</span></div>
+        <p>Failures are treated as expected events, each with a response decided in advance. Requests are retried with exponential backoff and jitter. A job's lease expires if its worker dies, which lets another worker pick the job up. Work that keeps failing moves to a dead-letter table where it can be inspected and replayed.</p>
+        <p>Underneath all of this, every job moves through a state machine that always reaches a final state, so nothing is left waiting forever.</p>
+      </div>
+    </div>
+    <div class="folio"><span>Briefing engine · Skills for a backend developer</span><span>3</span></div>
+  </section>
+
+  <!-- Databases -->
+  <section class="sheet" id="databases" aria-labelledby="db-title">
+    <div class="sheet-body">
+      <p class="group-tag">Skill group</p>
+      <h2 id="db-title">Databases</h2>
+      <p class="intro">Because PostgreSQL sits at the centre of the design, the project teaches far more about it than writing queries. The database is where most of the reliability guarantees are actually enforced.</p>
+
+      <div class="skill">
+        <div class="skill-head"><h3>Schema design</h3><span class="ref">plan §4</span></div>
+        <p>A multi-user service has to decide who owns each row. Feeds, articles and scores are facts about the world, so they are stored once and shared by everyone. Rubrics, briefings, budgets and deliveries belong to individual users. This split is what keeps the cost of fetching and scoring roughly flat as more users join.</p>
+        <p>The rules that must never break, such as one briefing per user per day, are enforced by Postgres itself through constraints and partial unique indexes. A bug in the application code therefore cannot violate them.</p>
+      </div>
+
+      <div class="skill">
+        <div class="skill-head"><h3>Postgres as infrastructure</h3><span class="ref">plan §6.2, §9.1, §9.2</span></div>
+        <p>The same database serves as the system of record, the job queue and the per-host rate limiter. Keeping everything in one place lets related changes commit together, and it removes the need to run a separate message broker.</p>
+        <p>The plan also compares the Postgres queue with Amazon SQS, and the load test measures queue contention to show when that choice should be revisited. Knowing where an approach stops being enough is as valuable as knowing how to use it.</p>
+      </div>
+
+      <div class="skill">
+        <div class="skill-head"><h3>Migrations</h3><span class="ref">plan §4.3, §12.3</span></div>
+        <p>The schema changes as the system grows, and Alembic migrations apply those changes while the service keeps running. The readiness endpoint reports the schema version, and a deploy continues only when the database is at least at the version the new code expects. This is how teams avoid releasing code against a schema it cannot work with.</p>
+      </div>
+    </div>
+    <div class="folio"><span>Briefing engine · Skills for a backend developer</span><span>4</span></div>
+  </section>
+
+  <!-- APIs -->
+  <section class="sheet" id="apis" aria-labelledby="api-title">
+    <div class="sheet-body">
+      <p class="group-tag">Skill group</p>
+      <h2 id="api-title">APIs and integration</h2>
+      <p class="intro">The service talks to the outside world in three directions. Clients call its API, it fetches content from servers that belong to other people, and it sends results to systems it does not control. Each direction teaches a different set of habits, and security runs through all three.</p>
+
+      <div class="skill">
+        <div class="skill-head"><h3>REST API design</h3><span class="ref">plan §5</span></div>
+        <p>There is no web front end, so the API under <code>/v1</code> is the whole interface. It authenticates clients with hashed API keys and scopes, and it pages through constantly growing lists with signed cursors that never repeat a row. Every error is reported in the same <code>problem+json</code> format.</p>
+        <p>Clients can also send an <code>Idempotency-Key</code> header, so a request that is retried after a timeout cannot create the same thing twice.</p>
+      </div>
+
+      <div class="skill">
+        <div class="skill-head"><h3>Being a good HTTP client</h3><span class="ref">plan §6.2, §6.3, §6.4</span></div>
+        <p>Fetching feeds from hosts you do not control requires good manners. The fetcher limits how often it contacts each host, waits as long as a <code>Retry-After</code> header asks, and backs off when a host is struggling. It sends conditional requests with <code>ETag</code> and <code>Last-Modified</code>, so a feed that has not changed is not downloaded again.</p>
+        <p>These habits come from a real failure. Reddit's feed answered <code>429 Too Many Requests</code> when the old system sent requests in bursts, and the briefing went out without those sources.</p>
+      </div>
+
+      <div class="skill">
+        <div class="skill-head"><h3>Webhooks</h3><span class="ref">plan §8.2, §8.3</span></div>
+        <p>Users can receive their briefing as an HTTP request to their own server. Each request is signed with HMAC in the Standard Webhooks format, so the receiver can prove that it came from the service and was not altered on the way. Signing secrets can be rotated, and a retry schedule with dead letters and replay means that a receiver which was offline for hours still receives every event.</p>
+      </div>
+
+      <div class="skill">
+        <div class="skill-head"><h3>Security basics</h3><span class="ref">plan §6.1, §7.2, §8.1</span></div>
+        <p>Three defences recur throughout the design. Once users can submit URLs, an SSRF guard stops the service from being tricked into fetching internal addresses, such as the endpoint that hands out cloud credentials. HTML is escaped in exactly one place, the email template, after the old system escaped it twice and showed apostrophes as <code>&amp;#x27;</code>.</p>
+        <p>Finally, article text is always treated as data when it is sent to the model, which guards against prompt injection hidden in feeds written by strangers.</p>
+      </div>
+    </div>
+    <div class="folio"><span>Briefing engine · Skills for a backend developer</span><span>5</span></div>
+  </section>
+
+  <!-- LLMs -->
+  <section class="sheet" id="llms" aria-labelledby="llm-title">
+    <div class="sheet-body">
+      <p class="group-tag">Skill group</p>
+      <h2 id="llm-title">Working with LLMs in production</h2>
+      <p class="intro">The language model is the only part of the system that costs money on every call, the only part whose output cannot be fully predicted, and the only part that reads text written by strangers. Using it in production is therefore mostly a matter of control.</p>
+
+      <div class="skill">
+        <div class="skill-head"><h3>Choosing the right model for each job</h3><span class="ref">plan §7.1</span></div>
+        <p>Claude Haiku 5.5 scores every new article, because that work is high in volume and needs to be fast and cheap. Claude Sonnet 5.5 writes the final summary, which happens once per user each day and benefits from a stronger writer.</p>
+        <p>The choice is checked with evidence. An evaluation compares the cheaper model's scores with labels assigned by hand before the split is relied on.</p>
+      </div>
+
+      <div class="skill">
+        <div class="skill-head"><h3>Structured output and validation</h3><span class="ref">plan §7.3, §7.4</span></div>
+        <p>The model must answer in a fixed JSON shape, and the application validates every response before anything is stored. When the output is malformed or incomplete, the plan has already decided what happens next, such as splitting a batch and retrying the articles individually. A bad answer therefore never finds its way silently into a briefing.</p>
+      </div>
+
+      <div class="skill">
+        <div class="skill-head"><h3>Caching and cost control</h3><span class="ref">plan §7.5, §7.7</span></div>
+        <p>Scores are cached by a hash of the exact text the model reads together with the rubric, so the same question is never paid for twice, and re-running a day costs almost nothing. Every call is recorded in a ledger with its token counts and cost.</p>
+        <p>From the third stage, each user also has a budget that concurrent jobs cannot overspend. Before a call is made, its maximum possible cost is reserved with a single conditional update. If a worker crashes mid-call, the reservation is counted as uncertain spend instead of being released, so the same money can never be spent twice. The guarantee depends on the estimate really being an upper bound, which the ledger checks on every call.</p>
+      </div>
+    </div>
+    <div class="folio"><span>Briefing engine · Skills for a backend developer</span><span>6</span></div>
+  </section>
+
+  <!-- Cloud -->
+  <section class="sheet" id="cloud" aria-labelledby="cloud-title">
+    <div class="sheet-body">
+      <p class="group-tag">Skill group</p>
+      <h2 id="cloud-title">Cloud and operations</h2>
+      <p class="intro">The second stage moves the service from a laptop into AWS, with one firm rule: nothing is configured by hand. Everything that runs in the cloud can be recreated from code in an empty account.</p>
+
+      <div class="skill">
+        <div class="skill-head"><h3>Infrastructure as code</h3><span class="ref">plan §11.1, §11.2</span></div>
+        <p>Terraform creates the whole environment. That includes ECS Fargate services for the API and the worker, an RDS PostgreSQL database in private subnets, Secrets Manager for credentials and the networking that connects them.</p>
+        <p>The plan also records why always-on containers suit this workload better than Lambda functions. Trade-offs of that kind are exactly what interviewers like to probe.</p>
+      </div>
+
+      <div class="skill">
+        <div class="skill-head"><h3>CI/CD</h3><span class="ref">plan §10, §11.2</span></div>
+        <p>Every pull request runs linting, type checks and the test suites. Deploys authenticate to AWS through GitHub's OIDC provider, so no long-lived access keys are stored anywhere. A deploy builds the image, runs the migrations and rolls out the new version, with an approval step guarding production.</p>
+      </div>
+
+      <div class="skill">
+        <div class="skill-head"><h3>Observability</h3><span class="ref">plan §12</span></div>
+        <p>Structured logs, metrics, worker heartbeats and CloudWatch alarms together show whether the system is healthy. A liveness endpoint serves the load balancer, and a separate readiness endpoint gates deploys.</p>
+        <p>The stage is not finished until an alarm has fired in a test and its email has arrived. That requirement proves that the monitoring works, instead of assuming it.</p>
+      </div>
+    </div>
+    <div class="folio"><span>Briefing engine · Skills for a backend developer</span><span>7</span></div>
+  </section>
+
+  <!-- Testing -->
+  <section class="sheet" id="testing" aria-labelledby="test-title">
+    <div class="sheet-body">
+      <p class="group-tag">Skill group</p>
+      <h2 id="test-title">Testing</h2>
+      <p class="intro">The guarantees that matter most in the briefing engine are the hardest to observe, because many of them fail only under timing that rarely happens on a laptop. The testing strategy is designed to make those failures appear on demand.</p>
+
+      <div class="skill">
+        <div class="skill-head"><h3>Testing the hard parts</h3><span class="ref">plan §10</span></div>
+        <p>Anything involving concurrency or database constraints is tested against a real PostgreSQL 17 instance, because a mock can only repeat your own assumptions. Property-based tests with Hypothesis search for inputs that break URL normalisation and hashing, and golden files lock down the exact HTML of the email.</p>
+        <p>Fake feed and Anthropic servers complete the picture. They reproduce slow responses, rate limits and outages whenever a test needs them, without touching any real service.</p>
+      </div>
+
+      <div class="skill">
+        <div class="skill-head"><h3>Load testing and outage drills</h3><span class="ref">plan §13</span></div>
+        <p>A k6 load test sends a constant 50 requests per second for ten minutes, whatever the response time. Holding the arrival rate fixed stops a slow server from appearing fast simply because it received fewer requests.</p>
+        <p>Scripted drills then break the system on purpose. They stop a worker mid-run, reboot the database, make the model API fail for twenty minutes and take a webhook receiver offline for three hours. The target for every drill is that no job is lost.</p>
+      </div>
+    </div>
+    <div class="folio"><span>Briefing engine · Skills for a backend developer</span><span>8</span></div>
+  </section>
+
+  <!-- Judgement -->
+  <section class="sheet" id="judgement" aria-labelledby="judge-title">
+    <div class="sheet-body">
+      <p class="group-tag">Skill group</p>
+      <h2 id="judge-title">Engineering judgement</h2>
+      <p class="intro">The last group of skills has less to do with code and more to do with how decisions are made, recorded and defended. It is also the group that interviewers value most.</p>
+
+      <div class="skill">
+        <div class="skill-head"><h3>Writing a design before the code</h3><span class="ref">plan §2, §15, §16</span></div>
+        <p>The whole design was written down and reviewed before the first line of code. It states goals and non-goals, records each significant decision together with the options that were rejected and the reasons, and keeps an explicit list of questions that are still open.</p>
+        <p>Working this way means that every decision can be reviewed and challenged by someone else, which is how experienced teams operate.</p>
+      </div>
+
+      <div class="skill">
+        <div class="skill-head"><h3>Building in small, checkable steps</h3><span class="ref">plan §14</span></div>
+        <p>A design review found that the first milestone bundled too many kinds of uncertainty together: a queue, ingestion, two model stages, caches, accounting and delivery recovery all had to work before the first briefing arrived. The plan now follows a working rule: settle what the next checkpoint needs, and record later decisions without building them early.</p>
+        <p>Learning to sequence work this way, so that each step produces evidence before the next one depends on it, is one of the most practical skills the project teaches.</p>
+      </div>
+
+      <div class="skill">
+        <div class="skill-head"><h3>Judging the product as well as the code</h3><span class="ref">plan §14</span></div>
+        <p>A briefing can be delivered reliably and still be unpleasant to read. From the first email, a short reading log records what was useful, what was misleading or annoying, and one thing to change, and those notes decide what to build next. Code can check lengths, references and repeated stories, but whether a summary is faithful and whether important stories were missed still need a person's judgement.</p>
+      </div>
+
+      <div class="skill">
+        <div class="skill-head"><h3>Measuring results</h3><span class="ref">plan §13</span></div>
+        <p>The metrics are defined before the system exists: cost per briefing before and after caching, fetches saved by conditional requests, API latency at the 95th percentile and recovery from outages. The project will end with a published case study that reports the real numbers, so every claim about the design can be checked.</p>
+      </div>
+    </div>
+    <div class="folio"><span>Briefing engine · Skills for a backend developer</span><span>9</span></div>
+  </section>
+
+  <!-- Interview -->
+  <section class="sheet" id="interview" aria-labelledby="int-title">
+    <div class="sheet-body">
+      <p class="group-tag">Closing</p>
+      <h2 id="int-title">Why it matters in an interview</h2>
+      <p class="intro">Almost any developer can learn a library from its documentation. Far fewer can explain the decisions behind a working system and show the evidence that those decisions were right.</p>
+      <p>Building the briefing engine gives you a concrete, tested answer to the questions that separate backend engineers from developers who have only written scripts. Each answer comes from a system you designed, built and measured yourself, which makes it far more convincing than an answer learnt from a book. Questions like these become straightforward:</p>
+      <ol class="questions">
+        <li>Why did you choose a Postgres queue instead of SQS, and what would make you change your mind?</li>
+        <li>What happens when a worker dies halfway through sending an email?</li>
+        <li>How does a user's budget hold when twenty jobs try to spend it at the same moment?</li>
+        <li>How do you stop a retried API request from creating the same resource twice?</li>
+        <li>How do you know your system recovers from an outage without losing work?</li>
+      </ol>
+      <p>Each of these has a short answer, a deeper explanation and a test or measurement behind it. That combination is what turns a portfolio project into evidence of backend engineering skill.</p>
+    </div>
+    <div class="folio"><span>Briefing engine · Skills for a backend developer</span><span>10</span></div>
+  </section>
+
+</div>

@@ -1,0 +1,634 @@
+<!-- ============================================================ -->
+<section class="ch" id="delivery">
+  <div class="ch-head"><span class="ch-num">Chapter 09</span><span class="plan-ref">plan §8, §5.2, §6.6, ADR-012</span><h2>Email and webhooks</h2></div>
+
+  <p>Delivery is the part of the system the reader sees: one email each morning and, from stage 3, a signed HTTP request to each webhook endpoint a user registers. The email puts text from feeds and a model into HTML that a mail client renders. The webhook goes to a server you don't control, over a network that can lose or repeat a request.</p>
+
+  <h3>What escaping is for</h3>
+  <p>In HTML, a few characters switch from text to markup. <code>&lt;</code> starts a tag, <code>&amp;</code> starts a character reference, and inside a quoted attribute the quote character ends the value. <b>Escaping</b> replaces each one with a character reference (<code>&lt;</code> becomes <code>&amp;lt;</code>, <code>&amp;</code> becomes <code>&amp;amp;</code>) that the client displays as the original character.</p>
+  <p>Without escaping, a title like <code>Why x &lt; y matters</code> loses text to a tag the parser tried to read, and a title containing <code>&lt;script&gt;</code> becomes live markup that can break the layout or disguise a link. The right treatment depends on the <b>output context</b>, the place where the text lands.</p>
+  <figure>
+    <div class="tbl"><table>
+      <thead><tr><th>Output context</th><th>Example in a template</th><th>What the text needs</th></tr></thead>
+      <tbody>
+        <tr><td>HTML element content</td><td><code>&lt;h2&gt;{{ item.title }}&lt;/h2&gt;</code></td><td>Escape <code>&amp;</code>, <code>&lt;</code> and <code>&gt;</code>. Jinja2 autoescape does this.</td></tr>
+        <tr><td>Quoted attribute value</td><td><code>&lt;img alt="{{ item.source }}"&gt;</code></td><td>Also escape both quote characters, so the value can't close the attribute. Autoescape covers this too.</td></tr>
+        <tr><td>URL in <code>href</code></td><td><code>&lt;a href="{{ item.url }}"&gt;</code></td><td>First check the scheme is <code>http</code> or <code>https</code>, then attribute-escape. Escaping alone can't make <code>javascript:</code> safe.</td></tr>
+        <tr><td>Plain-text email part</td><td><code>{{ item.title }}</code> in <code>briefing.txt</code></td><td>Nothing. The client shows characters as they are, so an escaped <code>&amp;amp;</code> would appear literally.</td></tr>
+        <tr><td>Script or style block</td><td>None in your templates</td><td>Different rules entirely. Feed and model text never goes there.</td></tr>
+      </tbody>
+    </table></div>
+    <figcaption><b>Figure 9.1</b> The same title needs different treatment depending on where it lands. Each row is a separate output context.</figcaption>
+  </figure>
+
+  <h3>How Horizon escaped twice</h3>
+  <p>Horizon's summary step escaped text when it produced it, so the apostrophe in <code>Anthropic's</code> became <code>&amp;#x27;</code>. The email step escaped the same string again, which turned the <code>&amp;</code> at the start of that reference into <code>&amp;amp;</code>. The mail client decoded one layer, as it always does, and showed the reader <code>Anthropic&amp;#x27;s</code>.</p>
+  <p>Escaping isn't idempotent, so applying it twice gives a different result from applying it once. Each step was reasonable if it was the only one that escaped, and the bug lived in the gap between them.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 760 284" role="img" aria-label="Two pipelines. Top, Horizon: the feed text Anthropic's is escaped by the summary step to Anthropic&amp;#x27;s, escaped again by the email template to Anthropic&amp;amp;#x27;s, and the reader sees Anthropic&amp;#x27;s. Bottom, the plan: the feed delivers Anthropic&amp;#x27;s, the parser decodes it once to Anthropic's, it is stored and passed as plain text, the template escapes it once to Anthropic&amp;#39;s, and the reader sees Anthropic's.">
+        <defs>
+          <marker id="delivery-m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <text class="t-head" x="20" y="26">Horizon: escaped at two layers</text>
+        <rect class="bx" x="20" y="40" width="160" height="60" rx="7"/>
+        <text class="t-sm" x="100" y="63" text-anchor="middle">Feed text</text>
+        <text class="t-mono" x="100" y="85" text-anchor="middle">Anthropic's</text>
+        <rect class="bx" x="210" y="40" width="160" height="60" rx="7"/>
+        <text class="t-sm" x="290" y="63" text-anchor="middle">Summary step escapes</text>
+        <text class="t-mono" x="290" y="85" text-anchor="middle">Anthropic&amp;#x27;s</text>
+        <rect class="bx-bad" x="400" y="40" width="160" height="60" rx="7"/>
+        <text class="t-sm" x="480" y="63" text-anchor="middle">Email template escapes</text>
+        <text class="t-mono" x="480" y="85" text-anchor="middle">Anthropic&amp;amp;#x27;s</text>
+        <rect class="bx-bad" x="590" y="40" width="160" height="60" rx="7"/>
+        <text class="t-sm" x="670" y="63" text-anchor="middle">Reader sees</text>
+        <text class="t-mono" x="670" y="85" text-anchor="middle">Anthropic&amp;#x27;s</text>
+        <path class="wire" d="M180 70 L208 70" marker-end="url(#delivery-m2)"/>
+        <path class="wire" d="M370 70 L398 70" marker-end="url(#delivery-m2)"/>
+        <path class="wire" d="M560 70 L588 70" marker-end="url(#delivery-m2)"/>
+        <text class="t-sm" x="380" y="124" text-anchor="middle">Each layer assumed it was the only one, so the second pass escaped the entity itself.</text>
+
+        <text class="t-head" x="20" y="166">Your plan: decode once on input, escape once on output</text>
+        <rect class="bx" x="10" y="180" width="132" height="60" rx="7"/>
+        <text class="t-sm" x="76" y="203" text-anchor="middle">Arrives in feed</text>
+        <text class="t-mono" x="76" y="225" text-anchor="middle">Anthropic&amp;#x27;s</text>
+        <rect class="bx" x="162" y="180" width="132" height="60" rx="7"/>
+        <text class="t-sm" x="228" y="203" text-anchor="middle">Decoded at parse</text>
+        <text class="t-mono" x="228" y="225" text-anchor="middle">Anthropic's</text>
+        <rect class="bx" x="314" y="180" width="132" height="60" rx="7"/>
+        <text class="t-sm" x="380" y="203" text-anchor="middle">Stored and passed</text>
+        <text class="t-mono" x="380" y="225" text-anchor="middle">Anthropic's</text>
+        <rect class="bx-pg" x="466" y="180" width="132" height="60" rx="7"/>
+        <text class="t-sm" x="532" y="203" text-anchor="middle">Template escapes</text>
+        <text class="t-mono" x="532" y="225" text-anchor="middle">Anthropic&amp;#39;s</text>
+        <rect class="bx-ok" x="618" y="180" width="132" height="60" rx="7"/>
+        <text class="t-sm" x="684" y="203" text-anchor="middle">Reader sees</text>
+        <text class="t-mono" x="684" y="225" text-anchor="middle">Anthropic's</text>
+        <path class="wire" d="M142 210 L160 210" marker-end="url(#delivery-m2)"/>
+        <path class="wire" d="M294 210 L312 210" marker-end="url(#delivery-m2)"/>
+        <path class="wire" d="M446 210 L464 210" marker-end="url(#delivery-m2)"/>
+        <path class="wire" d="M598 210 L616 210" marker-end="url(#delivery-m2)"/>
+        <text class="t-sm" x="380" y="264" text-anchor="middle">Between the two edges the text is plain, so no layer has to guess whether it has been escaped.</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 9.2</b> Horizon's bug and the plan's fix. Jinja2 writes the apostrophe as <code>&amp;#39;</code> and Python's <code>html.escape</code> writes <code>&amp;#x27;</code>. Both mean the same character.</figcaption>
+  </figure>
+
+  <h3>Decode once on input, escape once on output</h3>
+  <p>The plan's rule is that data stays raw until the template layer, and only the template escapes.</p>
+  <div class="note principle"><span class="label">Key principle</span><p>Inside the system, text is always plain, exactly the characters a person would read. It's decoded once at parse time and escaped once by the template, for the context it lands in. Code in between never escapes anything.</p></div>
+  <ul>
+    <li><b>Feed text</b> is decoded once when it's parsed. Feeds often carry HTML inside XML, and the number of entity layers varies by publisher, so the parse step turns everything into plain text before storing it.</li>
+    <li><b>Model text</b> arrives as plain-text fields in structured JSON. The model never returns HTML (ADR-007), so every byte of markup comes from your templates.</li>
+    <li><b>Templates</b> are the only place escaping happens.</li>
+  </ul>
+
+  <h4>Choosing autoescape by file extension</h4>
+  <p>Jinja2 escapes every <code>{{ … }}</code> value when autoescape is on, but its default is off. Each email has an HTML part, which needs escaping, and a text part, which mustn't be escaped, so the plan chooses by file extension:</p>
+<pre><code>from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+env = Environment(
+    loader=FileSystemLoader("templates"),
+    autoescape=<span class="hl">select_autoescape(enabled_extensions=("html",),
+                                 disabled_extensions=("txt",), default=True)</span>,
+)
+<span class="c"># briefing.html escapes, briefing.txt doesn't, anything else escapes</span></code></pre>
+  <ul>
+    <li><b>Unknown extensions escape.</b> <code>default=True</code> makes the safe choice for any file that matches neither list.</li>
+    <li><b>Name files <code>*.html</code> and <code>*.txt</code>.</b> <code>select_autoescape</code> matches the last extension, so <code>briefing.txt.j2</code> would fall through to the default and be escaped, which is Horizon's bug again in the text part.</li>
+    <li><b>One test checks both.</b> It renders both templates from one fixture and checks that <code>&amp;</code> comes out as <code>&amp;amp;</code> in the HTML and <code>&amp;</code> in the text.</li>
+  </ul>
+
+  <h4>No <code>|safe</code>, and a scheme check on every link</h4>
+  <p>The <code>|safe</code> filter switches escaping off for one value. The plan bans it on any feed or model field, enforced in CI by a grep-based lint over the <code>*.html</code> templates. <code>markupsafe.Markup</code> in Python has the same effect and is invisible to the grep, so the rule covers Python too.</p>
+  <p>Escaping does nothing about what a link does, because <code>javascript:alert(1)</code> contains nothing to escape. So every <code>href</code> is checked first. <code>http</code> and <code>https</code> are kept, anything else drops the link, and the template then attribute-escapes the URL.</p>
+<pre><code>from urllib.parse import urlsplit
+
+def safe_href(url: str) -&gt; str | None:
+    scheme = urlsplit(url.strip()).scheme.lower()
+    return url if scheme <span class="hl">in ("http", "https")</span> else None   <span class="c"># None: render without a link</span></code></pre>
+  <div class="split">
+    <div class="no"><h4>Blocklist: reject known bad schemes</h4><p>Reject <code>javascript:</code> and <code>data:</code>. The list has to anticipate mixed case, leading spaces, tabs that browsers remove, and schemes you've never heard of.</p></div>
+    <div class="yes"><h4>Allowlist: accept known good schemes</h4><p>Keep the URL only if the parsed scheme is <code>http</code> or <code>https</code>. Anything unexpected fails closed.</p></div>
+  </div>
+
+  <h4>Golden tests</h4>
+  <p>A <b>golden test</b> renders a fixed input and compares the output byte for byte with a committed, hand-checked file. The plan's fixtures use hostile titles like <code>AT&amp;T &lt;script&gt;alert(1)&lt;/script&gt; "quotes" &amp; 'apostrophes'</code> and already-escaped feed text. The test fails on double escaping and on a raw <code>&lt;script&gt;</code>, and it's the regression test for Horizon bug #3.</p>
+  <div class="note example"><span class="label">Worked example</span>
+    <ol>
+      <li>A feed's XML contains <code>&lt;title&gt;AT&amp;amp;amp;T results&lt;/title&gt;</code>. The XML parser yields <code>AT&amp;amp;T results</code>, which is HTML for "AT&amp;T results".</li>
+      <li>The parse step decodes entities once and stores <code>AT&amp;T results</code>.</li>
+      <li>The HTML template writes <code>AT&amp;amp;T results</code>, which the client shows as <b>AT&amp;T results</b>. The text template writes <code>AT&amp;T results</code>.</li>
+      <li>If any layer escaped again, the HTML would contain <code>AT&amp;amp;amp;T</code>, the reader would see <code>AT&amp;amp;T</code>, and the golden comparison would fail.</li>
+    </ol>
+  </div>
+  <div class="note pitfall"><span class="label">Common mistake</span><p>Escaping in the middle of the pipeline as a precaution, for example when saving a summary or in an API serialiser. Every extra escape is another layer that some output will show as literal entities.</p></div>
+
+  <h3>Sending the email</h3>
+  <ul>
+    <li><b>Stage 1: SMTP</b> through Horizon's account, with the credentials moved into this repository's <code>.env</code> and never committed. Going straight to SES instead is open question Q3.</li>
+    <li><b>Stage 2: Amazon SES</b> with a verified domain and <b>DKIM</b>, a signature that lets receiving servers check a message came from your domain unaltered. That's why the domain name (Q10) matters for email too.</li>
+  </ul>
+  <p>Each email is <code>multipart/alternative</code>, with <code>text/plain</code> and <code>text/html</code> parts built from the same data.</p>
+<pre><code>msg = EmailMessage()
+msg["Subject"] = subject
+msg.set_content(env.get_template("briefing.txt").render(b=briefing))          <span class="c"># text/plain</span>
+msg.<span class="hl">add_alternative</span>(env.get_template("briefing.html").render(b=briefing), subtype="html")</code></pre>
+  <p>Email uses the same delivery state machine as webhooks. A permanent rejection (an SMTP <code>5xx</code> reply, or SES <code>MessageRejected</code>) goes straight to <code>dead</code>, and temporary failures are retried.</p>
+
+  <h4>One-click unsubscribe</h4>
+  <p>From stage 2, when there's more than one recipient, every email carries two headers defined by RFC 8058:</p>
+<pre><code>List-Unsubscribe: &lt;https://…/v1/unsubscribe?token=…&gt;
+List-Unsubscribe-Post: List-Unsubscribe=One-Click</code></pre>
+  <p>Clients that support one-click send a <code>POST</code> to that URL. The endpoint takes no API key, so the token proves which user it's for:</p>
+<pre><code>token = base64url(user_id ‖ <span class="hl">HMAC-SHA256(unsubscribe_key, user_id ‖ "email")</span>)</code></pre>
+  <ul>
+    <li><b>It can't be forged.</b> Without <code>unsubscribe_key</code> nobody can make a token for another user, and the server stores nothing to check it against.</li>
+    <li><b><code>POST</code> unsubscribes.</b> It sets <code>users.email_enabled = false</code>. Webhooks are unaffected, and <code>PATCH /v1/me</code> turns email back on.</li>
+    <li><b><code>GET</code> only asks.</b> It shows a page with a button that POSTs, because mail scanners follow links and would otherwise unsubscribe people who never clicked.</li>
+  </ul>
+  <p>The footer also has a visible unsubscribe link. Stage 1 has one recipient, you, and leaves the headers out.</p>
+
+  <h4>When the email goes out</h4>
+  <p>The scheduler enqueues each build at the user's <code>send_time</code> minus 30 minutes, in their timezone, working out the instant per local date with <code>zoneinfo</code>. Two DST cases have fixed rules:</p>
+  <ul>
+    <li><b>A time that doesn't exist</b> moves forward by the length of the gap. In New York on 2026-03-08 clocks jump from 02:00 to 03:00, so 02:30 becomes 03:30 EDT (07:30 UTC), which is what <code>zoneinfo</code> gives for <code>fold=0</code>.</li>
+    <li><b>A time that happens twice</b> uses the first occurrence. On 2026-11-01, 01:30 in New York happens at 05:30 and again at 06:30 UTC, and the send uses 05:30.</li>
+  </ul>
+  <p>The build's dedupe key and unique constraint both use the local date, so an overlap can't produce two briefings. Your own 06:30 in Dublin is never affected, because European clocks change at 01:00 UTC.</p>
+
+  <h3>Webhooks: telling the user's server</h3>
+  <p>A <b>webhook</b> is an HTTP request your service sends to a URL the user registered, when something happens. Instead of the client polling <code>GET /v1/briefings</code> every few minutes, your service tells it once, the moment the briefing is ready:</p>
+<pre><code>{
+  "id": "0193f4b2-…",              <span class="c">// = deliveries.id, stable across retries</span>
+  "type": "briefing.ready",
+  "created_at": "2026-11-09T06:30:02Z",
+  "data": { "briefing_id": "…", "date": "2026-11-09", "profile": "ai-news",
+            "url": "https://api…/v1/briefings/…", "items": [ … ] }
+}</code></pre>
+  <p>The receiver's URL is open to the whole internet, so before acting it needs to know three things. Did the request come from briefing-engine, was it changed in transit, and is it new or an old request sent again? A timestamped HMAC signature answers all three.</p>
+
+  <h3>Signing with HMAC</h3>
+  <p>An <b>HMAC</b> (hash-based message authentication code) is a short value computed from a message and a secret key. Only someone with the key can compute it, and any change to the message changes it unpredictably. Python provides it as <code>hmac.new(key, msg, hashlib.sha256)</code>.</p>
+  <p>The shortcut <code>SHA-256(secret ‖ message)</code> is open to a <b>length-extension attack</b>, where an attacker who sees one valid value can compute one for the message with bytes appended. HMAC's nested two-pass form (RFC 2104) prevents that. HMAC is symmetric, so a match proves the request came from someone holding that endpoint's secret, which is what the receiver needs.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 760 570" role="img" aria-label="HMAC signing and verification. Both sides hold the same secret, whsec_ followed by base64 of 32 random bytes, and the HMAC key is the decoded bytes. The sender takes the event id, timestamp and raw body, builds the signed string id.timestamp.body, computes HMAC-SHA256 with the key, and puts v1 and the base64 digest in the signature header. The HTTP POST carries the webhook-id, webhook-timestamp and webhook-signature headers with the raw body. The receiver checks the timestamp is within 5 minutes, rebuilds the signed string from the received headers and body, computes HMAC-SHA256 with its copy of the key, compares the result with the received signature using hmac.compare_digest, and accepts on a match or rejects otherwise.">
+        <defs>
+          <marker id="delivery-m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+          <marker id="delivery-m3acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx-pg" x="230" y="10" width="300" height="66" rx="8"/>
+        <text class="t-head" x="380" y="31" text-anchor="middle">Shared secret</text>
+        <text class="t-sm" x="380" y="49" text-anchor="middle">whsec_ + base64 of 32 random bytes</text>
+        <text class="t-sm" x="380" y="65" text-anchor="middle">HMAC key = the decoded 32 bytes</text>
+
+        <text class="t-head" x="135" y="98" text-anchor="middle">Sender: briefing-engine</text>
+        <text class="t-head" x="625" y="98" text-anchor="middle">Receiver: the user's endpoint</text>
+
+        <rect class="bx" x="20" y="110" width="230" height="50" rx="7"/>
+        <text class="t-head" x="135" y="131" text-anchor="middle">Event to send</text>
+        <text class="t-mono" x="135" y="150" text-anchor="middle">id, timestamp, raw body</text>
+        <rect class="bx" x="20" y="190" width="230" height="50" rx="7"/>
+        <text class="t-head" x="135" y="211" text-anchor="middle">Signed string</text>
+        <text class="t-mono" x="135" y="230" text-anchor="middle">{id}.{timestamp}.{body}</text>
+        <rect class="bx-pg" x="20" y="270" width="230" height="50" rx="7"/>
+        <text class="t-head" x="135" y="291" text-anchor="middle">HMAC-SHA256</text>
+        <text class="t-sm" x="135" y="310" text-anchor="middle">keyed with the decoded secret</text>
+        <rect class="bx" x="20" y="350" width="230" height="50" rx="7"/>
+        <text class="t-head" x="135" y="371" text-anchor="middle">Signature header</text>
+        <text class="t-mono" x="135" y="390" text-anchor="middle">v1,base64(digest)</text>
+        <path class="wire" d="M135 160 L135 188" marker-end="url(#delivery-m3)"/>
+        <path class="wire" d="M135 240 L135 268" marker-end="url(#delivery-m3)"/>
+        <path class="wire" d="M135 320 L135 348" marker-end="url(#delivery-m3)"/>
+        <text class="t-sm" x="135" y="440" text-anchor="middle">The 32-byte digest is base64</text>
+        <text class="t-sm" x="135" y="457" text-anchor="middle">encoded to fit in a header.</text>
+
+        <rect class="bx" x="270" y="190" width="220" height="210" rx="8"/>
+        <text class="t-head" x="380" y="214" text-anchor="middle">HTTP POST</text>
+        <text class="t-mono" x="284" y="244">webhook-id: 0193f4b2-…</text>
+        <text class="t-mono" x="284" y="266">webhook-timestamp: 1794205802</text>
+        <text class="t-mono" x="284" y="288">webhook-signature: v1,K3x…</text>
+        <text class="t-mono" x="284" y="320">{"type":"briefing.ready"…}</text>
+        <text class="t-sm" x="380" y="360" text-anchor="middle">headers and raw body</text>
+        <text class="t-sm" x="380" y="378" text-anchor="middle">travel together</text>
+        <path class="wire-acc" d="M250 375 L268 375" marker-end="url(#delivery-m3acc)"/>
+        <path class="wire-acc" d="M490 215 L508 215" marker-end="url(#delivery-m3acc)"/>
+
+        <text class="t-sm" x="625" y="140" text-anchor="middle">Nothing is trusted until</text>
+        <text class="t-sm" x="625" y="157" text-anchor="middle">the signature matches.</text>
+        <rect class="bx" x="510" y="190" width="230" height="50" rx="7"/>
+        <text class="t-head" x="625" y="211" text-anchor="middle">Check the timestamp</text>
+        <text class="t-sm" x="625" y="230" text-anchor="middle">reject if more than 5 min off</text>
+        <rect class="bx" x="510" y="270" width="230" height="50" rx="7"/>
+        <text class="t-head" x="625" y="291" text-anchor="middle">Rebuild signed string</text>
+        <text class="t-mono" x="625" y="310" text-anchor="middle">{id}.{timestamp}.{body}</text>
+        <rect class="bx-pg" x="510" y="350" width="230" height="50" rx="7"/>
+        <text class="t-head" x="625" y="371" text-anchor="middle">HMAC-SHA256</text>
+        <text class="t-sm" x="625" y="390" text-anchor="middle">keyed with its copy of the secret</text>
+        <rect class="bx" x="510" y="430" width="230" height="50" rx="7"/>
+        <text class="t-head" x="625" y="451" text-anchor="middle">Constant-time compare</text>
+        <text class="t-mono" x="625" y="470" text-anchor="middle">hmac.compare_digest</text>
+        <path class="wire" d="M625 240 L625 268" marker-end="url(#delivery-m3)"/>
+        <path class="wire" d="M625 320 L625 348" marker-end="url(#delivery-m3)"/>
+        <path class="wire" d="M625 400 L625 428" marker-end="url(#delivery-m3)"/>
+        <rect class="bx-ok" x="510" y="510" width="110" height="40" rx="7"/>
+        <text x="565" y="535" text-anchor="middle">accept</text>
+        <rect class="bx-bad" x="630" y="510" width="110" height="40" rx="7"/>
+        <text x="685" y="535" text-anchor="middle">reject</text>
+        <path class="wire" d="M590 480 L570 508" marker-end="url(#delivery-m3)"/>
+        <path class="wire" d="M660 480 L680 508" marker-end="url(#delivery-m3)"/>
+      </svg>
+    </div>
+    <figcaption><b>Figure 9.3</b> Sender and receiver run the same computation over the same bytes with the same key. The receiver never trusts the signature it was sent. It computes its own and compares the two.</figcaption>
+  </figure>
+
+  <h4>The Standard Webhooks headers</h4>
+  <p>ADR-012 adopts the published <b>Standard Webhooks</b> scheme, so consumers can verify with existing libraries. Each request carries three headers:</p>
+  <ul>
+    <li><b><code>webhook-id</code></b> is the event id, equal to <code>deliveries.id</code>. Receivers use it to drop duplicates.</li>
+    <li><b><code>webhook-timestamp</code></b> is Unix seconds at signing time. It's what makes replay protection possible.</li>
+    <li><b><code>webhook-signature</code></b> is <code>v1,</code> plus the base64 HMAC-SHA256 of the <b>signed string</b> <code>{id}.{timestamp}.{raw_body}</code>. Signing all three binds the signature to the id, the moment and the exact bytes sent.</li>
+  </ul>
+
+  <h4>The secret format</h4>
+  <p>A webhook secret is <code>whsec_</code> followed by base64 of 32 random bytes, the format the Standard Webhooks libraries expect. The HMAC key is the <b>decoded 32 bytes</b>. Consumers paste the whole <code>whsec_…</code> string into their library, which strips the prefix and decodes it. A test checks your signature against the reference library's verifier, which would catch signing with the text instead of the bytes.</p>
+<pre><code>def sign(secret: str, event_id: str, ts: int, body: bytes) -&gt; str:
+    key = <span class="hl">base64.b64decode(secret.removeprefix("whsec_"))</span>     <span class="c"># the 32 raw bytes</span>
+    signed = f"{event_id}.{ts}.".encode() + body               <span class="c"># the exact bytes sent</span>
+    return "v1," + base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode()</code></pre>
+  <p>Every attempt is signed when it's sent, so a retry carries the same id with a new timestamp and signature.</p>
+  <div class="note pitfall"><span class="label">Common mistake</span><p>Verifying against re-serialised JSON. A receiver that parses the body and calls <code>json.dumps</code> to rebuild it usually gets different bytes (spacing, key order, Unicode escapes), and every check fails. Read the raw body before parsing it.</p></div>
+
+  <h4>Why the secret is encrypted and API keys are hashed</h4>
+  <div class="cards">
+    <div class="card"><h4>API key: only ever compared</h4><p>The server hashes the presented key and compares it with <code>api_keys.secret_hash</code>, so it stores only <code>SHA-256(secret)</code>. A fast hash is enough because the key has 256 bits of entropy (ADR-004).</p></div>
+    <div class="card"><h4>Webhook secret: used to compute</h4><p>Signing needs the secret itself on every send, so it's stored <b>encrypted</b> with Fernet, with the key in AWS Secrets Manager. A database dump alone reveals nothing.</p></div>
+  </div>
+  <p>Hash what you only need to recognise, and encrypt what you need to use. The secret is shown to the user once, when it's created or rotated.</p>
+
+  <h4>Stopping replays</h4>
+  <p>A <b>replay attack</b> captures a genuine request and sends it again, and the signature still matches. So receivers reject any timestamp more than 5 minutes from their own clock. An attacker can't change the timestamp without breaking the signature, and inside the window, de-duplicating on <code>webhook-id</code> makes a replay harmless.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 760 290" role="img" aria-label="Replay timeline over 15 minutes. At time T the original delivery is accepted and the receiver stores its webhook-id. At T plus 2 minutes an exact replay has a valid signature but its id has been seen, so it is ignored. At T plus 10 minutes an exact replay is rejected because its timestamp is more than 5 minutes old. A replay with an edited timestamp is rejected because the signature no longer matches.">
+        <rect class="bx-ok" x="40" y="44" width="120" height="200" rx="4"/>
+        <text class="t-sm" x="100" y="36" text-anchor="middle">accepted window</text>
+        <line class="axis" x1="280" y1="44" x2="280" y2="255"/>
+        <line class="axis" x1="400" y1="44" x2="400" y2="255"/>
+
+        <path class="wire-dash" d="M48 70 L428 70"/>
+        <path class="wire-dash" d="M96 120 L428 120"/>
+        <path class="wire-dash" d="M288 170 L428 170"/>
+        <path class="wire-dash" d="M336 220 L428 220"/>
+        <circle class="bx-ok" cx="40" cy="70" r="6"/>
+        <circle class="bx-pg" cx="88" cy="120" r="6"/>
+        <circle class="bx-bad" cx="280" cy="170" r="6"/>
+        <circle class="bx-bad" cx="328" cy="220" r="6"/>
+
+        <text x="440" y="67">Original delivery at T</text>
+        <text class="t-sm" x="440" y="84">accepted; the receiver stores its webhook-id</text>
+        <text x="440" y="117">Exact replay at T + 2 min</text>
+        <text class="t-sm" x="440" y="134">signature valid, id already seen: ignored</text>
+        <text x="440" y="167">Exact replay at T + 10 min</text>
+        <text class="t-sm" x="440" y="184">timestamp more than 5 min old: rejected</text>
+        <text x="440" y="217">Replay with a new timestamp</text>
+        <text class="t-sm" x="440" y="234">signature no longer matches: rejected</text>
+
+        <line class="wire" x1="40" y1="255" x2="400" y2="255"/>
+        <line class="wire" x1="40" y1="255" x2="40" y2="261"/>
+        <line class="wire" x1="160" y1="255" x2="160" y2="261"/>
+        <line class="wire" x1="280" y1="255" x2="280" y2="261"/>
+        <line class="wire" x1="400" y1="255" x2="400" y2="261"/>
+        <text class="t-mono" x="40" y="276" text-anchor="middle">T</text>
+        <text class="t-mono" x="160" y="276" text-anchor="middle">T+5</text>
+        <text class="t-mono" x="280" y="276" text-anchor="middle">T+10</text>
+        <text class="t-mono" x="400" y="276" text-anchor="middle">T+15 min</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 9.4</b> The timestamp limits a captured request to a 5-minute window, and the id check closes that window. Receivers also accept timestamps up to 5 minutes in the future, to tolerate clock skew.</figcaption>
+  </figure>
+
+  <h4>Comparing in constant time</h4>
+  <p>Python's <code>==</code> stops at the first differing character, so a guess that matches more characters takes slightly longer to reject. Over many requests an attacker can use that to recover a signature piece by piece, a <b>timing attack</b>. <code>hmac.compare_digest(a, b)</code> takes the same time wherever the inputs differ, and the plan uses it for signatures and API key hashes alike.</p>
+
+  <h4>Rotating the secret</h4>
+  <p>Sender and receiver can't switch secrets at the same instant. So <code>POST /v1/webhook-endpoints/{id}/rotate-secret</code> creates a new secret and keeps the old one for 24 hours, in <code>previous_secret_ciphertext</code> with <code>previous_secret_expires_at</code>. During the overlap each request carries both signatures, separated by a space, and the receiver accepts if any of them matches.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 760 256" role="img" aria-label="Secret rotation timeline. The old secret is valid until R plus 24 hours. The new secret is valid from R onwards. Before R the signature header carries only the old signature; from R to R plus 24 hours it carries the new and old signatures separated by a space; after that only the new one. The consumer uses the old secret until it switches, at any time within the window, and the new secret afterwards.">
+        <text x="140" y="55" text-anchor="end">Old secret</text>
+        <rect class="bx" x="150" y="37" width="504" height="26" rx="5"/>
+        <text class="t-sm" x="402" y="54" text-anchor="middle">valid</text>
+
+        <text x="140" y="97" text-anchor="end">New secret</text>
+        <rect class="bx-ok" x="222" y="79" width="504" height="26" rx="5"/>
+        <text class="t-sm" x="474" y="96" text-anchor="middle">valid</text>
+
+        <text x="140" y="139" text-anchor="end">Signatures sent</text>
+        <rect class="bx" x="150" y="121" width="72" height="26" rx="5"/>
+        <text class="t-mono" x="186" y="138" text-anchor="middle">v1,{old}</text>
+        <rect class="bx-pg" x="222" y="121" width="432" height="26" rx="5"/>
+        <text class="t-mono" x="438" y="138" text-anchor="middle">v1,{new} v1,{old}</text>
+        <rect class="bx" x="654" y="121" width="72" height="26" rx="5"/>
+        <text class="t-mono" x="690" y="138" text-anchor="middle">v1,{new}</text>
+
+        <text x="140" y="181" text-anchor="end">Consumer uses</text>
+        <rect class="bx" x="150" y="163" width="180" height="26" rx="5"/>
+        <text class="t-sm" x="276" y="180" text-anchor="middle">old secret</text>
+        <rect class="bx-ok" x="330" y="163" width="396" height="26" rx="5"/>
+        <text class="t-sm" x="528" y="180" text-anchor="middle">new secret</text>
+
+        <line class="wire-dash" x1="222" y1="28" x2="222" y2="206"/>
+        <line class="wire-dash" x1="654" y1="28" x2="654" y2="206"/>
+        <line class="wire" x1="150" y1="206" x2="726" y2="206"/>
+        <text class="t-mono" x="222" y="224" text-anchor="middle">R</text>
+        <text class="t-mono" x="654" y="224" text-anchor="middle">R + 24 h</text>
+        <text class="t-sm" x="222" y="242" text-anchor="middle">rotate-secret called</text>
+        <text class="t-sm" x="654" y="242" text-anchor="middle">previous secret expires</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 9.5</b> During the 24-hour overlap every request carries both signatures, so the consumer can switch at any point in the window (here about six hours after rotation) without a failed check.</figcaption>
+  </figure>
+
+  <h4>Sending to a URL a stranger chose</h4>
+  <p>A webhook URL comes from a user, so without care your worker becomes a <b>server-side request forgery</b> (SSRF) tool, reaching <code>http://169.254.169.254/…</code> (the AWS metadata address) on someone's behalf. Delivery applies the ingestion SSRF guard (resolve, reject non-public addresses, connect to the checked IP), plus four rules:</p>
+  <ul>
+    <li><b>HTTPS in production</b>, so the payload and signature can't be read in transit.</li>
+    <li><b>No redirects</b>, because a public endpoint could answer <code>302</code> to an internal address.</li>
+    <li><b>A 10-second timeout</b>, so a silent receiver can't hold one of the deliver queue's few slots.</li>
+    <li><b>Only the first 512 bytes</b> of the response are read, into <code>delivery_attempts.response_excerpt</code>.</li>
+  </ul>
+
+  <h3>The delivery state machine</h3>
+  <p>Each delivery is a row in <code>deliveries</code> with a <code>status</code>, and each attempt is logged in <code>delivery_attempts</code>. These are the only transitions allowed:</p>
+  <div class="tbl"><table>
+    <thead><tr><th>From</th><th>To</th><th>When</th></tr></thead>
+    <tbody>
+      <tr><td><code>pending</code></td><td><code>in_flight</code></td><td>The deliver job starts an attempt.</td></tr>
+      <tr><td><code>in_flight</code></td><td><code>succeeded</code></td><td>A <code>2xx</code> response. <code>succeeded</code> is terminal.</td></tr>
+      <tr><td><code>in_flight</code></td><td><code>pending</code></td><td>A retryable failure. <code>next_attempt_at</code> is set.</td></tr>
+      <tr><td><code>in_flight</code></td><td><code>dead</code></td><td>Attempts used up, or a permanent failure.</td></tr>
+      <tr><td><code>in_flight</code></td><td><code>in_flight</code></td><td><b>Crash recovery only.</b> The job's lease expired mid-attempt, so the outcome is unknown. The re-run records that attempt as <code>outcome_unknown</code> and starts a new one straight away.</td></tr>
+      <tr><td><code>dead</code></td><td><code>pending</code></td><td><b>Replay only</b>, from the API or the CLI. <code>attempts</code> goes back to 0 and <code>next_attempt_at = now()</code>.</td></tr>
+    </tbody>
+  </table></div>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 800 350" role="img" aria-label="Delivery state machine. pending moves to in_flight when an attempt starts. in_flight moves to succeeded on a 2xx response, to pending on a retryable failure with next_attempt_at set, and to dead when attempts are used up or the failure is permanent. A loop from in_flight back to in_flight is crash recovery, where the previous attempt is recorded as outcome_unknown. dead writes a dead_letters row, and dead moves back to pending only through replay, which resets attempts to 0 and keeps the same event id.">
+        <defs>
+          <marker id="delivery-m6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+          <marker id="delivery-m6acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="40" y="150" width="130" height="46" rx="23"/>
+        <text class="t-head" x="105" y="178" text-anchor="middle">pending</text>
+        <rect class="bx-pg" x="320" y="150" width="140" height="46" rx="23"/>
+        <text class="t-head" x="390" y="178" text-anchor="middle">in_flight</text>
+        <rect class="bx-ok" x="620" y="40" width="140" height="52" rx="14"/>
+        <text class="t-head" x="690" y="62" text-anchor="middle">succeeded</text>
+        <text class="t-sm" x="690" y="80" text-anchor="middle">terminal</text>
+        <rect class="bx-bad" x="620" y="250" width="140" height="52" rx="14"/>
+        <text class="t-head" x="690" y="272" text-anchor="middle">dead</text>
+        <text class="t-sm" x="690" y="290" text-anchor="middle">+ dead_letters row</text>
+
+        <path class="wire-acc" d="M170 166 L318 166" marker-end="url(#delivery-m6acc)"/>
+        <text class="t-sm" x="244" y="157" text-anchor="middle">attempt starts</text>
+        <path class="wire" d="M460 160 L618 76" marker-end="url(#delivery-m6)"/>
+        <text class="t-mono" x="512" y="108" text-anchor="middle">2xx</text>
+        <path class="wire" d="M460 186 L618 268" marker-end="url(#delivery-m6)"/>
+        <text class="t-sm" x="560" y="200">attempts used up,</text>
+        <text class="t-sm" x="560" y="216">or a permanent failure</text>
+        <path class="wire" d="M370 196 C 350 250, 130 250, 110 198" marker-end="url(#delivery-m6)"/>
+        <text class="t-sm" x="240" y="262" text-anchor="middle">retryable failure, next_attempt_at set</text>
+        <path class="wire-dash" d="M365 150 C 350 96, 430 96, 415 148" marker-end="url(#delivery-m6)"/>
+        <text class="t-sm" x="390" y="88" text-anchor="middle">crash recovery: outcome_unknown</text>
+        <path class="wire-dash" d="M690 302 L690 330 L75 330 L75 198" marker-end="url(#delivery-m6)"/>
+        <text class="t-sm" x="380" y="322" text-anchor="middle">replay only: attempts reset to 0, same event id, fresh signature</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 9.6</b> The delivery state machine. Solid arrows are normal operation, dashed ones are crash recovery and manual replay.</figcaption>
+  </figure>
+
+  <h4>Every transition is a guarded <code>UPDATE</code></h4>
+  <p>No code writes <code>status</code> directly. Every transition goes through one conditional statement:</p>
+<pre><code>UPDATE deliveries SET status = $to, …
+WHERE id = $id AND <span class="hl">status = ANY($allowed_from)</span>
+RETURNING 1;     <span class="c">-- no row: someone else moved it first</span></code></pre>
+  <p>If it updates no row, the delivery has already moved on, so the handler logs <code>delivery.stale_transition</code> and stops without sending. Say two replay requests for one dead delivery arrive at once. Both try <code>dead → pending</code>, the row lock lets one through, and the other finds the status is no longer <code>dead</code>. A unit test runs the whole transition table against the database, including every transition that should be refused.</p>
+
+  <h4>What each response means</h4>
+  <p>The receiver's response picks the transition.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Response</th><th>Action</th></tr></thead>
+    <tbody>
+      <tr><td><code>2xx</code></td><td><code>succeeded</code></td></tr>
+      <tr><td><code>410 Gone</code></td><td><code>dead</code> immediately, and the endpoint is set to <code>disabled</code></td></tr>
+      <tr><td><code>429</code> / <code>503</code> with <code>Retry-After</code></td><td>Retry at <code>max(Retry-After, the next backoff step)</code></td></tr>
+      <tr><td>Other <code>4xx</code>, <code>5xx</code>, timeout, connection error</td><td>Retry</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The retry schedule</h4>
+  <p>The gaps between attempts are 1 minute, 5 minutes, 30 minutes, 2 hours, 6 hours and 12 hours, each with ±20% jitter so deliveries that failed together don't retry together. That's seven attempts over about 21 hours, enough to outlast an overnight outage.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 760 360" role="img" aria-label="Retry schedule drawn to scale. On an axis of 0 to 22 hours, attempts 1 to 4 fall within the first 36 minutes, attempt 5 at 2 hours 36 minutes, attempt 6 at 8 hours 36 minutes and attempt 7 at 20 hours 36 minutes. Ghost bars show the plus or minus 20 percent jitter of the last three gaps, up to plus or minus 2.4 hours for the 12-hour gap. An enlarged inset of the first 40 minutes shows attempt 1 at 0, attempt 2 at 1 minute, attempt 3 at 6 minutes and attempt 4 at 36 minutes.">
+        <text class="t-head" x="20" y="24">The whole schedule, to scale</text>
+        <text class="t-sm" x="740" y="24" text-anchor="end">hours since the first attempt</text>
+        <rect class="bx-ghost" x="116" y="141" width="24" height="18" rx="3"/>
+        <rect class="bx-ghost" x="272" y="141" width="72" height="18" rx="3"/>
+        <rect class="bx-ghost" x="596" y="141" width="144" height="18" rx="3"/>
+        <line class="wire" x1="50" y1="150" x2="740" y2="150"/>
+        <path class="wire" d="M68 139 Q98 100 120 140"/>
+        <path class="wire" d="M128 140 Q218 80 300 141"/>
+        <path class="wire" d="M308 140 Q488 40 660 141"/>
+        <text class="t-mono" x="98" y="112" text-anchor="middle">+2 h</text>
+        <text class="t-mono" x="218" y="102" text-anchor="middle">+6 h</text>
+        <text class="t-mono" x="488" y="82" text-anchor="middle">+12 h</text>
+        <rect class="bx-pg" x="40" y="139" width="40" height="22" rx="11"/>
+        <text class="t-mono" x="60" y="154" text-anchor="middle">1–4</text>
+        <circle class="bx-pg" cx="128" cy="150" r="10"/>
+        <text class="t-mono" x="128" y="154" text-anchor="middle">5</text>
+        <circle class="bx-pg" cx="308" cy="150" r="10"/>
+        <text class="t-mono" x="308" y="154" text-anchor="middle">6</text>
+        <circle class="bx-pg" cx="668" cy="150" r="10"/>
+        <text class="t-mono" x="668" y="154" text-anchor="middle">7</text>
+        <text class="t-sm" x="60" y="176" text-anchor="middle">0 to 36 min</text>
+        <text class="t-sm" x="128" y="176" text-anchor="middle">2 h 36 m</text>
+        <text class="t-sm" x="308" y="176" text-anchor="middle">8 h 36 m</text>
+        <text class="t-sm" x="668" y="176" text-anchor="middle">20 h 36 m</text>
+        <text class="t-mono" x="50" y="196" text-anchor="middle">0</text>
+        <text class="t-mono" x="110" y="196" text-anchor="middle">2</text>
+        <text class="t-mono" x="170" y="196" text-anchor="middle">4</text>
+        <text class="t-mono" x="230" y="196" text-anchor="middle">6</text>
+        <text class="t-mono" x="290" y="196" text-anchor="middle">8</text>
+        <text class="t-mono" x="350" y="196" text-anchor="middle">10</text>
+        <text class="t-mono" x="410" y="196" text-anchor="middle">12</text>
+        <text class="t-mono" x="470" y="196" text-anchor="middle">14</text>
+        <text class="t-mono" x="530" y="196" text-anchor="middle">16</text>
+        <text class="t-mono" x="590" y="196" text-anchor="middle">18</text>
+        <text class="t-mono" x="650" y="196" text-anchor="middle">20</text>
+        <text class="t-mono" x="710" y="196" text-anchor="middle">22 h</text>
+
+        <text class="t-head" x="20" y="236">The first 40 minutes, enlarged</text>
+        <text class="t-sm" x="740" y="236" text-anchor="end">minutes since the first attempt</text>
+        <line class="wire" x1="50" y1="290" x2="690" y2="290"/>
+        <text class="t-mono" x="58" y="270" text-anchor="middle">+1 min</text>
+        <text class="t-mono" x="106" y="270" text-anchor="middle">+5 min</text>
+        <text class="t-mono" x="386" y="270" text-anchor="middle">+30 min</text>
+        <circle class="bx-pg" cx="50" cy="290" r="7"/>
+        <text class="t-mono" x="50" y="294" text-anchor="middle">1</text>
+        <circle class="bx-pg" cx="66" cy="290" r="7"/>
+        <text class="t-mono" x="66" y="294" text-anchor="middle">2</text>
+        <circle class="bx-pg" cx="146" cy="290" r="7"/>
+        <text class="t-mono" x="146" y="294" text-anchor="middle">3</text>
+        <circle class="bx-pg" cx="626" cy="290" r="7"/>
+        <text class="t-mono" x="626" y="294" text-anchor="middle">4</text>
+        <text class="t-mono" x="50" y="314" text-anchor="middle">0</text>
+        <text class="t-mono" x="130" y="314" text-anchor="middle">5</text>
+        <text class="t-mono" x="210" y="314" text-anchor="middle">10</text>
+        <text class="t-mono" x="290" y="314" text-anchor="middle">15</text>
+        <text class="t-mono" x="370" y="314" text-anchor="middle">20</text>
+        <text class="t-mono" x="450" y="314" text-anchor="middle">25</text>
+        <text class="t-mono" x="530" y="314" text-anchor="middle">30</text>
+        <text class="t-mono" x="690" y="314" text-anchor="middle">40</text>
+        <text class="t-sm" x="20" y="345">Ghost bars show the ±20% jitter on the last three gaps. Attempt 7 lands at about 20 h 36 m.</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 9.7</b> The schedule drawn to scale. Four of the seven attempts happen in the first 36 minutes, and almost all the elapsed time sits in the last two gaps.</figcaption>
+  </figure>
+  <div class="note example"><span class="label">Worked example</span>
+    <ol>
+      <li>Without jitter, 1 + 5 + 30 minutes plus 2 + 6 + 12 hours is 20 hours 36 minutes from the first attempt to the seventh, the plan's "about 21 hours".</li>
+      <li>With jitter, the 12-hour gap falls between 9.6 and 14.4 hours. If every gap drew the same extreme, the total would range from 16.5 hours (0.8 × 20.6) to about 24.7 hours (1.2 × 20.6).</li>
+      <li>A receiver goes down at 06:30 and comes back at 13:00. Attempts 1 to 5 fail at 06:30, 06:31, 06:36, 07:06 and 09:06.</li>
+      <li>Attempt 6 comes at about 15:06 and succeeds. With the shortest jitter on every gap it still can't come before 13:22, so the receiver gets five requests while it's down.</li>
+    </ol>
+  </div>
+
+  <h4>Dead letters, replay and auto-disable</h4>
+  <p>When the seventh attempt fails, the delivery becomes <code>dead</code> and a <code>dead_letters</code> row stores the exact payload, kept for 90 days. Nothing retries it automatically, because a 21-hour failure usually needs someone to fix something first. Then <code>POST /v1/deliveries/{id}/replay</code> (or the CLI) moves it back to <code>pending</code>:</p>
+  <ul>
+    <li><b>Attempts restart.</b> <code>attempts</code> goes back to 0, <code>next_attempt_at = now()</code>, and the dead letter gets <code>replayed_at</code>.</li>
+    <li><b>The event id stays the same.</b> A receiver that processed the original but failed to answer recognises the id and ignores the copy. The request is freshly signed with a new timestamp.</li>
+    <li><b>Replaying twice is safe.</b> The endpoint accepts an <code>Idempotency-Key</code>, and the guarded <code>UPDATE</code> stops two replays at once.</li>
+  </ul>
+  <p>After 3 consecutive dead deliveries (<code>consecutive_dead</code>) the endpoint is set to <code>disabled</code> and the user gets an email saying so. A <code>410 Gone</code> disables it at once.</p>
+
+  <h4>Rebuilding and re-sending a briefing</h4>
+  <p>A rebuilt briefing is a new revision of the same row, and each revision gets its own deliveries. <code>UNIQUE NULLS NOT DISTINCT (briefing_id, briefing_revision, channel, endpoint_id)</code> allows one delivery per revision per destination. Email rows have a null <code>endpoint_id</code>, and <code>NULLS NOT DISTINCT</code> counts those nulls as equal, so there's one email per revision too.</p>
+  <ul>
+    <li><b><code>--force</code></b> rebuilds the same <code>briefings</code> row. In one transaction it sets <code>status = 'building'</code>, increments <code>revision</code> and replaces <code>briefing_items</code>. It sends <b>nothing</b>.</li>
+    <li><b><code>--force --resend</code></b> also creates new <code>deliveries</code> rows for the new revision. They get new event ids, so receivers that dedupe on <code>webhook-id</code> still see the update.</li>
+  </ul>
+  <p>Without either flag, running <code>run-daily</code> twice for the same date makes no LLM calls and sends nothing. That's a stage 1 acceptance test.</p>
+
+  <h3>Why exactly-once delivery is impossible</h3>
+  <p>No protocol can promise exactly-once delivery across a network. Your worker sends the request, the receiver processes it and replies <code>200</code>, and your worker crashes before recording <code>succeeded</code>. To the sender, "processed, reply lost" looks the same as "never arrived", so retrying risks a duplicate and not retrying risks a loss.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 760 610" role="img" aria-label="Sequence diagram with Worker A, Postgres, Receiver and Worker B. Worker A claims the job with a 60-second lease and sends a POST with webhook-id E. The receiver processes the event and stores id E, then replies 200 OK. Worker A crashes before recording success. In Postgres the lease expires and the job is queued again. Worker B claims the job, finds the delivery still in_flight and records the old attempt as outcome_unknown, then posts again with the same id E. The receiver has already seen id E, so there is no second effect, and it replies 200 OK. Worker B records succeeded.">
+        <defs>
+          <marker id="delivery-m8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+          <marker id="delivery-m8acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="30" y="20" width="140" height="36" rx="7"/>
+        <text class="t-head" x="100" y="43" text-anchor="middle">Worker A</text>
+        <rect class="bx-pg" x="230" y="20" width="140" height="36" rx="7"/>
+        <text class="t-head" x="300" y="43" text-anchor="middle">Postgres</text>
+        <rect class="bx" x="430" y="20" width="140" height="36" rx="7"/>
+        <text class="t-head" x="500" y="43" text-anchor="middle">Receiver</text>
+        <rect class="bx" x="610" y="20" width="140" height="36" rx="7"/>
+        <text class="t-head" x="680" y="43" text-anchor="middle">Worker B</text>
+        <line class="wire-dash" x1="100" y1="56" x2="100" y2="262"/>
+        <line class="wire-dash" x1="300" y1="56" x2="300" y2="590"/>
+        <line class="wire-dash" x1="500" y1="56" x2="500" y2="590"/>
+        <line class="wire-dash" x1="680" y1="56" x2="680" y2="590"/>
+
+        <path class="wire" d="M100 95 L298 95" marker-end="url(#delivery-m8)"/>
+        <text class="t-sm" x="200" y="88" text-anchor="middle">claim job, lease 60 s</text>
+        <path class="wire-acc" d="M100 140 L498 140" marker-end="url(#delivery-m8acc)"/>
+        <text class="t-sm" x="200" y="133" text-anchor="middle">POST, webhook-id E</text>
+        <rect class="bx-ok" x="425" y="160" width="150" height="42" rx="7"/>
+        <text class="t-sm" x="500" y="177" text-anchor="middle">processes the event</text>
+        <text class="t-sm" x="500" y="193" text-anchor="middle">and stores id E</text>
+        <path class="wire" d="M500 230 L102 230" marker-end="url(#delivery-m8)"/>
+        <text class="t-sm" x="400" y="223" text-anchor="middle">200 OK</text>
+        <line class="strike" x1="90" y1="252" x2="110" y2="272"/>
+        <line class="strike" x1="110" y1="252" x2="90" y2="272"/>
+        <text class="t-sm" x="118" y="268">crashes before recording</text>
+
+        <rect class="bx-pg" x="225" y="290" width="150" height="42" rx="7"/>
+        <text class="t-sm" x="300" y="307" text-anchor="middle">lease expires,</text>
+        <text class="t-sm" x="300" y="323" text-anchor="middle">job is queued again</text>
+
+        <path class="wire" d="M680 365 L302 365" marker-end="url(#delivery-m8)"/>
+        <text class="t-sm" x="590" y="358" text-anchor="middle">claim job</text>
+        <rect class="bx" x="610" y="380" width="140" height="42" rx="7"/>
+        <text class="t-sm" x="680" y="397" text-anchor="middle">old attempt marked</text>
+        <text class="t-sm" x="680" y="413" text-anchor="middle">outcome_unknown</text>
+        <path class="wire-acc" d="M680 450 L502 450" marker-end="url(#delivery-m8acc)"/>
+        <text class="t-sm" x="590" y="443" text-anchor="middle">POST again, same id E</text>
+        <rect class="bx-ok" x="425" y="465" width="150" height="42" rx="7"/>
+        <text class="t-sm" x="500" y="482" text-anchor="middle">id E already seen:</text>
+        <text class="t-sm" x="500" y="498" text-anchor="middle">no second effect</text>
+        <path class="wire" d="M500 530 L678 530" marker-end="url(#delivery-m8)"/>
+        <text class="t-sm" x="590" y="523" text-anchor="middle">200 OK</text>
+        <path class="wire" d="M680 570 L302 570" marker-end="url(#delivery-m8)"/>
+        <text class="t-sm" x="590" y="563" text-anchor="middle">record succeeded</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 9.8</b> A crash after the receiver accepted the event but before the sender recorded it. The second request can't be avoided. De-duplication on the stable <code>webhook-id</code> makes it harmless.</figcaption>
+  </figure>
+
+  <h4>At-least-once plus de-duplication</h4>
+  <p>The plan risks duplicates and never losses. Delivery is <b>at-least-once</b>, meaning it retries until a success is recorded or the delivery is dead. The duplicate window is small because state is recorded straight after each response, and duplicates are harmless because the <code>webhook-id</code> never changes. The receiver remembers processed ids, ideally in the same transaction as the work:</p>
+<pre><code><span class="c">-- receiver side, in the same transaction as acting on the event</span>
+INSERT INTO processed_webhooks (webhook_id) VALUES ($1)
+<span class="hl">ON CONFLICT DO NOTHING</span>
+RETURNING 1;          <span class="c">-- no row: already handled, reply 2xx and stop</span></code></pre>
+  <p>At-least-once delivery plus idempotent processing gives the effect people want from exactly-once. Email has no id check at the other end, so the same crash can occasionally send a briefing twice, a trade-off the plan documents openly.</p>
+
+  <div class="try">
+    <span class="label">Try it: sign, tamper, verify</span>
+    <ol>
+      <li>Paste this into a Python shell. It makes a secret in the <code>whsec_</code> format, signs an event the way the plan does, and verifies it as a receiver would.
+<pre><code>import base64, hashlib, hmac, os, time
+
+secret = "whsec_" + base64.b64encode(os.urandom(32)).decode()
+body = b'{"type":"briefing.ready"}'
+
+def sign(event_id, ts, raw):
+    key = base64.b64decode(secret.removeprefix("whsec_"))
+    signed = f"{event_id}.{ts}.".encode() + raw
+    return "v1," + base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode()
+
+def verify(event_id, ts, raw, header, now):
+    if abs(now - ts) &gt; 300:
+        return "rejected: stale timestamp"
+    expected = sign(event_id, ts, raw)
+    ok = any(hmac.compare_digest(expected, s) for s in header.split(" "))
+    return "accepted" if ok else "rejected: bad signature"
+
+ts = int(time.time())
+header = sign("evt_1", ts, body)</code></pre></li>
+      <li>Run four checks:
+<pre><code>print(verify("evt_1", ts, body, header, now=ts))
+print(verify("evt_1", ts, body.replace(b"ready", b"Ready"), header, now=ts))
+print(verify("evt_1", ts, body, header, now=ts + 600))
+print(verify("evt_1", ts, body, "v1,AAAA " + header, now=ts))</code></pre></li>
+    </ol>
+    <p>You should see <code>accepted</code>, then <code>rejected: bad signature</code> (one letter changed), then <code>rejected: stale timestamp</code> (ten minutes on), then <code>accepted</code>. The last is the rotation overlap, where one of two signatures is wrong and one match is enough. To pass the age check an attacker must change the timestamp, and without the key they can't compute the matching signature, which is why the timestamp is inside the signed string.</p>
+  </div>
+
+  <div class="ask">
+    <span class="label">If an interviewer asks</span>
+    <p class="q">"Can you guarantee a webhook is delivered exactly once?"</p>
+    <p>"No, and nothing can across a network. A crash after the receiver accepted a request but before I record it looks the same as a lost request, so I retry. I guarantee at-least-once, seven attempts over about 21 hours, and every event has a stable <code>webhook-id</code> that receivers use to drop duplicates."</p>
+    <p class="q">"How do you stop a replay and a retry from fighting over one delivery?"</p>
+    <p>"Every status change is one conditional <code>UPDATE … WHERE status = ANY($allowed_from)</code>. If it matches no row, something else already moved the delivery, so the handler logs a stale transition and stops without sending. A test runs the whole transition table, including the refused ones."</p>
+    <p class="q">"What was the double-escaping bug, and how does your design prevent it?"</p>
+    <p>"In Horizon two layers escaped the same text, so apostrophes reached the reader as <code>&amp;#x27;</code>. In my design text is decoded once at parse time, stays plain, and is escaped once by Jinja2, chosen by file extension so the text part is never escaped. CI bans <code>|safe</code>, and a golden test with hostile input fails on double or missing escaping."</p>
+  </div>
+  <label class="got"><input type="checkbox" id="got-delivery" data-ch="delivery"> I can explain this</label>
+</section>

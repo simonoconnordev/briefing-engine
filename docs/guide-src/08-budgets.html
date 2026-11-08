@@ -1,0 +1,468 @@
+<!-- ============================================================ -->
+<section class="ch" id="budgets">
+  <div class="ch-head"><span class="ch-num">Chapter 08</span><span class="plan-ref">plan §4, §7.7, ADR-013</span><h2>Money and budgets</h2></div>
+
+  <p>Every LLM call costs money, and each user has a monthly budget that concurrent jobs mustn't overspend. Several workers run at once, so two jobs for the same user can both see room in the budget and both spend it. The plan solves this with a ledger that records every call and a reservation system that stops concurrent jobs overspending, provided each call's cost estimate really is an upper bound.</p>
+  <p>The two parts arrive at different times. Checkpoints 1.1 to 1.4 record every call in the ledger and show the cost of each briefing, but enforce nothing beyond the spend limit on the Anthropic workspace, which caps the account as a whole. Budget enforcement arrives in stage 3, and its tables are created by the stage 3 migration.</p>
+
+  <h3>Every call writes one ledger row</h3>
+  <p>Each API call inserts one row into <code>llm_calls</code>, the <b>cost ledger</b>. It records:</p>
+  <ul>
+    <li><b>What the call was for.</b> The <code>purpose</code> (<code>score</code>, <code>writeup</code>, <code>enrich</code>, <code>eval</code> or <code>smoke</code>), the model and Anthropic's <code>request_id</code>.</li>
+    <li><b>What it used.</b> The four token counts from <code>response.usage</code>: input, output, cache read and cache write.</li>
+    <li><b>What it cost.</b> <code>cost_micros</code>, plus <code>estimate_micros</code>, the upper-bound estimate. Stage 1 stores it on every call without reserving it, so the ledger tests the estimate with real calls long before enforcement relies on it.</li>
+    <li><b>Who pays.</b> <code>user_id</code>, which is never null.</li>
+  </ul>
+  <p>The cost is calculated from <code>pricing.toml</code> at call time and stored. Recalculating it from today's prices would let a price change silently rewrite past months, and budgets and case-study numbers would stop matching the ledger.</p>
+
+  <h3>Storing money as integer micro-dollars</h3>
+  <p>Money is a <code>bigint</code> count of <b>micro-dollars</b> (µ$), where 1 USD = 1,000,000. Binary floating point can't represent most decimal fractions exactly (in Python, <code>0.1 + 0.2 == 0.3</code> is <code>False</code>), and adding thousands of tiny inexact costs drifts. Integers add exactly, so a budget comparison is never off by a rounding error.</p>
+  <p>Prices are stored the same way, as micro-dollars per million tokens:</p>
+  <ul>
+    <li><b>Haiku 5.5:</b> input <code>100_000</code> ($0.10), output <code>500_000</code> ($0.50).</li>
+    <li><b>Sonnet 5.5:</b> input <code>2_000_000</code> ($2), output <code>10_000_000</code> ($10).</li>
+  </ul>
+
+  <h4>Rounding up once per call</h4>
+  <p>Each call's cost is summed exactly over all token types, then <b>rounded up once</b> to a whole micro-dollar, using integer arithmetic only.</p>
+<pre><code>def ceil_div(a: int, b: int) -&gt; int:
+    return -(-a // b)                       <span class="c"># integer ceiling, no floats</span>
+
+cost_micros = ceil_div(<span class="hl">sum(tokens[t] * price_per_mtok_micros[t] for t in token_types)</span>, 1_000_000)</code></pre>
+  <div class="note example"><span class="label">Worked example</span>
+    <ol>
+      <li>A 451-token Haiku input costs 451 × 100,000 ÷ 1,000,000 = 45.1 µ$. It's stored as <b>46</b>.</li>
+      <li>A scoring batch uses 5,713 input and 587 output tokens. The exact sum is 571,300,000 + 293,500,000 = 864,800,000, which is 864.8 µ$. Rounded up once, it's <b>865</b>.</li>
+      <li>Rounding each token type separately would give 572 + 294 = 866, which is why only the final sum is rounded.</li>
+      <li>A batch of 5,700 input and 600 output tokens divides exactly: 570 + 300 = <b>870</b> µ$.</li>
+    </ol>
+  </div>
+  <p>Rounding up keeps budgets conservative, and the bias is under 1 µ$ per call. A typical day makes about 31 calls (30 scoring batches and one write-up), so that's under 31 µ$ a day.</p>
+
+  <h3>Who pays for each call</h3>
+  <p>Every call is charged to exactly one user, chosen by what the call is for:</p>
+  <ul>
+    <li><b>Write-ups</b> go to the briefing's owner.</li>
+    <li><b>Score batches</b> go to the <b>billed user</b>, chosen at enqueue time. Among the subscribers of the article's sources whose profile uses this rubric hash, it's the one whose matching profile version is oldest. Users who hit the cache afterwards pay nothing, and their <code>llm_cache_hits</code> row records the saving.</li>
+    <li><b>Work that belongs to nobody</b> goes to the <b>system user</b>: preset rubrics, shared enrichment, model evaluations, the nightly injection audit and the live smoke test.</li>
+  </ul>
+  <p>If the billed user is out of budget, the score job tries the other matching subscribers in the same order. If all of them are, it finishes as <code>succeeded</code>, logs <code>score.skipped_budget</code>, and those briefings degrade.</p>
+  <p>The system user is created by a stage 2 migration, when there is shared work to charge (ADR-013). In stage 1 you are the only user, so evaluation and audit calls are charged to you, and <code>llm_calls.purpose</code> keeps them apart in cost reports.</p>
+
+  <h4>Why a system user instead of a null</h4>
+  <p>The <b>system user</b> is one <code>users</code> row with <code>is_system = true</code>, and the partial index <code>UNIQUE(is_system) WHERE is_system</code> allows only one. It has no API keys and <code>email_enabled = false</code>, so nobody can log in as it or get its mail (ADR-013).</p>
+  <div class="split">
+    <div class="no"><h4>Nullable <code>user_id</code> for shared work</h4><p>Shared calls have no owner and no budget, so they need a separate spending path with its own cap. Every report needs an <code>IS NULL</code> special case, and unowned spend can grow unnoticed.</p></div>
+    <div class="yes"><h4>A system user with its own budget</h4><p>Shared work goes through the same reservation code and is capped by the system user's monthly budget. The cost is one special row that <code>GET /v1/me</code>, login and email must exclude.</p></div>
+  </div>
+  <p>The nightly live smoke test shows how this works. Its $0.10 cap is enforced twice:</p>
+  <ul>
+    <li><b>By Anthropic.</b> The test's own API key lives in a separate Console workspace with a spend limit set by hand, which holds even if our code is wrong.</li>
+    <li><b>By us.</b> It runs as the system user with <code>purpose = 'smoke'</code> and a dedicated budget of 100,000 µ$, through the normal reservation path, with <code>max_tokens = 1024</code>.</li>
+  </ul>
+  <p>The second cap isn't settled yet. A dedicated budget row clashes with the <code>usage_periods</code> key, which allows one row per user per month, and it depends on reservations, which don't exist before stage 3. The plan records this and resolves it in stage 3. Until then the workspace spend limit is the only cap.</p>
+
+  <h4>Splitting the cost is still an open question</h4>
+  <p>Splitting each shared call across every subscriber who benefits is fairer, but harder to explain and audit. The plan proposes the billed user and leaves the choice open as Q7. For three users on one preset and a batch costing 870 µ$:</p>
+  <ul>
+    <li><b>Billed user (proposed):</b> the first user pays 870, and the other two each get a cache-hit row saving 870.</li>
+    <li><b>Split:</b> each pays 290, but the split changes whenever someone subscribes or leaves, and the reservation must be made before the split is known.</li>
+  </ul>
+  <p>The ledger records calls and cache hits per user, so the case study can report what a split would have looked like either way.</p>
+
+  <h3>Why a simple budget check fails</h3>
+  <p>The obvious approach reads the user's spend, compares it with the limit, makes the call if there's room, and records the cost afterwards. That's correct with one worker and wrong with several. Take a limit of 1,000,000 µ$ ($1.00), current spend of 960,000, and two workers each about to spend 30,000.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 760 390" role="img" aria-label="Check-then-act race. The usage_periods row has a limit of 1,000,000 micros and spent of 960,000. Worker A reads spent as 960,000. Worker B also reads 960,000. Worker A checks that 990,000 is within 1,000,000 and calls the API. Worker B makes the same check and also calls the API. Worker A adds 30,000, making spent 990,000. Worker B adds 30,000, making spent 1,020,000, which is over the limit by 20,000.">
+        <defs>
+          <marker id="budgets-a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <line class="wire-dash" x1="150" y1="56" x2="150" y2="355"/>
+        <line class="wire-dash" x1="380" y1="112" x2="380" y2="355"/>
+        <line class="wire-dash" x1="610" y1="56" x2="610" y2="355"/>
+        <rect class="bx" x="80" y="20" width="140" height="36" rx="7"/>
+        <text class="t-head" x="150" y="43" text-anchor="middle">Worker A</text>
+        <rect class="bx-pg" x="290" y="20" width="180" height="36" rx="7"/>
+        <text class="t-head" x="380" y="43" text-anchor="middle">usage_periods row</text>
+        <rect class="bx" x="540" y="20" width="140" height="36" rx="7"/>
+        <text class="t-head" x="610" y="43" text-anchor="middle">Worker B</text>
+        <text class="t-mono" x="380" y="74" text-anchor="middle">limit 1,000,000 micros</text>
+        <rect class="bx" x="305" y="84" width="150" height="28" rx="6"/>
+        <text x="380" y="103" text-anchor="middle">spent = 960,000</text>
+
+        <path class="wire" d="M378 140 L152 140" marker-end="url(#budgets-a1)"/>
+        <text class="t-mono" x="265" y="133" text-anchor="middle">reads spent = 960,000</text>
+        <path class="wire" d="M382 175 L608 175" marker-end="url(#budgets-a1)"/>
+        <text class="t-mono" x="495" y="168" text-anchor="middle">reads spent = 960,000</text>
+
+        <rect class="bx-ok" x="60" y="192" width="180" height="44" rx="7"/>
+        <text class="t-sm" x="150" y="210" text-anchor="middle">990,000 ≤ 1,000,000</text>
+        <text class="t-sm" x="150" y="227" text-anchor="middle">check passes, calls API</text>
+        <rect class="bx-ok" x="520" y="210" width="180" height="44" rx="7"/>
+        <text class="t-sm" x="610" y="228" text-anchor="middle">990,000 ≤ 1,000,000</text>
+        <text class="t-sm" x="610" y="245" text-anchor="middle">check passes, calls API</text>
+
+        <path class="wire" d="M152 285 L303 285" marker-end="url(#budgets-a1)"/>
+        <text class="t-mono" x="228" y="278" text-anchor="middle">adds 30,000</text>
+        <rect class="bx" x="305" y="271" width="150" height="28" rx="6"/>
+        <text x="380" y="290" text-anchor="middle">spent = 990,000</text>
+        <path class="wire" d="M608 335 L457 335" marker-end="url(#budgets-a1)"/>
+        <text class="t-mono" x="533" y="328" text-anchor="middle">adds 30,000</text>
+        <rect class="bx-bad" x="305" y="321" width="150" height="28" rx="6"/>
+        <text x="380" y="340" text-anchor="middle">spent = 1,020,000</text>
+        <text class="t-sm" x="380" y="374" text-anchor="middle">over the limit by 20,000</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 8.1</b> A check-then-act race. Both workers read the same value, both checks pass, and both calls go ahead. Each decision was right for the value it read, but that value was stale by the time it acted.</figcaption>
+  </figure>
+  <p>This is a <b>check-then-act</b> race. Wrapping the read and the write in a transaction doesn't help on its own, because under Postgres's default isolation level two transactions can both read the same committed value before either writes.</p>
+
+  <h3>Making the check and the change one statement</h3>
+  <p>The plan moves the check into the <code>WHERE</code> clause of the <code>UPDATE</code> that changes the value. Check and write become one statement on one row, and Postgres guarantees no other write to that row can slip in between.</p>
+<pre><code>UPDATE usage_periods
+SET reserved_micros = reserved_micros + $est
+WHERE user_id = $u AND period_start = $p
+  <span class="hl">AND spent_micros + uncertain_micros + reserved_micros + $est &lt;= limit_micros</span>
+RETURNING 1;                      <span class="c">-- no row back: budget exhausted, don't call</span></code></pre>
+  <p>Each user has one <code>usage_periods</code> row per month (UTC). It holds the limit and three amounts that all count against it:</p>
+  <ul>
+    <li><b>Spent.</b> <code>spent_micros</code> is confirmed cost, taken from a response.</li>
+    <li><b>Reserved.</b> <code>reserved_micros</code> is money promised to calls in flight, so it can't be promised twice.</li>
+    <li><b>Uncertain.</b> <code>uncertain_micros</code> is the estimate of crashed calls whose outcome is unknown. It stays counted until the real cost turns up.</li>
+  </ul>
+  <p>If the condition fails, <code>RETURNING</code> gives no row and the caller knows the budget is exhausted.</p>
+  <div class="note principle"><span class="label">Key principle</span><p>When a decision depends on a value other processes can change, make the decision inside the statement that changes the value. A check done in application code is already out of date when you act on it.</p></div>
+
+  <h4>How Postgres orders two updates to the same row</h4>
+  <p>Postgres uses <b>MVCC</b> (multi-version concurrency control). An <code>UPDATE</code> writes a new version of the row and takes a <b>row-level lock</b> on it until its transaction ends. A second transaction that wants to update the same row waits for that lock.</p>
+  <p>Under <code>READ COMMITTED</code>, the Postgres default, the waiter checks again once the lock is free. If the first transaction committed, the waiter re-reads the latest committed version and evaluates its <code>WHERE</code> clause against it, updating only if the condition still holds. If the first transaction rolled back, the waiter carries on with the original version.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 800 410" role="img" aria-label="Two concurrent conditional updates under READ COMMITTED. The row starts with spent 960,000, uncertain 0 and reserved 0. Transaction A runs the UPDATE adding 30,000, which writes a new version with reserved 30,000, locked by A and not yet committed. Transaction B runs the same UPDATE and waits for A's row lock. A commits, so reserved 30,000 is committed, and A goes on to call the API. B re-reads the latest version and re-evaluates the WHERE clause: 960,000 plus 30,000 plus 30,000 is 1,020,000, more than 1,000,000, so there is no match. B's UPDATE affects 0 rows and returns nothing, so the budget is exhausted and B degrades.">
+        <defs>
+          <marker id="budgets-a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <line class="wire-dash" x1="130" y1="52" x2="130" y2="398"/>
+        <line class="wire-dash" x1="400" y1="52" x2="400" y2="398"/>
+        <line class="wire-dash" x1="670" y1="52" x2="670" y2="398"/>
+        <rect class="bx" x="60" y="16" width="140" height="36" rx="7"/>
+        <text class="t-head" x="130" y="39" text-anchor="middle">Transaction A</text>
+        <rect class="bx-pg" x="300" y="16" width="200" height="36" rx="7"/>
+        <text class="t-head" x="400" y="39" text-anchor="middle">usage_periods row</text>
+        <rect class="bx" x="600" y="16" width="140" height="36" rx="7"/>
+        <text class="t-head" x="670" y="39" text-anchor="middle">Transaction B</text>
+
+        <rect class="bx" x="262" y="64" width="276" height="28" rx="6"/>
+        <text class="t-mono" x="400" y="82" text-anchor="middle">spent 960,000, uncertain 0, reserved 0</text>
+
+        <path class="wire" d="M132 128 L288 128" marker-end="url(#budgets-a2)"/>
+        <text class="t-mono" x="210" y="121" text-anchor="middle">UPDATE … +30,000</text>
+        <rect class="bx-pg" x="290" y="106" width="220" height="44" rx="6"/>
+        <text class="t-sm" x="400" y="124" text-anchor="middle">new version: reserved 30,000</text>
+        <text class="t-sm" x="400" y="141" text-anchor="middle">row locked by A, uncommitted</text>
+
+        <path class="wire" d="M668 180 L402 180" marker-end="url(#budgets-a2)"/>
+        <text class="t-mono" x="535" y="173" text-anchor="middle">same UPDATE</text>
+        <rect class="bx-ghost" x="662" y="186" width="16" height="74" rx="4"/>
+        <text class="t-sm" x="688" y="218">waits for</text>
+        <text class="t-sm" x="688" y="234">A's row lock</text>
+
+        <path class="wire" d="M132 245 L288 245" marker-end="url(#budgets-a2)"/>
+        <text class="t-mono" x="210" y="238" text-anchor="middle">COMMIT</text>
+        <rect class="bx-ok" x="290" y="231" width="220" height="28" rx="6"/>
+        <text class="t-sm" x="400" y="249" text-anchor="middle">committed: reserved 30,000</text>
+
+        <rect class="bx" x="60" y="280" width="140" height="44" rx="7"/>
+        <text class="t-sm" x="130" y="298" text-anchor="middle">calls the API</text>
+        <text class="t-sm" x="130" y="315" text-anchor="middle">30,000 reserved</text>
+
+        <path class="wire" d="M402 300 L558 300" marker-end="url(#budgets-a2)"/>
+        <text class="t-mono" x="480" y="293" text-anchor="middle">re-evaluate WHERE</text>
+        <rect class="bx" x="560" y="270" width="220" height="62" rx="7"/>
+        <text class="t-sm" x="670" y="290" text-anchor="middle">re-reads the latest version:</text>
+        <text class="t-mono" x="670" y="307" text-anchor="middle">960k + 30k + 30k = 1,020k</text>
+        <text class="t-sm" x="670" y="323" text-anchor="middle">more than 1,000,000: no match</text>
+        <rect class="bx-bad" x="560" y="346" width="220" height="48" rx="7"/>
+        <text class="t-head" x="670" y="366" text-anchor="middle">UPDATE 0, no row</text>
+        <text class="t-sm" x="670" y="384" text-anchor="middle">budget exhausted: degrade</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 8.2</b> Two reservations on the same row under <code>READ COMMITTED</code>. B waits for A's lock, then checks its condition against the version A committed, which already includes A's reservation. B is refused.</figcaption>
+  </figure>
+  <p>Two details follow from this:</p>
+  <ul>
+    <li><b>Stay at the default level.</b> Under <code>REPEATABLE READ</code> or <code>SERIALIZABLE</code>, the waiter fails with "could not serialize access due to concurrent update" and has to be retried.</li>
+    <li><b>The lock is narrow.</b> It covers one user's row for one month, for the few milliseconds the statement takes. Different users never wait for each other.</li>
+  </ul>
+  <div class="split">
+    <div class="no"><h4>Read in Python, then update</h4><p><code>SELECT</code> the spend, compare in application code, then <code>UPDATE</code>. Any number of workers can read the same value in between, and the plan's test with 20 concurrent tasks will show spend going over the limit.</p></div>
+    <div class="yes"><h4>Conditional <code>UPDATE … RETURNING</code></h4><p>The comparison happens inside the statement, under the row lock, against the latest committed version. The same 20-task test shows confirmed plus uncertain spend never exceeding the limit.</p></div>
+  </div>
+
+  <h3>Reserve, call, settle</h3>
+  <p>The real cost is only known after the response arrives, but the budget decision has to come first. So each call has three steps:</p>
+  <ol>
+    <li><b>Reserve</b> an upper-bound estimate, in one short transaction that commits straight away.</li>
+    <li><b>Call</b> the API with no transaction open.</li>
+    <li><b>Settle</b> the reservation against the real cost, in one transaction with the <code>llm_calls</code> insert.</li>
+  </ol>
+  <p><b>Every potentially billable attempt takes its own reservation.</b> A retry after an error reserves again before it is sent, and so does each smaller call made by the split-and-retry fallback. Otherwise a retry could spend money that the budget never counted.</p>
+<pre><code><span class="c">-- 1. reserve, in one transaction</span>
+INSERT INTO usage_periods (user_id, period_start, limit_micros,
+                           reserved_micros, spent_micros, uncertain_micros)
+SELECT id, $p, monthly_budget_micros, 0, 0, 0 FROM users WHERE id = $u
+<span class="hl">ON CONFLICT DO NOTHING</span>;                         <span class="c">-- first call of the month creates the row</span>
+UPDATE usage_periods
+SET reserved_micros = reserved_micros + $est
+WHERE user_id = $u AND period_start = $p
+  AND spent_micros + uncertain_micros + reserved_micros + $est &lt;= limit_micros
+RETURNING 1;                                    <span class="c">-- no row: budget exhausted, roll back</span>
+INSERT INTO budget_reservations (id, user_id, period_start, amount_micros, purpose, expires_at)
+VALUES ($r, $u, $p, $est, $purpose, now() + $ttl);
+
+<span class="c">-- 3. settle, in one transaction with the llm_calls insert</span>
+UPDATE budget_reservations SET settled_at = now()
+WHERE id = $r AND settled_at IS NULL
+RETURNING expired_at;                           <span class="c">-- non-null: reaper moved it to uncertain</span>
+UPDATE usage_periods
+SET reserved_micros  = reserved_micros  - (CASE WHEN $expired THEN 0 ELSE $est END),
+    <span class="hl">uncertain_micros = uncertain_micros - (CASE WHEN $expired THEN $est ELSE 0 END)</span>,
+    spent_micros     = spent_micros + $actual
+WHERE user_id = $u AND period_start = $p;</code></pre>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 820 440" role="img" aria-label="Reservation lifecycle. Step 1, estimate an upper bound from UTF-8 bytes. Step 2, reserve: three statements in one commit. If no row is returned, the call is refused and the briefing degrades. If one row is returned, step 3 calls the API with no transaction open. Step 4 settles: the ledger row and the budget update in one transaction, so reserved goes down by the estimate and spent goes up by the actual cost. If the worker crashes during the call, the reservation row is left open. After its expires_at, 15 minutes or 25 hours for a batch, the reaper marks it expired and moves its amount from reserved to uncertain, which still counts against the limit. If the call settles afterwards, uncertain goes down by the estimate and spent goes up by the actual cost.">
+        <defs>
+          <marker id="budgets-a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="20" y="40" width="160" height="74" rx="8"/>
+        <text class="t-head" x="100" y="70" text-anchor="middle">1. Estimate</text>
+        <text class="t-sm" x="100" y="91" text-anchor="middle">UTF-8 bytes bound</text>
+        <rect class="bx-pg" x="225" y="40" width="160" height="74" rx="8"/>
+        <text class="t-head" x="305" y="70" text-anchor="middle">2. Reserve</text>
+        <text class="t-mono" x="305" y="91" text-anchor="middle">conditional UPDATE</text>
+        <rect class="bx" x="430" y="40" width="160" height="74" rx="8"/>
+        <text class="t-head" x="510" y="70" text-anchor="middle">3. Call the API</text>
+        <text class="t-sm" x="510" y="91" text-anchor="middle">no transaction open</text>
+        <rect class="bx-ok" x="635" y="40" width="160" height="74" rx="8"/>
+        <text class="t-head" x="715" y="66" text-anchor="middle">4. Settle</text>
+        <text class="t-sm" x="715" y="85" text-anchor="middle">ledger + budget,</text>
+        <text class="t-sm" x="715" y="101" text-anchor="middle">one transaction</text>
+        <path class="wire" d="M180 77 L223 77" marker-end="url(#budgets-a3)"/>
+        <path class="wire" d="M385 77 L428 77" marker-end="url(#budgets-a3)"/>
+        <text class="t-mono" x="407" y="68" text-anchor="middle">1 row</text>
+        <path class="wire" d="M590 77 L633 77" marker-end="url(#budgets-a3)"/>
+        <text class="t-sm" x="715" y="136" text-anchor="middle">reserved −= estimate,</text>
+        <text class="t-sm" x="715" y="152" text-anchor="middle">spent += actual</text>
+
+        <path class="wire" d="M305 114 L305 198" marker-end="url(#budgets-a3)"/>
+        <text class="t-mono" x="313" y="160">no row</text>
+        <rect class="bx-bad" x="225" y="200" width="160" height="56" rx="8"/>
+        <text class="t-head" x="305" y="222" text-anchor="middle">Refused</text>
+        <text class="t-sm" x="305" y="242" text-anchor="middle">degrade (figure 8.4)</text>
+
+        <path class="wire-dash" d="M510 114 L510 198" marker-end="url(#budgets-a3)"/>
+        <text class="t-mono" x="518" y="160">crash</text>
+        <rect class="bx-ghost" x="430" y="200" width="160" height="56" rx="8"/>
+        <text class="t-head" x="510" y="222" text-anchor="middle">Worker crashes</text>
+        <text class="t-sm" x="510" y="242" text-anchor="middle">reservation left open</text>
+        <path class="wire-dash" d="M510 256 L510 298" marker-end="url(#budgets-a3)"/>
+        <text class="t-mono" x="518" y="282">after expires_at</text>
+        <rect class="bx" x="430" y="300" width="160" height="56" rx="8"/>
+        <text class="t-head" x="510" y="322" text-anchor="middle">Reaper</text>
+        <text class="t-sm" x="510" y="342" text-anchor="middle">marks it expired</text>
+        <path class="wire" d="M590 328 L633 328" marker-end="url(#budgets-a3)"/>
+        <rect class="bx" x="635" y="300" width="160" height="56" rx="8"/>
+        <text class="t-head" x="715" y="322" text-anchor="middle">Uncertain spend</text>
+        <text class="t-mono" x="715" y="342" text-anchor="middle">reserved → uncertain</text>
+
+        <text class="t-sm" x="20" y="388">Lifetime ($ttl): 15 minutes for a normal call, 25 hours for a Message Batches submission.</text>
+        <text class="t-sm" x="20" y="406">Uncertain spend still counts against the limit, so an expired reservation frees nothing.</text>
+        <text class="t-sm" x="20" y="424">A late settle (logged as late_settle) does uncertain −= estimate and spent += actual.</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 8.3</b> The reservation lifecycle. The normal path runs along the top. A refused reservation leads to degradation. A crash leaves an open reservation row, and once it expires the reaper moves its amount into uncertain spend, which stays counted until a late settle replaces it with the real cost.</figcaption>
+  </figure>
+
+  <h4>The month's row is created by its first reservation</h4>
+  <p>Nothing creates <code>usage_periods</code> rows in advance. The first reservation of a month inserts the row, copying <code>limit_micros</code> from <code>users.monthly_budget_micros</code>. If two first reservations race, the second insert waits for the first to commit and then does nothing. The CLI command <code>set-budget</code> updates both the user and the current month's row.</p>
+
+  <h4>One row per reservation</h4>
+  <p>Each reservation is also a row in <code>budget_reservations</code>, with its amount, purpose and <code>expires_at</code>. The total in <code>usage_periods</code> can't tell you which reservations are stale, but the rows can, so a crashed call's reservation is dealt with without touching anyone else's. The lifetime, <code>$ttl</code>, is:</p>
+  <ul>
+    <li><b>15 minutes</b> for a normal call, far longer than any API call should take.</li>
+    <li><b>25 hours</b> for a Message Batches submission, because a batch can take up to 24 hours and must not expire while it's still running.</li>
+  </ul>
+
+  <h4>The reaper and a late settle</h4>
+  <p>The <b>reaper</b>, part of the scheduler, finds reservations past <code>expires_at</code> that are neither settled nor expired. It doesn't give the money back. In one transaction it sets their <code>expired_at</code> and moves exactly their amounts from <code>reserved_micros</code> to <code>uncertain_micros</code>, which still counts against the limit.</p>
+  <p>An expired reservation is a call whose outcome is unknown. The worker may have died before the request was sent, or after Anthropic charged for it but before the ledger row was written. Counting that money as spent until the real cost is known is what keeps the limit safe.</p>
+  <div class="note example"><span class="label">Worked example</span>
+    <p>A design review of revision 2 found this case. The limit is 1,000,000 µ$, spent is 900,000, and call X holds a 60,000 reservation when its worker stalls past <code>expires_at</code>.</p>
+    <ol>
+      <li><b>Revision 2 released it.</b> Reserved fell to 0 and 100,000 looked free, so call Y reserved and spent 100,000, making spent 1,000,000. Then X finished and settled its real cost of 50,000, and spent became 1,050,000, over the limit by 50,000.</li>
+      <li><b>Revision 3 moves it to uncertain.</b> Uncertain becomes 60,000 and only 40,000 is free, so Y's reservation of 100,000 is refused (900,000 + 60,000 + 100,000 is 1,060,000) and Y's briefing degrades.</li>
+      <li><b>X's late settle returns money.</b> Uncertain drops by 60,000 and spent rises by 50,000, so spent is 950,000, uncertain is 0, and 50,000 is free again.</li>
+    </ol>
+  </div>
+  <p>Settle and the reaper must never both act on the same reservation. Both update the reservation row with a condition, so its row lock decides:</p>
+  <ul>
+    <li><b>Settle first.</b> <code>settled_at</code> is set, so the reaper's condition no longer matches.</li>
+    <li><b>Reaper first.</b> Settle gets <code>expired_at</code> back, subtracts the estimate from <code>uncertain_micros</code> and adds the real cost to <code>spent_micros</code>. This <b>late settle</b> logs <code>late_settle</code>. If the estimate is a true upper bound, it returns money and never takes the user over budget.</li>
+  </ul>
+  <p>The <code>CHECK (reserved_micros &gt;= 0 AND spent_micros &gt;= 0 AND uncertain_micros &gt;= 0)</code> constraint is the backstop that makes a double subtraction fail loudly.</p>
+  <div class="note pitfall"><span class="label">Common mistake</span><p>Locking the budget row with <code>SELECT … FOR UPDATE</code>, making the API call, then committing. Every other call for that user then waits for the whole API call, a connection sits idle, and a crash holds the lock until the connection times out. The reservation commits at once, so the lock lasts milliseconds.</p></div>
+  <h4>Confirmed and uncertain spend are reported separately</h4>
+  <p><code>spent_micros</code> is cost established from a response, and <code>uncertain_micros</code> is allowance consumed conservatively because the outcome is unknown. Both count against the limit, and <code>GET /v1/usage</code> and the case-study reports show them as separate figures.</p>
+  <p>The price of this rule is wasted allowance. A crashed call can use up more of a user's budget than was really spent, temporarily if the call later settles, or indefinitely if it never does. The design doesn't recover the missing usage data or establish what Anthropic actually charged. A manual reconciliation against Anthropic's usage reports could correct <code>uncertain_micros</code>, but none is planned.</p>
+
+  <h4>Why settle shares a transaction with the ledger row</h4>
+  <p>If they were separate, a crash between them would leave spend with no ledger row, or the reverse. Together they give an invariant you can check with SQL: for each user and month, <code>spent_micros</code> equals the sum of <code>cost_micros</code> charged to that month.</p>
+  <p>One gap is left. If a worker crashes after Anthropic processed the call but before the settle commits, the real cost appears in neither table. The budget still counts the estimate as uncertain spend, so the limit holds if the estimate was a true bound, but only comparing the ledger with Anthropic's usage figures would show what was charged. A related case, a worker whose lease expires after a paid call and whose ledger row is then discarded, is recorded as open and is settled at checkpoint 1.2.</p>
+
+  <h3>An estimate that is a real upper bound</h3>
+  <p>The whole guarantee rests on the estimate. Concurrent jobs can't push confirmed plus uncertain spend past the limit provided the estimate is never lower than the real cost. If it ever is, settle adds more than was reserved and the user can go over. The formula:</p>
+<pre><code>estimate = (<span class="hl">UTF-8 bytes of the system prompt and messages</span> + 1,000) × input price
+         + max_tokens × output price</code></pre>
+  <ul>
+    <li><b>The output term</b> is a true ceiling, because the model can't produce more than <code>max_tokens</code>.</li>
+    <li><b>The input term</b> counts bytes. With a byte-level tokenizer every token covers at least one byte, so tokens can't outnumber bytes. The extra 1,000 is headroom on top.</li>
+  </ul>
+  <p>Anthropic doesn't publish its tokenizer, so this is an assumption about tokenisation, and the ledger tests it. Any call whose <code>cost_micros</code> exceeds its <code>estimate_micros</code> logs <code>estimate_exceeded</code>, and a nightly check fails if one appears.</p>
+  <div class="note example"><span class="label">Worked example</span>
+    <ol>
+      <li>A scoring batch sends 22,800 bytes of prompt: about 4,800 bytes of instructions and rubric, plus ten articles of about 1,800 bytes. Take <code>max_tokens = 1,024</code> as an illustrative value.</li>
+      <li>Estimate: (22,800 + 1,000) × 100,000 + 1,024 × 500,000 = 2,380,000,000 + 512,000,000, so <b>2,892</b> µ$ is reserved.</li>
+      <li>The call actually uses 5,700 input and 600 output tokens, so it costs <b>870</b> µ$.</li>
+      <li>Settle lowers <code>reserved_micros</code> by 2,892 and raises <code>spent_micros</code> by 870. The other 2,022 µ$ goes back to the available budget.</li>
+      <li>Had the worker stalled past <code>expires_at</code>, the reaper would have moved the 2,892 to <code>uncertain_micros</code>. A late settle would then lower <code>uncertain_micros</code> by 2,892 and raise <code>spent_micros</code> by 870, returning the same 2,022.</li>
+    </ol>
+  </div>
+  <p>The bound is loose, about 4× on English text (22,800 bytes against 5,700 tokens). That only matters within a few cents of the limit, and the difference comes back at settle. The exact alternative, the <code>count_tokens</code> endpoint, would add a round-trip to every call. The formula also prices all input at the ordinary rate, so if <code>pricing.toml</code> charges more for cache writes, the bound leans on the byte count's slack. The plan records this as unsettled, to be resolved in stage 3 when enforcement is built.</p>
+
+  <h3>What happens when the budget runs out</h3>
+  <p>A refused reservation never means no briefing. The plan drops the most expensive parts first. It never sends nothing, and it stays within the budget as long as the estimate holds.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 760 320" role="img" aria-label="Degradation ladder. Full briefing with Haiku scores and a Sonnet write-up. If a reservation is refused, step 1: no write-up, a ranked list with Haiku reasons as blurbs. If refused again, step 2: score only the top 30 candidates by heuristic. If refused again, step 3: heuristic only, ranked by source weight times recency times Hacker News points, with no LLM calls. Each rung spends less than the one above it. It always sends something, and stays within budget while the estimate holds.">
+        <defs>
+          <marker id="budgets-a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx-ok" x="20" y="20" width="340" height="52" rx="8"/>
+        <text class="t-head" x="35" y="42">Full briefing</text>
+        <text class="t-sm" x="35" y="61">Haiku scores, Sonnet write-up</text>
+        <rect class="bx" x="140" y="100" width="340" height="52" rx="8"/>
+        <text class="t-head" x="155" y="122">1. No write-up</text>
+        <text class="t-sm" x="155" y="141">ranked list, Haiku reasons as blurbs</text>
+        <rect class="bx" x="260" y="180" width="340" height="52" rx="8"/>
+        <text class="t-head" x="275" y="202">2. Fewer scores</text>
+        <text class="t-sm" x="275" y="221">score only the top 30 candidates by heuristic</text>
+        <rect class="bx-pg" x="380" y="260" width="360" height="52" rx="8"/>
+        <text class="t-head" x="395" y="282">3. Heuristic only</text>
+        <text class="t-sm" x="395" y="301">source weight × recency × HN points, no LLM calls</text>
+        <path class="wire" d="M80 72 L80 126 L138 126" marker-end="url(#budgets-a4)"/>
+        <text class="t-mono" x="88" y="104">refused</text>
+        <path class="wire" d="M200 152 L200 206 L258 206" marker-end="url(#budgets-a4)"/>
+        <text class="t-mono" x="208" y="184">refused</text>
+        <path class="wire" d="M320 232 L320 286 L378 286" marker-end="url(#budgets-a4)"/>
+        <text class="t-mono" x="328" y="264">refused</text>
+        <text class="t-sm" x="740" y="40" text-anchor="end">Each rung spends less</text>
+        <text class="t-sm" x="740" y="57" text-anchor="end">than the one above it.</text>
+        <text class="t-sm" x="20" y="283">Always sends something, and stays</text>
+        <text class="t-sm" x="20" y="300">within budget while the estimate holds.</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 8.4</b> The degradation ladder. The last rung makes no LLM calls, so it can always be built.</figcaption>
+  </figure>
+  <ol>
+    <li><b>Skip the write-up.</b> The Sonnet call is the largest single cost. The reader still gets the model's ranking, with Haiku's reasons as blurbs.</li>
+    <li><b>Score fewer articles.</b> Only the top 30 candidates by heuristic are scored, which cuts scoring by about 90% on a 300-article day.</li>
+    <li><b>Heuristic only.</b> Source weight × recency × HN points, with no LLM calls.</li>
+  </ol>
+  <p><code>GET /v1/usage</code> and the email footer show the budget state, so a degraded briefing explains itself, and <code>GET /v1/usage</code> gives confirmed and uncertain spend as separate figures.</p>
+
+  <h3>What a briefing should cost</h3>
+  <p>The plan expects about $0.05 to $0.06 per briefing, assuming about 300 new articles a day across the 15 Horizon sources. Stage 1 will check these figures.</p>
+  <ul>
+    <li><b>Scoring input.</b> 300 articles × about 450 tokens = 135K, plus 30 batches × about 1.2K instruction and rubric tokens = 36K, so 171K tokens are sent.</li>
+    <li><b>With the rubric cached.</b> The first batch pays full price for its 1.2K. The other 29 read 34.8K from the cache at 10% of the input price, which counts as 3.5K. That's 135K + 1.2K + 3.5K ≈ 139.7K full-price tokens, about <b>$0.014</b>. The 10% is the cache-read ratio on other current models and still needs checking for Haiku 5.5.</li>
+    <li><b>Without caching.</b> If the rubric prefix is below Haiku's minimum cacheable size, all 171K are full price, about <b>$0.017</b>.</li>
+    <li><b>Scoring output.</b> 300 × about 60 tokens = 18K, about <b>$0.009</b>.</li>
+    <li><b>Write-up.</b> About 8K input and 1.5K output tokens on Sonnet: $0.016 + $0.015 = <b>$0.031</b>.</li>
+  </ul>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 760 250" role="img" aria-label="Horizontal stacked bar chart, drawn to scale, of the estimated cost per briefing. Scoring with Haiku 5.5: input 0.014 dollars with the rubric cached, plus output 0.009 dollars, total 0.023 dollars, with a dashed extension of 0.003 dollars if the rubric is not cached. Write-up with Sonnet 5.5: input 0.016 dollars and output 0.015 dollars, total 0.031 dollars. The axis runs from 0 to 0.03 dollars. Total about 0.054 dollars per briefing with caching and 0.057 without.">
+        <rect class="bar" x="170" y="12" width="14" height="12"/>
+        <text class="t-sm" x="190" y="22">input tokens</text>
+        <rect class="bar-alt" x="290" y="12" width="14" height="12"/>
+        <text class="t-sm" x="310" y="22">output tokens</text>
+        <rect class="bx-ghost" x="420" y="12" width="14" height="12"/>
+        <text class="t-sm" x="440" y="22">extra if the rubric isn't cached</text>
+
+        <text class="t-head" x="158" y="70" text-anchor="end">Scoring</text>
+        <text class="t-sm" x="158" y="86" text-anchor="end">Haiku 5.5</text>
+        <text class="t-mono" x="282" y="50" text-anchor="middle">$0.014</text>
+        <text class="t-mono" x="466" y="50" text-anchor="middle">$0.009</text>
+        <rect class="bar" x="170" y="56" width="224" height="34"/>
+        <rect class="bar-alt" x="394" y="56" width="144" height="34"/>
+        <rect class="bx-ghost" x="538" y="56" width="48" height="34"/>
+        <text class="t-mono" x="596" y="78">= $0.023</text>
+
+        <text class="t-head" x="158" y="140" text-anchor="end">Write-up</text>
+        <text class="t-sm" x="158" y="156" text-anchor="end">Sonnet 5.5</text>
+        <text class="t-mono" x="298" y="120" text-anchor="middle">$0.016</text>
+        <text class="t-mono" x="546" y="120" text-anchor="middle">$0.015</text>
+        <rect class="bar" x="170" y="126" width="256" height="34"/>
+        <rect class="bar-alt" x="426" y="126" width="240" height="34"/>
+        <text class="t-mono" x="676" y="148">= $0.031</text>
+
+        <line class="axis" x1="170" y1="186" x2="730" y2="186"/>
+        <line class="axis" x1="170" y1="182" x2="170" y2="190"/><text class="t-mono" x="170" y="204" text-anchor="middle">$0.00</text>
+        <line class="axis" x1="330" y1="182" x2="330" y2="190"/><text class="t-mono" x="330" y="204" text-anchor="middle">$0.01</text>
+        <line class="axis" x1="490" y1="182" x2="490" y2="190"/><text class="t-mono" x="490" y="204" text-anchor="middle">$0.02</text>
+        <line class="axis" x1="650" y1="182" x2="650" y2="190"/><text class="t-mono" x="650" y="204" text-anchor="middle">$0.03</text>
+        <text class="t-sm" x="170" y="234">Total about $0.054 per briefing with the rubric cached, $0.057 without.</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 8.5</b> Expected cost per briefing, drawn to scale (one cent = 160 units). The single write-up call costs more than scoring all 300 articles.</figcaption>
+  </figure>
+  <p>The write-up, one call, is the larger share, a finding the case study can confirm or correct. Horizon scores everything with Sonnet, which this design should undercut by roughly ten times, and the shadow week will measure the real ratio.</p>
+
+  <h3>The Message Batches option</h3>
+  <p>Anthropic's Message Batches API charges 50% less, but results can take up to 24 hours. That suits articles fetched in the evening and doesn't suit items fetched at 06:00 for a 06:30 briefing. The plan proposes trying it in stage 3 for scoring that isn't urgent, and the decision is still open (Q9). The reservations are ready for it, because a batch reservation lives for 25 hours.</p>
+
+  <div class="try">
+    <span class="label">Try it: watch the conditional update serialise</span>
+    <ol>
+      <li>Start a throwaway Postgres with <code>docker run --rm --name pg -e POSTGRES_PASSWORD=x postgres:17</code>, then open two more terminals and run <code>docker exec -it pg psql -U postgres</code> in each.</li>
+      <li>In terminal 1, create the row and reserve, leaving the transaction open:
+<pre><code>CREATE TABLE usage_periods (user_id int PRIMARY KEY, limit_micros bigint,
+  reserved_micros bigint DEFAULT 0, spent_micros bigint, uncertain_micros bigint DEFAULT 0);
+INSERT INTO usage_periods VALUES (1, 1000000, 0, 960000, 0);
+
+BEGIN;
+UPDATE usage_periods SET reserved_micros = reserved_micros + 30000
+WHERE user_id = 1
+  AND spent_micros + uncertain_micros + reserved_micros + 30000 &lt;= limit_micros
+RETURNING reserved_micros;   <span class="c">-- returns 30000</span></code></pre></li>
+      <li>In terminal 2, run the same <code>UPDATE</code> without <code>BEGIN</code>. It hangs, because terminal 1 holds the row lock.</li>
+      <li>Type <code>COMMIT;</code> in terminal 1.</li>
+      <li>Reset with <code>UPDATE usage_periods SET reserved_micros = 0;</code> and repeat, but end terminal 1 with <code>ROLLBACK;</code> instead.</li>
+      <li>Now play the reaper. Terminal 2's successful reservation is still held, so expire it with <code>UPDATE usage_periods SET reserved_micros = reserved_micros - 30000, uncertain_micros = uncertain_micros + 30000;</code> and run the reservation <code>UPDATE</code> once more.</li>
+    </ol>
+    <p>After the commit, terminal 2 finishes at once with <code>UPDATE 0</code> and no row. It re-checked its condition against the committed version, and 960,000 + 30,000 + 30,000 is over the limit. After the rollback, terminal 2 succeeds and returns 30000, because the version it re-checks is the original one. The final reservation is refused too, because the expired 30,000 still counts as uncertain spend.</p>
+  </div>
+
+  <div class="ask">
+    <span class="label">If an interviewer asks</span>
+    <p class="q">"Two jobs run at the same time and both think there's budget left. What happens?"</p>
+    <p>"Each job reserves its worst-case cost with one conditional <code>UPDATE</code>. The second job waits for the row lock, then, under <code>READ COMMITTED</code>, re-checks its condition against the row the first job committed. That row already includes the first reservation, so the second job is refused and its briefing degrades. A test with 20 concurrent jobs checks that confirmed plus uncertain spend never exceeds the limit. That guarantee assumes the estimate is a true upper bound, and the ledger flags any call that exceeds its estimate."</p>
+    <p class="q">"What if a worker dies in the middle of a call?"</p>
+    <p>"Each reservation is a row with an expiry, 15 minutes or 25 hours for a batch. The outcome of an expired call is unknown, since Anthropic may already have charged for it, so the reaper doesn't release the money. It moves exactly that amount from reserved to uncertain spend, which still counts against the limit. If the call finishes afterwards, settle sees <code>expired_at</code>, swaps the estimate for the real cost and logs <code>late_settle</code>, which gives money back. The cost is that a call that never settles keeps using allowance, and usage reports show that uncertain spend separately."</p>
+    <p class="q">"Who pays when several users share a cached score?"</p>
+    <p>"The subscriber who brought that rubric first pays for the miss. Everyone who hits the cache pays nothing and gets a row recording the saving. Work with no owner goes to a system user with its own budget, so the same code caps it. Splitting costs is fairer but harder to audit, and that choice is still open."</p>
+  </div>
+  <label class="got"><input type="checkbox" id="got-budgets" data-ch="budgets"> I can explain this</label>
+</section>

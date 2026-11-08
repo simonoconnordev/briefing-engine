@@ -1,0 +1,588 @@
+<!-- ============================================================ -->
+<section class="ch" id="api">
+  <div class="ch-head"><span class="ch-num">Chapter 10</span><span class="plan-ref">plan §5, §4.2, §6.1, ADR-004, ADR-008</span><h2>The API surface</h2></div>
+
+  <p>There is no web UI, so the REST API under <code>/v1</code> is the whole interface. Clients send an API key, page through articles that keep arriving, retry after timeouts, and in stage 2 submit URLs that your workers will fetch.</p>
+  <p>Each of those is where a naive API breaks. Keys leak from a stolen database, pages repeat rows, a retry builds the same thing twice, or the server is tricked into reading its own cloud credentials.</p>
+
+  <h3>What an API key looks like</h3>
+  <p>A key has the format <code>bek_&lt;12-char prefix&gt;_&lt;32 random bytes, base62&gt;</code>. Self-service sign-up and OAuth are non-goals, so the key is the whole of a user's identity.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 820 210" role="img" aria-label="Anatomy of an API key. The example key is bek_ followed by the prefix k7Qm2xR9aLp4, an underscore, and a 43 character base62 secret. The marker bek_ lets secret scanners recognise a leak. The 12 character prefix is a non-secret lookup id shown in key listings. The secret is 32 random bytes, 256 bits of entropy, encoded as 43 base62 characters and shown once at creation. The api_keys table stores the prefix and the SHA-256 of the secret, never the key itself. The whole key is 60 characters.">
+        <defs>
+          <marker id="api-a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <text class="t-sm" x="20" y="24">An example key, made up for this guide</text>
+        <rect class="bx-pg" x="20" y="36" width="50" height="38" rx="6"/>
+        <text class="t-mono" x="45" y="59" text-anchor="middle">bek_</text>
+        <rect class="bx" x="76" y="36" width="104" height="38" rx="6"/>
+        <text class="t-mono" x="128" y="59" text-anchor="middle">k7Qm2xR9aLp4</text>
+        <rect class="bx-ghost" x="186" y="36" width="22" height="38" rx="6"/>
+        <text class="t-mono" x="197" y="59" text-anchor="middle">_</text>
+        <rect class="bx-ok" x="214" y="36" width="304" height="38" rx="6"/>
+        <text class="t-mono" x="366" y="59" text-anchor="middle">NyVpMWu6pEspYqOkGVXOzYwHTQHLaIsCmhkvZm6WpCX</text>
+
+        <text class="t-mono" x="559" y="47" text-anchor="middle">SHA-256</text>
+        <path class="wire" d="M518 55 H598" marker-end="url(#api-a1)"/>
+        <rect class="bx-pg" x="600" y="30" width="200" height="96" rx="8"/>
+        <text class="t-head" x="700" y="52" text-anchor="middle">Stored in api_keys</text>
+        <text class="t-mono" x="700" y="72" text-anchor="middle">prefix = k7Qm2xR9aLp4</text>
+        <text class="t-mono" x="700" y="90" text-anchor="middle">secret_hash = 32 bytes</text>
+        <text class="t-sm" x="700" y="110" text-anchor="middle">the key itself is not kept</text>
+
+        <path class="wire" d="M45 74 V100"/>
+        <text class="t-head" x="20" y="118">Marker</text>
+        <text class="t-sm" x="20" y="136">lets secret scanners</text>
+        <text class="t-sm" x="20" y="152">recognise a leak</text>
+
+        <path class="wire" d="M160 74 V100"/>
+        <text class="t-head" x="160" y="118">Prefix, 12 characters</text>
+        <text class="t-sm" x="160" y="136">non-secret lookup id</text>
+        <text class="t-sm" x="160" y="152">shown in key listings</text>
+
+        <path class="wire" d="M400 74 V100"/>
+        <text class="t-head" x="340" y="118">Secret, 32 random bytes</text>
+        <text class="t-sm" x="340" y="136">base62, 43 characters</text>
+        <text class="t-sm" x="340" y="152">256 bits of entropy</text>
+        <text class="t-sm" x="340" y="168">shown once, at creation</text>
+
+        <text class="t-sm" x="20" y="196">The whole key is 4 + 12 + 1 + 43 = 60 characters.</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 10.1</b> The three parts of a key and what the database keeps. Only the prefix and a hash of the secret are stored.</figcaption>
+  </figure>
+  <ul>
+    <li><b>The marker <code>bek_</code>.</b> It gives keys a recognisable shape, so secret scanners such as GitHub push protection and trufflehog can spot them. You can also grep logs and repositories for leaks.</li>
+    <li><b>The prefix.</b> A unique, non-secret id for the key's row. It appears in <code>GET /v1/api-keys</code> and is safe to log.</li>
+    <li><b>The secret.</b> 32 bytes from a cryptographically secure source, encoded in base62 (digits and both cases of letters). That fits 256 bits into 43 characters with no punctuation to break when copied.</li>
+  </ul>
+  <p>The full key appears once, in the response to <code>POST /v1/api-keys</code>. <code>DELETE /v1/api-keys/{id}</code> sets <code>revoked_at</code>, and the key stops working on its next request.</p>
+
+  <h3>Why SHA-256 is enough for API keys</h3>
+  <p>The plan stores <code>SHA-256(secret)</code>, a fast hash, although passwords need a slow one such as argon2id or bcrypt (ADR-004). Both rules are right, and the reason is entropy.</p>
+  <p><b>Entropy</b> measures how unpredictable a secret is, in bits. A secret with <i>n</i> bits is as hard to guess as one value out of 2<sup><i>n</i></sup>. Human passwords have far less entropy than their length suggests, because people pick words and patterns.</p>
+  <p>An attacker with your stolen <code>api_keys</code> table can't reverse the hashes, so they hash candidates and compare. A slow hash makes each guess cost more, and it can't add entropy.</p>
+  <figure>
+    <div class="tbl"><table>
+      <thead><tr><th>Secret</th><th>Entropy</th><th>Possible values</th><th>Time to try them all at 10<sup>10</sup> SHA-256 guesses a second</th></tr></thead>
+      <tbody>
+        <tr><td>A password from a list of the 10 million most common</td><td>about 23 bits</td><td>10<sup>7</sup></td><td class="badc">1 millisecond</td></tr>
+        <tr><td>8 random lower-case letters</td><td>about 38 bits</td><td>2.1 × 10<sup>11</sup></td><td class="badc">21 seconds</td></tr>
+        <tr><td>An API key secret, 32 random bytes</td><td>256 bits</td><td>1.2 × 10<sup>77</sup></td><td class="good">about 3.7 × 10<sup>59</sup> years</td></tr>
+      </tbody>
+    </table></div>
+    <figcaption><b>Figure 10.2</b> Guessing cost against entropy, at a round guess rate of the order one high-end GPU reaches. A hash 100,000 times slower stretches 21 seconds to about 24 days. The universe is about 1.4 × 10<sup>10</sup> years old.</figcaption>
+  </figure>
+  <p>For a password, the slow hash is what protects users after a leak. For a 256-bit random secret, brute force is out of reach at any speed, so a fast hash loses nothing and keeps authentication well under a millisecond.</p>
+  <p>If a reviewer presses, ADR-004 records a cheap extra defence. A <b>pepper</b> computes <code>HMAC(key, secret)</code> with a key from Secrets Manager, so a leaked database alone isn't enough even to check a guess.</p>
+  <div class="note principle"><span class="label">Key principle</span><p>A slow hash makes up for low entropy and can't create it. Human-chosen secrets need a deliberately slow, memory-hard hash. Machine-generated secrets with 128 bits or more can use a fast one.</p></div>
+
+  <h3>How a request is authenticated</h3>
+  <p>The FastAPI auth dependency parses <code>Authorization: Bearer &lt;key&gt;</code>, splits off the prefix and fetches the live key with that prefix:</p>
+<pre><code>SELECT id, user_id, secret_hash, scopes, last_used_at
+FROM api_keys
+WHERE <span class="hl">prefix = $1</span>
+  AND revoked_at IS NULL
+  AND (expires_at IS NULL OR expires_at &gt; now());</code></pre>
+  <p>Then it hashes the presented secret and compares the two hashes:</p>
+<pre><code>presented = hashlib.sha256(secret.encode()).digest()
+if row is None or not <span class="hl">hmac.compare_digest(presented, row.secret_hash)</span>:
+    raise unauthorized()        <span class="c"># one 401 for every failure</span></code></pre>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 840 260" role="img" aria-label="Authentication flow. A request carries Authorization Bearer bek_ and so on. The key is parsed into marker, prefix and secret. The row is found by prefix, excluding revoked and expired keys. The SHA-256 of the presented secret is compared with the stored hash using compare_digest. On success the request is authenticated with the user and scopes. A malformed key, a missing row, or a hash that differs all lead to the same 401 Unauthorized response. An authenticated key that lacks the scope the route needs gets 403 Forbidden with problem type insufficient-scope.">
+        <defs>
+          <marker id="api-a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="15" y="40" width="145" height="84" rx="8"/>
+        <text class="t-head" x="87" y="66" text-anchor="middle">Request</text>
+        <text class="t-sm" x="87" y="86" text-anchor="middle">Authorization:</text>
+        <text class="t-mono" x="87" y="104" text-anchor="middle">Bearer bek_…</text>
+
+        <rect class="bx" x="180" y="40" width="145" height="84" rx="8"/>
+        <text class="t-head" x="252" y="66" text-anchor="middle">Parse the key</text>
+        <text class="t-sm" x="252" y="86" text-anchor="middle">split into marker,</text>
+        <text class="t-sm" x="252" y="104" text-anchor="middle">prefix and secret</text>
+
+        <rect class="bx-pg" x="345" y="40" width="145" height="84" rx="8"/>
+        <text class="t-head" x="417" y="62" text-anchor="middle">Find the row</text>
+        <text class="t-mono" x="417" y="82" text-anchor="middle">WHERE prefix = $1</text>
+        <text class="t-sm" x="417" y="100" text-anchor="middle">not revoked,</text>
+        <text class="t-sm" x="417" y="116" text-anchor="middle">not expired</text>
+
+        <rect class="bx" x="510" y="40" width="145" height="84" rx="8"/>
+        <text class="t-head" x="582" y="66" text-anchor="middle">Compare hashes</text>
+        <text class="t-mono" x="582" y="86" text-anchor="middle">SHA-256(secret)</text>
+        <text class="t-mono" x="582" y="104" text-anchor="middle">compare_digest</text>
+
+        <rect class="bx-ok" x="675" y="40" width="145" height="84" rx="8"/>
+        <text class="t-head" x="747" y="66" text-anchor="middle">Authenticated</text>
+        <text class="t-sm" x="747" y="86" text-anchor="middle">user and scopes</text>
+        <text class="t-sm" x="747" y="104" text-anchor="middle">for this request</text>
+
+        <path class="wire" d="M160 82 H178" marker-end="url(#api-a2)"/>
+        <path class="wire" d="M325 82 H343" marker-end="url(#api-a2)"/>
+        <path class="wire" d="M490 82 H508" marker-end="url(#api-a2)"/>
+        <path class="wire" d="M655 82 H673" marker-end="url(#api-a2)"/>
+
+        <path class="wire" d="M290 124 V188" marker-end="url(#api-a2)"/>
+        <path class="wire" d="M417 124 V188" marker-end="url(#api-a2)"/>
+        <path class="wire" d="M560 124 V188" marker-end="url(#api-a2)"/>
+        <path class="wire" d="M747 124 V188" marker-end="url(#api-a2)"/>
+        <text class="t-sm" x="296" y="160">malformed</text>
+        <text class="t-sm" x="423" y="160">no row</text>
+        <text class="t-sm" x="566" y="160">hash differs</text>
+        <text class="t-sm" x="741" y="160" text-anchor="end">lacks the scope</text>
+
+        <rect class="bx-bad" x="250" y="190" width="340" height="50" rx="8"/>
+        <text class="t-head" x="420" y="212" text-anchor="middle">401 Unauthorized</text>
+        <text class="t-sm" x="420" y="230" text-anchor="middle">same status and body, whichever check failed</text>
+
+        <rect class="bx-bad" x="640" y="190" width="185" height="50" rx="8"/>
+        <text class="t-head" x="732" y="212" text-anchor="middle">403 Forbidden</text>
+        <text class="t-mono" x="732" y="230" text-anchor="middle">insufficient-scope</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 10.3</b> The authentication pipeline. Three different failures give one identical <code>401</code>, so a client learns only that the key didn't work. A working key without the route's scope gets <code>403</code>.</figcaption>
+  </figure>
+  <ul>
+    <li><b>Look up by prefix.</b> The query uses the small <code>UNIQUE(prefix)</code> index, and every key gets a safe public name. Looking up by hash would leave nothing non-secret to log.</li>
+    <li><b>Compare with <code>hmac.compare_digest</code>.</b> <code>==</code> can stop at the first differing byte, so timing could reveal how much matched. For hashes that leak is nearly useless, but the constant-time function costs nothing.</li>
+    <li><b>One <code>401</code> for every failure.</b> A missing, malformed, unknown, wrong, revoked or expired key gets the same status and body. If "key revoked" differed from "key not found", someone holding an old leaked key would learn it once existed. The detail goes to your logs under the request id.</li>
+  </ul>
+
+  <h4>Scopes, and when to answer 403</h4>
+  <p>Each key has <code>scopes</code>, in stage 2 just <code>read</code> and <code>write</code>, checked by a per-route FastAPI dependency. That's enough to give a dashboard a key that reads briefings but can't change subscriptions or start builds.</p>
+  <p>A valid key without the needed scope gets <code>403</code>, problem type <code>insufficient-scope</code>, with the header RFC 6750 defines for this case:</p>
+<pre><code>HTTP/1.1 403 Forbidden
+WWW-Authenticate: Bearer error="insufficient_scope", scope="write"</code></pre>
+  <p><code>401</code> means "I couldn't establish who you are". <code>403</code> means "I know who you are, and this key may not do that", and the header says which scope would.</p>
+
+  <h4>Recording <code>last_used_at</code> without a write per request</h4>
+  <p><code>last_used_at</code> shows which keys are still in use, so you can revoke stale ones with confidence. The plan writes it at most once a minute per key.</p>
+  <p>Each Postgres update creates a new row version that goes to the write-ahead log and must later be vacuumed. A dashboard polling once a second would cause 86,400 writes a day, and the rule caps that at 1,440. Skip the write when the value you just read is recent, and use a conditional update for requests that arrive together:</p>
+<pre><code>UPDATE api_keys SET last_used_at = now()
+WHERE id = $1
+  AND (last_used_at IS NULL OR last_used_at &lt; now() - interval '1 minute');</code></pre>
+
+  <div class="note pitfall"><span class="label">Common mistake</span><p>Logging the raw request while debugging authentication. One <code>logger.debug(request.headers)</code> writes live keys into your log store for its whole retention period. Put the redaction of <code>Authorization</code> and of anything matching <code>bek_</code> in the logging configuration itself, and test it by logging a fake key.</p></div>
+
+  <h3>Why offset pagination breaks on a growing list</h3>
+  <p>Lists such as <code>GET /v1/articles</code> come in pages, with <code>limit</code> defaulting to 50 and capped at 200. <b>Offset pagination</b> asks for page 2 as <code>ORDER BY first_seen_at DESC LIMIT 50 OFFSET 50</code>, and it has two faults:</p>
+  <ul>
+    <li><b>Repeats and gaps.</b> New articles go in at the top of a newest-first list and push everything down, so page 2 repeats rows from page 1. Deletions do the opposite and skip rows.</li>
+    <li><b>Cost that grows with depth.</b> For <code>OFFSET 100000</code>, Postgres must produce 100,000 rows in order and throw them away.</li>
+  </ul>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 820 470" role="img" aria-label="Offset pagination with rows shifting. Request 1 uses OFFSET 0 LIMIT 5 on ten articles a10 to a1, newest first, and returns a10 to a6 as page 1. Between the requests, three new articles n1 to n3 arrive at the top. Request 2 uses OFFSET 5 LIMIT 5 on the thirteen rows now present and returns a8, a7, a6, a5 and a4. The first three were already seen on page 1. Keyset pagination would instead ask for rows older than a6 and get a5 to a1.">
+        <defs>
+          <marker id="api-a3acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <text class="t-head" x="150" y="30" text-anchor="middle">Request 1</text>
+        <text class="t-mono" x="150" y="48" text-anchor="middle">OFFSET 0 LIMIT 5</text>
+        <rect class="bx-pg" x="60" y="64" width="180" height="24" rx="4"/><text class="t-mono" x="150" y="80" text-anchor="middle">a10  06:50</text>
+        <rect class="bx-pg" x="60" y="92" width="180" height="24" rx="4"/><text class="t-mono" x="150" y="108" text-anchor="middle">a9  06:45</text>
+        <rect class="bx-pg" x="60" y="120" width="180" height="24" rx="4"/><text class="t-mono" x="150" y="136" text-anchor="middle">a8  06:40</text>
+        <rect class="bx-pg" x="60" y="148" width="180" height="24" rx="4"/><text class="t-mono" x="150" y="164" text-anchor="middle">a7  06:35</text>
+        <rect class="bx-pg" x="60" y="176" width="180" height="24" rx="4"/><text class="t-mono" x="150" y="192" text-anchor="middle">a6  06:30</text>
+        <rect class="bx" x="60" y="204" width="180" height="24" rx="4"/><text class="t-mono" x="150" y="220" text-anchor="middle">a5  06:25</text>
+        <rect class="bx" x="60" y="232" width="180" height="24" rx="4"/><text class="t-mono" x="150" y="248" text-anchor="middle">a4  06:20</text>
+        <rect class="bx" x="60" y="260" width="180" height="24" rx="4"/><text class="t-mono" x="150" y="276" text-anchor="middle">a3  06:15</text>
+        <rect class="bx" x="60" y="288" width="180" height="24" rx="4"/><text class="t-mono" x="150" y="304" text-anchor="middle">a2  06:10</text>
+        <rect class="bx" x="60" y="316" width="180" height="24" rx="4"/><text class="t-mono" x="150" y="332" text-anchor="middle">a1  06:05</text>
+        <text class="t-sm" x="52" y="136" text-anchor="end">page 1</text>
+
+        <text class="t-sm" x="360" y="130" text-anchor="middle">between the requests,</text>
+        <text class="t-sm" x="360" y="146" text-anchor="middle">3 new articles arrive</text>
+        <path class="wire-acc" d="M250 160 H468" marker-end="url(#api-a3acc)"/>
+
+        <text class="t-head" x="570" y="30" text-anchor="middle">Request 2</text>
+        <text class="t-mono" x="570" y="48" text-anchor="middle">OFFSET 5 LIMIT 5</text>
+        <rect class="bx-ok" x="480" y="64" width="180" height="24" rx="4"/><text class="t-mono" x="570" y="80" text-anchor="middle">n3  06:58</text>
+        <rect class="bx-ok" x="480" y="92" width="180" height="24" rx="4"/><text class="t-mono" x="570" y="108" text-anchor="middle">n2  06:55</text>
+        <rect class="bx-ok" x="480" y="120" width="180" height="24" rx="4"/><text class="t-mono" x="570" y="136" text-anchor="middle">n1  06:52</text>
+        <rect class="bx" x="480" y="148" width="180" height="24" rx="4"/><text class="t-mono" x="570" y="164" text-anchor="middle">a10  06:50</text>
+        <rect class="bx" x="480" y="176" width="180" height="24" rx="4"/><text class="t-mono" x="570" y="192" text-anchor="middle">a9  06:45</text>
+        <rect class="bx-bad" x="480" y="204" width="180" height="24" rx="4"/><text class="t-mono" x="570" y="220" text-anchor="middle">a8  06:40</text>
+        <rect class="bx-bad" x="480" y="232" width="180" height="24" rx="4"/><text class="t-mono" x="570" y="248" text-anchor="middle">a7  06:35</text>
+        <rect class="bx-bad" x="480" y="260" width="180" height="24" rx="4"/><text class="t-mono" x="570" y="276" text-anchor="middle">a6  06:30</text>
+        <rect class="bx-pg" x="480" y="288" width="180" height="24" rx="4"/><text class="t-mono" x="570" y="304" text-anchor="middle">a5  06:25</text>
+        <rect class="bx-pg" x="480" y="316" width="180" height="24" rx="4"/><text class="t-mono" x="570" y="332" text-anchor="middle">a4  06:20</text>
+        <rect class="bx" x="480" y="344" width="180" height="24" rx="4"/><text class="t-mono" x="570" y="360" text-anchor="middle">a3  06:15</text>
+        <rect class="bx" x="480" y="372" width="180" height="24" rx="4"/><text class="t-mono" x="570" y="388" text-anchor="middle">a2  06:10</text>
+        <rect class="bx" x="480" y="400" width="180" height="24" rx="4"/><text class="t-mono" x="570" y="416" text-anchor="middle">a1  06:05</text>
+        <text class="t-sm" x="670" y="108">new articles</text>
+        <text class="t-sm" x="670" y="248">already seen on page 1</text>
+        <text class="t-sm" x="670" y="318">new to the client</text>
+        <text class="t-sm" x="470" y="276" text-anchor="end">page 2</text>
+
+        <text class="t-sm" x="410" y="452" text-anchor="middle">Keyset pagination asks for rows older than a6 instead, and gets a5 to a1 whatever arrives at the top.</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 10.4</b> Rows shifting under offset pagination. Three inserts between two requests make page 2 repeat three articles.</figcaption>
+  </figure>
+
+  <h3>How keyset pagination continues from the last row</h3>
+  <p><b>Keyset pagination</b>, also called cursor pagination, asks for the rows after the last one the client saw, identified by its sort key. Articles sort by <code>(first_seen_at DESC, id DESC)</code>:</p>
+<pre><code>SELECT …
+FROM articles
+WHERE <span class="hl">(first_seen_at, id) &lt; ($t, $id)</span>     <span class="c">-- the last row of the previous page</span>
+ORDER BY first_seen_at DESC, id DESC
+LIMIT $n + 1;                               <span class="c">-- one extra row, explained below</span></code></pre>
+  <p>The condition is a <b>row-value comparison</b>, which compares pairs column by column, like dictionary order. <code>(a, b) &lt; (x, y)</code> is true when <code>a &lt; x</code>, or when <code>a = x</code> and <code>b &lt; y</code>. The <code>id</code> breaks ties between articles that share a <code>first_seen_at</code>, so no row is skipped or repeated at a page boundary.</p>
+  <div class="note example"><span class="label">Worked example</span>
+    <p>The previous page ended with the row <code>(06:30:00, 12345)</code>.</p>
+    <ol>
+      <li><code>(06:30:00, 12346)</code> is excluded. In <code>id DESC</code> order it came before 12345, so it was on the previous page.</li>
+      <li><code>(06:30:00, 12344)</code> is included. Same timestamp, smaller id, so it's the next row after the boundary.</li>
+      <li><code>(06:29:59, 99999)</code> is included, because its timestamp is earlier, whatever its id.</li>
+      <li>A new article at 06:58 is later than the boundary, so it can never appear on this page or shift it.</li>
+    </ol>
+  </div>
+  <ul>
+    <li><b>A composite index for each list.</b> The plan gives each paginated list one that matches its sort: <code>articles (first_seen_at, id)</code>, <code>briefings (user_id, briefing_date, id)</code> and <code>subscriptions (user_id, created_at, id)</code>. A B-tree scans backwards for <code>DESC</code>, so page 1,000 costs the same short scan as page 1.</li>
+    <li><b>Limit + 1.</b> The query fetches one extra row. If 51 come back for a limit of 50, the server returns 50 and builds <code>next_cursor</code> from the 50th. Otherwise <code>next_cursor</code> is <code>null</code>, and no <code>COUNT(*)</code> was needed.</li>
+    <li><b>A test of the query plan.</b> <code>GET /v1/articles</code> joins your subscriptions through <code>article_sources</code> to <code>articles</code>. An integration test runs <code>EXPLAIN</code> on the seeded load-test data and fails on a sequential scan of <code>articles</code>.</li>
+  </ul>
+  <div class="split">
+    <div class="no"><h4>Offset and limit</h4><p>Page numbers and a total count. Rows repeat or vanish when data changes, and cost grows with depth.</p></div>
+    <div class="yes"><h4>Keyset with a cursor</h4><p>Stable under inserts and constant cost at any depth. No "jump to page 7" and no total count, which ADR-008 judges an API client doesn't need.</p></div>
+  </div>
+
+  <h3>What's inside a cursor, and why it's signed</h3>
+  <p>The client receives an opaque <code>next_cursor</code> and sends it back unchanged. Its format is <code>&lt;payload&gt;.&lt;sig&gt;</code>:</p>
+<pre><code>GET /v1/articles?profile=ai-news&amp;min_score=6&amp;limit=50&amp;cursor=eyJ2IjoxLCJyIjoi…In0.8L1RxbVMkJZMYFuxseMW_g
+→ { "data": [...], "next_cursor": "…" | null }
+
+<span class="c"># the payload, decoded from base64url (no padding)</span>
+{"v":1,"r":"articles","k":["2026-11-08T06:30:00Z",12345],"f":"609bc063ca879f26"}</code></pre>
+  <ul>
+    <li><b><code>v</code>, the format version.</b> It lets the format change later.</li>
+    <li><b><code>r</code>, the resource.</b> It must match the endpoint, so a briefings cursor can't be used on articles.</li>
+    <li><b><code>k</code>, the last row's sort key.</b> These are the <code>$t</code> and <code>$id</code> of the query.</li>
+    <li><b><code>f</code>, the filter hash.</b> The first 8 bytes, in hex, of SHA-256 over the canonical query filters. It must match this request's filters, so a client can't change <code>min_score</code> halfway through a walk and silently skip rows.</li>
+  </ul>
+  <p>The signature is base64url of the first 16 bytes of <code>HMAC-SHA256(CURSOR_HMAC_KEY, payload)</code>, compared in constant time. Any failed check returns <code>400</code>, problem type <code>invalid-cursor</code>.</p>
+  <p>Base64 hides nothing, so without a signature some client would build cursors by hand and the format would become public API. With one, only cursors your server issued are valid, and you stay free to change the sort or encoding. That's what ADR-008 means by not committing the API to a sort implementation. Rotating the key invalidates outstanding cursors, which is acceptable because they're short-lived.</p>
+  <p>The plan says "canonical filters" without fixing the form. The example hashes <code>{"min_score":6,"profile":"ai-news"}</code> with sorted keys and no whitespace. Pick a form and pin it with a unit test.</p>
+
+  <h3>How Idempotency-Key makes a retried POST safe</h3>
+  <p>The two <code>POST</code> requests that create work, <code>POST /v1/briefings</code> and <code>POST /v1/deliveries/{id}/replay</code>, accept an <code>Idempotency-Key</code> header. It covers the case where the connection drops and the client can't tell whether the server got the request.</p>
+  <p>The client generates a UUID once per logical operation and sends it with every attempt. The server keeps it for 24 hours in <code>idempotency_keys</code>:</p>
+<pre><code>idempotency_keys
+  user_id, key            <span class="c">-- PRIMARY KEY (user_id, key): keys are per user</span>
+  request_hash            <span class="c">-- SHA-256 of method, path and canonical body</span>
+  state                   <span class="c">-- 'in_progress' or 'completed'</span>
+  response_status, response_body
+  locked_until, created_at, expires_at   <span class="c">-- expires_at = created_at + 24 h</span></code></pre>
+  <p>The handler starts by trying to claim the key. <code>RETURNING</code> tells it whether its insert won:</p>
+<pre><code>INSERT INTO idempotency_keys (user_id, key, request_hash, state, locked_until, expires_at)
+VALUES ($u, $k, $h, 'in_progress', now() + interval '60 seconds', now() + interval '24 hours')
+<span class="hl">ON CONFLICT DO NOTHING</span>
+RETURNING 1;</code></pre>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 860 320" role="img" aria-label="Idempotency-Key decision flow. A POST with Idempotency-Key K inserts a key row with state in_progress using ON CONFLICT DO NOTHING. If the row was inserted, this request owns the key, runs the handler and saves the response. If the row already exists, the request hash is compared. A different hash returns 422 idempotency-key-reused. The same hash with state completed returns the stored response with Idempotent-Replayed true and does no work. The same hash with state in_progress returns 409 Conflict with Retry-After 1. The same hash with an expired lock means the first request crashed, so this request takes the key over and runs the handler.">
+        <defs>
+          <marker id="api-a6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="20" y="16" width="200" height="68" rx="8"/>
+        <text class="t-head" x="120" y="40" text-anchor="middle">Request</text>
+        <text class="t-mono" x="120" y="58" text-anchor="middle">POST /v1/briefings</text>
+        <text class="t-mono" x="120" y="74" text-anchor="middle">Idempotency-Key: K</text>
+
+        <rect class="bx-pg" x="290" y="16" width="300" height="68" rx="8"/>
+        <text class="t-head" x="440" y="38" text-anchor="middle">Insert the key row</text>
+        <text class="t-mono" x="440" y="56" text-anchor="middle">state = 'in_progress'</text>
+        <text class="t-mono" x="440" y="72" text-anchor="middle">ON CONFLICT DO NOTHING</text>
+
+        <rect class="bx-ok" x="660" y="16" width="180" height="68" rx="8"/>
+        <text class="t-head" x="750" y="38" text-anchor="middle">Owns the key</text>
+        <text class="t-sm" x="750" y="56" text-anchor="middle">runs the handler,</text>
+        <text class="t-sm" x="750" y="72" text-anchor="middle">saves the response</text>
+
+        <path class="wire" d="M220 50 H288" marker-end="url(#api-a6)"/>
+        <path class="wire" d="M590 50 H658" marker-end="url(#api-a6)"/>
+        <text class="t-sm" x="624" y="42" text-anchor="middle">inserted</text>
+
+        <path class="wire" d="M440 84 V132"/>
+        <text class="t-sm" x="450" y="112">already exists: compare request_hash</text>
+        <path class="wire" d="M110 132 H750"/>
+        <path class="wire" d="M110 132 V158" marker-end="url(#api-a6)"/>
+        <path class="wire" d="M324 132 V158" marker-end="url(#api-a6)"/>
+        <path class="wire" d="M537 132 V158" marker-end="url(#api-a6)"/>
+        <path class="wire" d="M750 132 V158" marker-end="url(#api-a6)"/>
+
+        <rect class="bx-bad" x="12" y="160" width="196" height="120" rx="8"/>
+        <text class="t-head" x="110" y="184" text-anchor="middle">Different hash</text>
+        <text class="t-mono" x="110" y="206" text-anchor="middle">422</text>
+        <text class="t-mono" x="110" y="224" text-anchor="middle">idempotency-key-reused</text>
+        <text class="t-sm" x="110" y="252" text-anchor="middle">a key reused for</text>
+        <text class="t-sm" x="110" y="268" text-anchor="middle">a different request</text>
+
+        <rect class="bx-ok" x="226" y="160" width="196" height="120" rx="8"/>
+        <text class="t-head" x="324" y="184" text-anchor="middle">Same hash, completed</text>
+        <text class="t-sm" x="324" y="206" text-anchor="middle">the stored response</text>
+        <text class="t-mono" x="324" y="224" text-anchor="middle">Idempotent-Replayed: true</text>
+        <text class="t-sm" x="324" y="252" text-anchor="middle">no work is done</text>
+
+        <rect class="bx" x="439" y="160" width="196" height="120" rx="8"/>
+        <text class="t-head" x="537" y="184" text-anchor="middle">Same hash, in progress</text>
+        <text class="t-mono" x="537" y="206" text-anchor="middle">409 Conflict</text>
+        <text class="t-mono" x="537" y="224" text-anchor="middle">Retry-After: 1</text>
+        <text class="t-sm" x="537" y="252" text-anchor="middle">the first request is</text>
+        <text class="t-sm" x="537" y="268" text-anchor="middle">still running</text>
+
+        <rect class="bx-pg" x="652" y="160" width="196" height="120" rx="8"/>
+        <text class="t-head" x="750" y="184" text-anchor="middle">Same hash, lock expired</text>
+        <text class="t-sm" x="750" y="206" text-anchor="middle">the first request crashed</text>
+        <text class="t-mono" x="750" y="224" text-anchor="middle">locked_until &lt; now()</text>
+        <text class="t-sm" x="750" y="252" text-anchor="middle">take the key over,</text>
+        <text class="t-sm" x="750" y="268" text-anchor="middle">then run the handler</text>
+
+        <text class="t-sm" x="20" y="306">Keys expire after 24 hours. A maintenance job deletes them, and the same key then counts as new.</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 10.5</b> The five outcomes of an <code>Idempotency-Key</code> (plan §5.1).</figcaption>
+  </figure>
+  <ol class="steps">
+    <li><b>Inserted.</b> This request owns the key. It runs the handler, then stores the status and body and sets <code>state = 'completed'</code>, in the handler's own transaction where possible.</li>
+    <li><b>Different <code>request_hash</code>.</b> The client reused a key for another request, which is a client bug. It gets <code>422</code>, problem type <code>idempotency-key-reused</code>.</li>
+    <li><b>Same hash, <code>completed</code>.</b> A genuine retry gets the stored response with <code>Idempotent-Replayed: true</code>.</li>
+    <li><b>Same hash, <code>in_progress</code>.</b> A concurrent request is still running, so this one gets <code>409 Conflict</code> with <code>Retry-After: 1</code>. The handler never runs twice at once.</li>
+    <li><b>Same hash, <code>locked_until</code> passed.</b> The first request crashed. This one takes the key over with <code>UPDATE … WHERE locked_until &lt; now()</code>, which only one request can win, and runs as in case 1.</li>
+  </ol>
+  <p>For <code>POST /v1/briefings</code>, <code>UNIQUE(user_id, profile_id, briefing_date)</code> already prevents a second briefing. The key adds a consistent answer, the same <code>job_id</code> every time.</p>
+  <p><code>PUT</code> is idempotent by definition, and the plan keeps it so. A <code>PUT /v1/profiles/{id}/rubric</code> whose canonical hash equals the current version's writes nothing and returns <code>200</code> with that version. Going back to an older rubric creates a new version, so history stays linear, and its old cached scores are hit straight away.</p>
+
+  <h3>Errors in one standard shape</h3>
+  <p>Every error is <code>application/problem+json</code> from RFC 9457, which replaced RFC 7807. Its standard members are <code>type</code> (a URI naming the kind of problem), <code>title</code>, <code>status</code> and <code>detail</code> (this occurrence, for a person to read).</p>
+  <p>The plan adds <code>request_id</code> to every error, and validation errors list each failing field. In this failure from <code>PATCH /v1/me</code>, the member name <code>errors</code> and the domain are illustrative. The plan names neither, and the domain is still an open question (Q10).</p>
+<pre><code>HTTP/1.1 422 Unprocessable Content
+Content-Type: application/problem+json
+X-Request-Id: 0b6f1c2e-6a4d-4f0e-9a51-3c7d2e8f4b10
+
+{
+  "type": "https://api.example.com/problems/validation-error",
+  "title": "The request body is not valid",
+  "status": 422,
+  "detail": "1 field failed validation.",
+  "request_id": "0b6f1c2e-6a4d-4f0e-9a51-3c7d2e8f4b10",
+  <span class="hl">"errors": [
+    {"field": "timezone", "message": "Not a known IANA timezone name: Europe/Londn"}
+  ]</span>
+}</code></pre>
+  <p>With one shape, a client writes its error handling once. It branches on <code>status</code> and <code>type</code>, shows <code>detail</code>, and quotes <code>request_id</code> in a bug report. The id comes from the client's <code>X-Request-Id</code> header or is generated, and it appears in every log line for the request.</p>
+  <figure>
+    <div class="tbl"><table>
+      <thead><tr><th>Status</th><th>Problem type</th><th>When</th></tr></thead>
+      <tbody>
+        <tr><td><code>400</code></td><td><code>invalid-cursor</code></td><td>The cursor's signature, resource or filter hash doesn't match the request</td></tr>
+        <tr><td><code>401</code></td><td>one for every failure</td><td>The key is missing, malformed, unknown, wrong, revoked or expired</td></tr>
+        <tr><td><code>403</code></td><td><code>insufficient-scope</code></td><td>A valid key lacks the route's scope. Sent with <code>WWW-Authenticate</code></td></tr>
+        <tr><td><code>409</code></td><td></td><td>The same <code>Idempotency-Key</code> and body are still in progress. Sent with <code>Retry-After: 1</code></td></tr>
+        <tr><td><code>422</code></td><td>validation</td><td>The body fails validation. Each failing field is listed</td></tr>
+        <tr><td><code>422</code></td><td><code>idempotency-key-reused</code></td><td>A known key arrives with a different request hash</td></tr>
+        <tr><td><code>422</code></td><td><code>url-not-allowed</code></td><td>A subscription or webhook URL resolves to a non-public address</td></tr>
+        <tr><td><code>429</code></td><td></td><td>Stage 3: the key's token bucket is empty. Sent with <code>Retry-After</code> and the <code>RateLimit-Limit</code>, <code>RateLimit-Remaining</code> and <code>RateLimit-Reset</code> headers</td></tr>
+        <tr><td><code>503</code></td><td></td><td>Postgres didn't give a connection within the pool's 2 s timeout. Sent with <code>Retry-After: 5</code></td></tr>
+      </tbody>
+    </table></div>
+    <figcaption><b>Figure 10.6</b> The error statuses the plan defines. A blank problem type is one the plan doesn't name, so you choose it.</figcaption>
+  </figure>
+
+  <h3>How the unsubscribe link works without an API key</h3>
+  <p>From stage 2, every email carries <code>List-Unsubscribe</code> and <code>List-Unsubscribe-Post: List-Unsubscribe=One-Click</code> headers (RFC 8058), pointing at <code>/v1/unsubscribe?token=…</code>. A mail client has no API key, so the token itself proves who is unsubscribing.</p>
+<pre><code>token = base64url( user_id ‖ HMAC-SHA256(unsubscribe_key, user_id ‖ "email") )   <span class="c"># ‖ means concatenation</span></code></pre>
+  <p>The server splits the token, recomputes the HMAC over the user id and compares with <code>compare_digest</code>. Nobody without <code>unsubscribe_key</code> can make a token for another user.</p>
+  <ul>
+    <li><b><code>POST</code> does the work.</b> It's the RFC 8058 one-click target, and it sets <code>users.email_enabled = false</code>.</li>
+    <li><b><code>GET</code> only asks.</b> It shows a one-line page with a button that sends the <code>POST</code>. Mail scanners follow links in incoming mail, and a <code>GET</code> that unsubscribed would remove people who never clicked.</li>
+  </ul>
+  <p>Webhooks keep working, and the user can turn email back on with <code>PATCH /v1/me</code>. The only other routes without auth are <code>/healthz</code> and <code>/readyz</code>.</p>
+
+  <h3>SSRF: why accepting URLs is dangerous</h3>
+  <p>In stage 2, users submit feed URLs (<code>POST /v1/subscriptions</code>) and webhook URLs (<code>POST /v1/webhook-endpoints</code>), and your workers request them. <b>Server-side request forgery</b> (SSRF) is an attack in which someone makes your server send a request to a destination they choose.</p>
+  <p>Your server can reach places the attacker can't, such as private VPC addresses, <code>localhost</code> and the cloud metadata endpoint.</p>
+  <ul>
+    <li><b>EC2.</b> The <b>instance metadata service</b> at <code>http://169.254.169.254/</code> serves temporary credentials for the instance's IAM role. A server tricked into fetching <code>/latest/meta-data/iam/security-credentials/</code> and echoing the result hands them over. IMDSv2's session token, obtained with a <code>PUT</code>, blocks most simple SSRF.</li>
+    <li><b>ECS Fargate</b>, where the plan deploys. Task credentials come from <code>169.254.170.2</code>, at a path given to the container in an environment variable.</li>
+  </ul>
+  <p>Don't rely on the platform defence alone. Both addresses are link-local, a range the guard blocks.</p>
+
+  <h4>The guard's three steps</h4>
+  <p>The guard runs when a URL is submitted and again every time a worker connects, because a name's address can change in between.</p>
+  <ol class="steps">
+    <li><b>Resolve the hostname</b> and check every address against the ranges in Figure 10.7. A string check isn't enough, because <code>127.1</code>, <code>2130706433</code>, <code>[::ffff:127.0.0.1]</code> and any domain the attacker controls can all lead to loopback.</li>
+    <li><b>Check again on every redirect hop.</b> Feed fetches follow redirects by hand, at most 5, each through the same check. Webhook deliveries don't follow redirects at all.</li>
+    <li><b>Connect to the address that was checked.</b> The request goes to that IP, with the original hostname in the <code>Host</code> header and the TLS server name (SNI), so virtual hosting and certificate checks still work.</li>
+  </ol>
+  <figure>
+    <div class="tbl"><table>
+      <thead><tr><th>Range</th><th>IPv4</th><th>IPv6</th><th>What lives there</th></tr></thead>
+      <tbody>
+        <tr><td>Loopback</td><td><code>127.0.0.0/8</code></td><td><code>::1</code></td><td>Services on the machine itself</td></tr>
+        <tr><td>Private (RFC 1918)</td><td><code>10.0.0.0/8</code>, <code>172.16.0.0/12</code>, <code>192.168.0.0/16</code></td><td></td><td>Your VPC, including the database</td></tr>
+        <tr><td>Link-local</td><td><code>169.254.0.0/16</code></td><td><code>fe80::/10</code></td><td>Metadata and credential endpoints</td></tr>
+        <tr><td>CGNAT (shared address space)</td><td><code>100.64.0.0/10</code></td><td></td><td>Carrier and provider internal networks</td></tr>
+        <tr><td>Multicast</td><td><code>224.0.0.0/4</code></td><td><code>ff00::/8</code></td><td>Group addresses, never a feed</td></tr>
+        <tr><td>Unique local</td><td></td><td><code>fc00::/7</code></td><td>The IPv6 counterpart of private ranges</td></tr>
+      </tbody>
+    </table></div>
+    <figcaption><b>Figure 10.7</b> The ranges plan §6.1 rejects. In Python, unwrap IPv4-mapped IPv6 addresses with <code>ipv4_mapped</code> before checking. <code>is_global</code> is <code>False</code> for most of these ranges but <code>True</code> for multicast, so check <code>is_multicast</code> too, and block <code>0.0.0.0</code>.</figcaption>
+  </figure>
+  <p>A URL that fails gets <code>422</code>, problem type <code>url-not-allowed</code>, with the detail "resolves to a non-public address". It doesn't say which address, so nobody can use the endpoint to map your internal DNS.</p>
+
+  <h4>Why every redirect hop is checked</h4>
+  <p>The attacker submits a URL on their own server, which passes the first check. That server then answers with a redirect to the metadata endpoint, and a client that follows redirects automatically would go there without asking the guard.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 840 350" role="img" aria-label="Redirect attack sequence. The attacker subscribes to feeds.attacker.example/rss. briefing-engine runs check 1, finds a public IP and allows it. The worker sends GET /rss to the attacker's feed server, which replies 302 Found with Location http://169.254.169.254/. Check 2 runs on this hop, finds a link-local address and rejects it. The request to the metadata service is never sent; without the hop check it would have been, and credentials could have come back.">
+        <defs>
+          <marker id="api-a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="20" y="20" width="140" height="40" rx="8"/>
+        <text class="t-head" x="90" y="45" text-anchor="middle">Attacker</text>
+        <rect class="bx" x="230" y="20" width="160" height="40" rx="8"/>
+        <text class="t-head" x="310" y="45" text-anchor="middle">briefing-engine</text>
+        <rect class="bx-bad" x="445" y="20" width="190" height="40" rx="8"/>
+        <text class="t-head" x="540" y="37" text-anchor="middle">Feed server</text>
+        <text class="t-mono" x="540" y="53" text-anchor="middle">feeds.attacker.example</text>
+        <rect class="bx-pg" x="670" y="20" width="150" height="40" rx="8"/>
+        <text class="t-head" x="745" y="37" text-anchor="middle">Metadata service</text>
+        <text class="t-mono" x="745" y="53" text-anchor="middle">169.254.169.254</text>
+        <path class="wire-dash" d="M90 60 V340"/>
+        <path class="wire-dash" d="M310 60 V340"/>
+        <path class="wire-dash" d="M540 60 V340"/>
+        <path class="wire-dash" d="M745 60 V340"/>
+
+        <text class="t-sm" x="200" y="88" text-anchor="middle">subscribe to</text>
+        <text class="t-mono" x="200" y="104" text-anchor="middle">feeds.attacker.example/rss</text>
+        <path class="wire" d="M90 112 H308" marker-end="url(#api-a4)"/>
+
+        <rect class="bx-ok" x="205" y="124" width="210" height="26" rx="5"/>
+        <text class="t-sm" x="310" y="141" text-anchor="middle">check 1: public IP, allowed</text>
+
+        <text class="t-mono" x="425" y="176" text-anchor="middle">GET /rss</text>
+        <path class="wire" d="M310 184 H538" marker-end="url(#api-a4)"/>
+
+        <text x="425" y="209" text-anchor="middle">302 Found</text>
+        <text class="t-mono" x="425" y="228" text-anchor="middle">Location: http://169.254.169.254/</text>
+        <path class="wire" d="M540 236 H312" marker-end="url(#api-a4)"/>
+
+        <rect class="bx-bad" x="165" y="250" width="290" height="28" rx="5"/>
+        <text class="t-sm" x="310" y="268" text-anchor="middle">check 2 on this hop: link-local, rejected</text>
+
+        <text class="t-sm" x="527" y="298" text-anchor="middle">never sent: without the hop check, credentials could come back</text>
+        <path class="wire-dash" d="M310 310 H743" marker-end="url(#api-a4)"/>
+        <line class="strike" x1="594" y1="304" x2="606" y2="316"/>
+        <line class="strike" x1="594" y1="316" x2="606" y2="304"/>
+      </svg>
+    </div>
+    <figcaption><b>Figure 10.8</b> A redirect attack. The first URL is harmless, and the danger is in where it sends the worker. Checking every hop closes the gap.</figcaption>
+  </figure>
+  <p>A permanent redirect (<code>301</code> or <code>308</code>) on a feed updates <code>sources.url</code> only after the new URL passes the guard.</p>
+
+  <h4>Why the connection goes to the checked IP</h4>
+  <p>A naive guard checks the address and passes the URL to the HTTP library, which resolves the name again to connect. The attacker's DNS answers with a time-to-live of zero, giving a public address the first time and the metadata address the second. This is <b>DNS rebinding</b>, a time-of-check to time-of-use flaw.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 840 380" role="img" aria-label="DNS rebinding sequence. The fetch worker asks the attacker's DNS server for feeds.attacker.example and gets 203.0.113.10 with a TTL of 0. The check finds it public and allows it. On the unsafe path, the HTTP library resolves the name again and the DNS server now answers 169.254.169.254, so the library connects to the metadata service. The fix is one lookup, then connecting to the address that was checked, 203.0.113.10, with the Host header and TLS SNI set to feeds.attacker.example, so there is no second answer.">
+        <defs>
+          <marker id="api-a5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="120" y="16" width="160" height="48" rx="8"/>
+        <text class="t-head" x="200" y="45" text-anchor="middle">Fetch worker</text>
+        <rect class="bx-bad" x="380" y="16" width="200" height="48" rx="8"/>
+        <text class="t-head" x="480" y="36" text-anchor="middle">Attacker's DNS</text>
+        <text class="t-mono" x="480" y="54" text-anchor="middle">ns.attacker.example</text>
+        <rect class="bx-pg" x="640" y="16" width="180" height="48" rx="8"/>
+        <text class="t-head" x="730" y="36" text-anchor="middle">Metadata service</text>
+        <text class="t-mono" x="730" y="54" text-anchor="middle">169.254.169.254</text>
+        <path class="wire-dash" d="M200 64 V300"/>
+        <path class="wire-dash" d="M480 64 V300"/>
+        <path class="wire-dash" d="M730 64 V300"/>
+
+        <text class="t-mono" x="340" y="92" text-anchor="middle">A? feeds.attacker.example</text>
+        <path class="wire" d="M200 100 H478" marker-end="url(#api-a5)"/>
+        <text class="t-mono" x="340" y="132" text-anchor="middle">203.0.113.10, TTL 0</text>
+        <path class="wire" d="M480 140 H202" marker-end="url(#api-a5)"/>
+        <rect class="bx-ok" x="110" y="152" width="180" height="26" rx="5"/>
+        <text class="t-sm" x="200" y="169" text-anchor="middle">check: public, allowed</text>
+
+        <text class="t-sm" x="15" y="240">unsafe path:</text>
+        <text class="t-sm" x="15" y="256">second lookup</text>
+        <text class="t-sm" x="340" y="206" text-anchor="middle">the HTTP library resolves again</text>
+        <path class="wire-dash" d="M200 214 H478" marker-end="url(#api-a5)"/>
+        <text class="t-mono" x="340" y="244" text-anchor="middle">169.254.169.254, TTL 0</text>
+        <path class="wire-dash" d="M480 252 H202" marker-end="url(#api-a5)"/>
+        <text class="t-sm" x="465" y="282" text-anchor="middle">connects to the address it was just given</text>
+        <path class="wire-dash" d="M200 290 H728" marker-end="url(#api-a5)"/>
+        <line class="strike" x1="634" y1="284" x2="646" y2="296"/>
+        <line class="strike" x1="634" y1="296" x2="646" y2="284"/>
+
+        <rect class="bx-ok" x="20" y="316" width="800" height="50" rx="8"/>
+        <text class="t-head" x="420" y="336" text-anchor="middle">The fix: one lookup, then connect to the address that was checked</text>
+        <text class="t-sm" x="420" y="354" text-anchor="middle">The request goes to 203.0.113.10, with Host and TLS SNI set to feeds.attacker.example, so there is no second answer.</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 10.9</b> DNS rebinding. The dashed path is what happens when the check and the connection each do their own lookup. Pinning the connection to the checked address removes the second lookup. (203.0.113.10 is in a range reserved for documentation.)</figcaption>
+  </figure>
+  <p>With HTTPS the certificate must still be verified against the hostname. With <code>httpx</code> you request the IP and pass the hostname in the <code>Host</code> header and the <code>sni_hostname</code> request extension. Confirm that with a test on the version you install.</p>
+
+  <div class="note pitfall"><span class="label">Common mistake</span><p>Validating the URL with string checks such as "reject <code>localhost</code> and anything starting with <code>10.</code>". Addresses have many spellings, and any public domain can resolve to a private address. Check the resolved IPs with a real parser such as Python's <code>ipaddress</code>, and connect to the address you checked.</p></div>
+
+  <h3>Versioning, and the actions with no endpoint</h3>
+  <p>The base path <code>/v1</code> promises clients that behaviour won't change under them.</p>
+  <ul>
+    <li><b>Additive changes stay in <code>/v1</code>.</b> A new endpoint, optional parameter or response field is safe if clients ignore fields they don't recognise, which your docs should ask of them.</li>
+    <li><b>Breaking changes go to <code>/v2</code>.</b> Removing or renaming a field, changing its meaning or making a parameter required needs a <code>/v2</code> router, served alongside <code>/v1</code> by the same app.</li>
+  </ul>
+  <p>Creating a user, setting a budget and pausing a source are <b>CLI commands that run against the database</b>, with no HTTP endpoint. As endpoints they'd need an admin key, an internet-facing secret whose theft would expose every user. The CLI needs database credentials that no API client holds.</p>
+
+  <div class="try">
+    <span class="label">Try it</span>
+    <ol>
+      <li>In a Python shell, make a key secret in the plan's format, hash it and check it:
+<pre><code>import secrets, hashlib, hmac, string, base64, json
+ALPHABET = string.digits + string.ascii_uppercase + string.ascii_lowercase
+def b62(data: bytes, width: int) -&gt; str:
+    n, out = int.from_bytes(data, "big"), ""
+    for _ in range(width):
+        n, r = divmod(n, 62)
+        out = ALPHABET[r] + out
+    return out
+secret = b62(secrets.token_bytes(32), 43)
+stored = hashlib.sha256(secret.encode()).digest()
+hmac.compare_digest(hashlib.sha256(secret.encode()).digest(), stored)   <span class="c"># True</span></code></pre></li>
+      <li>Build and verify a cursor in the plan's format, then tamper with it:
+<pre><code>KEY = b"dev-only-cursor-key"
+def b64(b: bytes) -&gt; str: return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+def sign(p: str) -&gt; str: return b64(hmac.new(KEY, p.encode(), hashlib.sha256).digest()[:16])
+f = hashlib.sha256(b'{"min_score":6,"profile":"ai-news"}').digest()[:8].hex()
+payload = b64(json.dumps({"v": 1, "r": "articles", "k": ["2026-11-08T06:30:00Z", 12345],
+                          "f": f}, separators=(",", ":")).encode())
+cursor = f"{payload}.{sign(payload)}"
+def valid(c: str) -&gt; bool:
+    p, s = c.rsplit(".", 1)
+    return hmac.compare_digest(s, sign(p))
+valid(cursor), valid("A" + cursor[1:])          <span class="c"># (True, False)</span>
+base64.urlsafe_b64decode(payload + "==")       <span class="c"># readable by anyone</span></code></pre></li>
+      <li>Try the address checks: <code>ipaddress.ip_address("169.254.169.254").is_global</code> and <code>ipaddress.ip_address("224.0.0.1").is_global</code>.</li>
+    </ol>
+    <p>The key check prints <code>True</code>, and <code>False</code> if you change one character of <code>secret</code>. The cursor decodes to plain JSON, which is why it must be signed, and the tampered copy fails verification. The metadata address gives <code>False</code>, but the multicast address gives <code>True</code>, which is why the guard needs its own multicast check.</p>
+  </div>
+
+  <div class="ask">
+    <span class="label">If an interviewer asks</span>
+    <p class="q">"Why store API keys with SHA-256 when you'd use argon2 for passwords?"</p>
+    <p>"Slow hashes make guessing low-entropy, human-chosen secrets expensive. My keys are 256 random bits, so there's nothing to guess at any speed, and a fast hash keeps auth under a millisecond. Lookup is by a non-secret prefix with a constant-time compare. Against a leaked database alone I'd add a pepper from Secrets Manager, at almost no cost."</p>
+    <p class="q">"A user subscribes to <code>http://169.254.169.254/latest/meta-data/</code>. What happens?"</p>
+    <p>"The guard resolves it, sees a link-local address, and rejects it with a <code>422</code> that doesn't name the address. The check repeats on every redirect hop, and the connection goes to the checked IP, so neither a redirect nor DNS rebinding gets round it. Fargate's credential endpoint, 169.254.170.2, is in the same range."</p>
+    <p class="q">"Two requests with the same Idempotency-Key arrive at once. What happens?"</p>
+    <p>"Both insert the key row with <code>ON CONFLICT DO NOTHING</code>, and the primary key lets one win. The other sees <code>in_progress</code> and gets <code>409</code> with <code>Retry-After: 1</code>. Its retry gets the stored response with <code>Idempotent-Replayed: true</code>. If the winner crashed, its 60-second lock expires and the next request takes the key over."</p>
+  </div>
+  <label class="got"><input type="checkbox" id="got-api" data-ch="api"> I can explain this</label>
+</section>

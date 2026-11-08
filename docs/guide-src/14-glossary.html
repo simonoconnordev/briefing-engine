@@ -1,0 +1,47 @@
+<!-- ============================================================ -->
+<section class="ch" id="glossary">
+  <div class="ch-head"><span class="ch-num">Chapter 14</span><h2>Glossary</h2></div>
+  <dl class="gloss">
+    <dt>Advisory lock</dt><dd>A lock in Postgres that protects nothing on its own; your code agrees what it means. Used to make sure only one scheduler runs.</dd>
+    <dt>At-least-once</dt><dd>Every job or message is processed, possibly more than once. The honest guarantee for queues and webhooks.</dd>
+    <dt>Backoff</dt><dd>Waiting before retrying, usually longer after each failure.</dd>
+    <dt>Canonical JSON</dt><dd>JSON written in one fixed form (sorted keys, no whitespace) so the same data always hashes the same.</dd>
+    <dt>Checkpoint</dt><dd>One of the four steps that stage 1 is built in. Each ends in something you can run and inspect, with its own tests, so a failure can be traced to the layer just added.</dd>
+    <dt>Conditional request</dt><dd>An HTTP request with <code>If-None-Match</code> or <code>If-Modified-Since</code> that returns <code>304</code> if nothing changed.</dd>
+    <dt>Content hash</dt><dd>A SHA-256 of an article's cleaned-up feed text (title and summary), used to spot copies at different URLs. Full-text extraction never changes it.</dd>
+    <dt>Dead letter</dt><dd>A job or delivery that ran out of attempts, kept with its payload so it can be inspected and replayed.</dd>
+    <dt>Dedupe key</dt><dd>A string that identifies a job's purpose, made unique while the job is pending so it can't be queued twice.</dd>
+    <dt>DNS rebinding</dt><dd>An attack where a hostname resolves to a safe IP when checked and an internal one when used.</dd>
+    <dt>Dual-write problem</dt><dd>Writing to two systems where a crash between the writes leaves them inconsistent.</dd>
+    <dt>ETag</dt><dd>A server's fingerprint for one version of a resource, sent back in <code>If-None-Match</code>.</dd>
+    <dt>Expand/contract</dt><dd>Changing a schema in steps so old and new code both work during a deploy.</dd>
+    <dt>Golden file</dt><dd>A stored copy of expected output; the test fails if the real output differs.</dd>
+    <dt>HMAC</dt><dd>A keyed hash: a signature over a message that only holders of the secret can produce or check.</dd>
+    <dt>Idempotent</dt><dd>Doing it twice has the same effect as doing it once.</dd>
+    <dt>Input hash</dt><dd>A hash of exactly what the scorer is sent, built from the same <code>scoring_input</code> function as the request. It changes when full-text extraction replaces the summary, and it keys the score cache.</dd>
+    <dt>Jitter</dt><dd>Randomness added to retry delays so clients don't retry in sync.</dd>
+    <dt>Keyset pagination</dt><dd>Paging by "rows after the last one seen" instead of by offset.</dd>
+    <dt>Lease</dt><dd>A time-limited claim on a job, extended by heartbeats and reclaimed when it expires.</dd>
+    <dt>Liveness / readiness</dt><dd>"Is the process alive?" versus "can it serve traffic right now?"</dd>
+    <dt>Micro-dollars</dt><dd>Millionths of a dollar, stored as integers so money sums are exact.</dd>
+    <dt>Outbox pattern</dt><dd>Writing messages to a table in the same transaction as the data, then relaying them to a separate queue.</dd>
+    <dt>Partial index</dt><dd>An index that only covers rows matching a condition, such as queued jobs.</dd>
+    <dt>Prompt caching</dt><dd>Anthropic's feature that bills a repeated prompt prefix at a reduced rate for a short time.</dd>
+    <dt>Prompt injection</dt><dd>Text inside input data that tries to give the model new instructions.</dd>
+    <dt>Property-based test</dt><dd>A test that checks a rule against many generated inputs instead of a few examples.</dd>
+    <dt>Reading log</dt><dd>A dated note written after reading each briefing: what was useful, what was misleading or annoying, and one thing to change. It decides what to build next.</dd>
+    <dt>Reaper</dt><dd>A periodic task that cleans up after failures: expired leases, stale reservations.</dd>
+    <dt>SKIP LOCKED</dt><dd>A Postgres clause that skips rows other transactions have locked instead of waiting for them.</dd>
+    <dt>Soft 304</dt><dd>A <code>200</code> whose body is identical to last time, detected by hashing the body.</dd>
+    <dt>SSRF</dt><dd>Server-side request forgery: tricking a server into fetching an address it shouldn't, such as internal services.</dd>
+    <dt>Structured outputs</dt><dd>Making the model's response match a JSON schema you supply.</dd>
+    <dt>System user</dt><dd>A single internal user with no API keys or email that owns and pays for shared work, such as preset rubrics, shared enrichment, model evaluations and the smoke test. It is created in stage 2.</dd>
+    <dt>Thundering herd</dt><dd>Many clients acting at the same moment, such as retrying together after an outage.</dd>
+    <dt>Uncertain spend</dt><dd>Budget consumed by a call whose outcome is unknown, usually because its worker crashed. It counts against the limit at the estimated cost until the real cost arrives, and is reported separately from confirmed spend.</dd>
+    <dt>Upsert</dt><dd>Insert a row, or update it if it already exists: <code>INSERT … ON CONFLICT</code>.</dd>
+    <dt>UUID v7</dt><dd>A UUID that starts with a timestamp, so new ids sort roughly by time.</dd>
+  </dl>
+
+  <footer class="end">Written for Simon O'Connor's briefing-engine project, following the design in <code>docs/plan.md</code> (draft of 8 November 2026). Where this guide and the plan disagree, the plan is the source of truth.</footer>
+</section>
+

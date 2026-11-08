@@ -1,0 +1,66 @@
+<!-- ============================================================ -->
+<section class="ch" id="drill">
+  <div class="ch-head"><span class="ch-num">Chapter 13</span><h2>Interview drill</h2></div>
+  <p>Answer each question out loud before opening it. If your answer missed the main point, follow the review link under it.</p>
+
+  <details class="qa"><summary>Give me the 30-second version of this project.</summary>
+    <p>"It's a multi-user service that collects news from feeds, scores each article against a user's interests with Claude, and sends a daily briefing by email or webhook. I built it after running an open-source tool and fixing three bugs in it. The interesting parts are a Postgres-backed job queue with leases, per-host rate limiting, a score cache that makes repeat runs free, and per-user LLM budgets that hold under concurrency. It runs on ECS Fargate, deployed with Terraform."</p>
+    <p class="go">Review: <a href="#pipeline">The big picture</a>, <a href="#queue">The job queue</a>, <a href="#llm">The LLM layer</a>, <a href="#budgets">Money and budgets</a></p></details>
+
+  <details class="qa"><summary>Why is Postgres your queue?</summary>
+    <p>Transactional enqueue: jobs commit with the data they depend on, so there's no dual-write problem and no outbox. No extra infrastructure, and jobs can be inspected with SQL. Huge headroom at this volume. A stated condition for switching the delivery queue to SQS.</p>
+    <p class="go">Review: <a href="#queue">The job queue</a></p></details>
+
+  <details class="qa"><summary>What does SKIP LOCKED do, exactly?</summary>
+    <p>With <code>FOR UPDATE</code>, a query locks the rows it selects. If a row is already locked, another transaction would normally wait. <code>SKIP LOCKED</code> makes it skip that row and take the next unlocked one, so concurrent workers each get different jobs without blocking each other.</p>
+    <p class="go">Review: <a href="#queue">The job queue</a></p></details>
+
+  <details class="qa"><summary>Why leases instead of holding a transaction while the job runs?</summary>
+    <p>Jobs include slow network calls. A transaction held open for 30 seconds keeps locks, ties up a connection and blocks Postgres from cleaning up old row versions. A lease commits straight away, a heartbeat extends it, and a reaper recovers jobs from dead workers.</p>
+    <p class="go">Review: <a href="#queue">The job queue</a></p></details>
+
+  <details class="qa"><summary>What does idempotent mean, and where does your system rely on it?</summary>
+    <p>Doing it twice has the same effect as once. Everywhere: upserts keyed on URL hash, a unique briefing per user and day, unique deliveries per destination, cached scores, dedupe keys on jobs, Idempotency-Key on POSTs. Needed because the queue is at-least-once.</p>
+    <p class="go">Review: <a href="#idempotency">Idempotency</a></p></details>
+
+  <details class="qa"><summary>Explain exponential backoff with jitter. Why jitter?</summary>
+    <p>Wait longer after each failure, up to a cap, so a struggling server recovers. Without jitter, clients that failed together retry together and overload it again. Full jitter picks a random delay between zero and the backoff value, spreading the retries out.</p>
+    <p class="go">Review: <a href="#ingestion">Ingestion</a></p></details>
+
+  <details class="qa"><summary>How does your rate limiter work across several workers?</summary>
+    <p>One row per host stores the next allowed time. Each fetch takes the next slot with one atomic <code>UPDATE … RETURNING</code>. If the slot is in the future, the job is rescheduled for that time instead of sleeping. <code>Retry-After</code> sets a block that applies to every feed on the host.</p>
+    <p class="go">Review: <a href="#ingestion">Ingestion</a></p></details>
+
+  <details class="qa"><summary>Walk me through your score cache key.</summary>
+    <p>Input hash (a hash of the exact text the scorer reads) so copies and re-fetches hit, and a full-text extraction triggers a fresh score; rubric hash so edits invalidate and identical rubrics share across users; model and prompt version so changing either invalidates cleanly with no flush. Only valid scores are cached, and hits are logged with the cost they saved.</p>
+    <p class="go">Review: <a href="#llm">The LLM layer</a></p></details>
+
+  <details class="qa"><summary>What's the difference between prompt caching and your score cache?</summary>
+    <p>Prompt caching is Anthropic's: a repeated prompt prefix is billed at a reduced rate for a short time, but you still make the call. My score cache skips the call entirely when the same content, rubric, model and prompt were scored before.</p>
+    <p class="go">Review: <a href="#llm">The LLM layer</a></p></details>
+
+  <details class="qa"><summary>How do you enforce a budget under concurrency?</summary>
+    <p>Reserve the worst-case cost with one conditional <code>UPDATE</code>. Postgres serialises updates to the row and re-checks the condition, so concurrent jobs can't both pass. Settle the real cost after the call, in the same transaction as the ledger row. A reaper moves reservations from crashed workers into uncertain spend, which still counts against the limit, so their money can't be spent twice. The guarantee holds as long as the estimate really is an upper bound.</p>
+    <p class="go">Review: <a href="#budgets">Money and budgets</a></p></details>
+
+  <details class="qa"><summary>Why store money as integers?</summary>
+    <p>Floats can't represent most decimals exactly, and tiny errors add up across thousands of small charges. Micro-dollars as <code>bigint</code> make every sum exact.</p>
+    <p class="go">Review: <a href="#data-model">The data model</a></p></details>
+
+  <details class="qa"><summary>How do you verify a webhook came from you?</summary>
+    <p>HMAC-SHA256 over the id, timestamp and body with a shared secret, following Standard Webhooks. Receivers recompute it, compare in constant time, and reject old timestamps to block replays. Two signatures during secret rotation.</p>
+    <p class="go">Review: <a href="#delivery">Email and webhooks</a></p></details>
+
+  <details class="qa"><summary>Why keyset pagination?</summary>
+    <p>Offset pages shift when rows are inserted, causing repeats and gaps, and deep offsets get slow. Keyset pages continue from the last row seen, so they stay stable and use an index at any depth. The cursor is opaque and signed.</p>
+    <p class="go">Review: <a href="#api">The API surface</a></p></details>
+
+  <details class="qa"><summary>What would you do differently in production?</summary>
+    <p>Multi-AZ RDS; private subnets with NAT or VPC endpoints; a pepper on API key hashes; per-key rate limits from day one; and the load test would decide whether any queue moves to SQS. All of these are written down in the plan as conscious trade-offs.</p>
+    <p class="go">Review: <a href="#api">The API surface</a>, <a href="#aws">Running it on AWS</a></p></details>
+
+  <details class="qa"><summary>How did you use AI tools on this project?</summary>
+    <p>Answer truthfully about what you actually did. A strong shape: "I wrote the design and the core myself: the data model, the queue, the rate limiter, the cache and the budget logic. I used Claude Code to speed up the rest and to review my work, and I checked everything against tests and real runs." Only say the parts that are true for you. Then give a concrete example of a decision you made or changed yourself.</p>
+    <p class="go">This guide</p></details>
+</section>
+

@@ -1,0 +1,530 @@
+<!-- ============================================================ -->
+<section class="ch" id="idempotency">
+  <div class="ch-head"><span class="ch-num">Chapter 02</span><span class="plan-ref">plan §6.6, §5.1</span><h2>Idempotency: the idea that ties it together</h2></div>
+
+  <p>The pipeline handles almost every failure by running the job again. That is only safe if a second run can't store a second copy of an article, pay for a second LLM call or send you a second email. Goal 4 of your plan sets the bar. Re-running any job, or a whole day, gives the same result, sends no duplicate email and costs close to nothing.</p>
+
+  <h3>What idempotent means</h3>
+  <p>An operation is <b>idempotent</b> if doing it twice leaves the system in the same state as doing it once. In maths, <i>f</i> is idempotent if <i>f</i>(<i>f</i>(<i>x</i>)) = <i>f</i>(<i>x</i>). Rounding is an example: 3.7 rounds to 4, and 4 rounds to 4 again.</p>
+  <p>The definition is about the effect on state. Two calls can return different responses and still be idempotent, as long as they leave the world in the same condition.</p>
+  <ul>
+    <li><b>A lift call button</b> is idempotent. Pressing it five times still calls one lift.</li>
+    <li><b>A light switch with on and off positions</b> is idempotent. A push-button that toggles the light is not, because two presses put it back where it started.</li>
+    <li><b>Setting a balance to £50</b> is idempotent. Adding £10 is not, because five retries add £50.</li>
+  </ul>
+  <p>Most of the work in your system is turning "add a row" into "make sure this row exists".</p>
+
+  <h4>Idempotency in HTTP</h4>
+  <p>HTTP builds the idea into its methods. RFC 9110 calls a method <b>safe</b> if it is read-only, and <b>idempotent</b> if repeating an identical request has the same intended effect as sending it once. An HTTP library may retry an idempotent request after a dropped connection, and shouldn't silently retry a <code>POST</code>.</p>
+
+  <figure>
+    <div class="tbl"><table>
+      <thead><tr><th>Method</th><th>Safe</th><th>Idempotent</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><code>GET</code>, <code>HEAD</code>, <code>OPTIONS</code></td><td class="good">Yes</td><td class="good">Yes</td><td>They read and change nothing, so repeating them changes nothing.</td></tr>
+        <tr><td><code>PUT</code></td><td class="badc">No</td><td class="good">Yes</td><td>It replaces the resource with the representation sent. Sending the same body twice leaves the same resource.</td></tr>
+        <tr><td><code>DELETE</code></td><td class="badc">No</td><td class="good">Yes</td><td>After the first call the resource is gone, and later calls leave it gone. The second response may be <code>404</code>, but the state is the same.</td></tr>
+        <tr><td><code>POST</code></td><td class="badc">No</td><td class="badc">No</td><td>It typically creates something or starts processing, so each call can have a new effect.</td></tr>
+        <tr><td><code>PATCH</code></td><td class="badc">No</td><td>Not guaranteed</td><td>It depends on the patch. "Set the name to X" is idempotent; "append this item" is not.</td></tr>
+      </tbody>
+    </table></div>
+    <figcaption><b>Figure 2.1</b> Safe and idempotent HTTP methods, from RFC 9110, with <code>PATCH</code> from RFC 5789.</figcaption>
+  </figure>
+
+  <p>Your API follows these rules, and makes the risky endpoints safe too:</p>
+  <ul>
+    <li><b><code>DELETE /v1/api-keys/{id}</code></b> is a soft revoke. Revoking twice leaves the key revoked.</li>
+    <li><b><code>POST /v1/subscriptions</code></b> uses its natural key. Subscribing to a feed you already follow answers <code>200</code> instead of <code>201</code> and creates nothing.</li>
+    <li><b><code>PUT /v1/profiles/{id}/rubric</code></b> normally creates a new rubric version. If the new rubric's canonical hash equals the current version's hash, nothing is written and the answer is <code>200</code> with the current version. Going back to an older rubric creates a new version, and its old cached scores are hit at once through the shared rubric hash.</li>
+    <li><b><code>POST /v1/briefings</code> and <code>POST /v1/deliveries/{id}/replay</code></b> start work, so they accept an <code>Idempotency-Key</code> header.</li>
+  </ul>
+
+  <h3>Why a system that retries needs it</h3>
+  <p>Any system that hands work between processes picks one of three delivery guarantees, whether it says so or not.</p>
+  <ul>
+    <li><b>At-most-once.</b> Work runs once or not at all. You never retry, so a crash loses work.</li>
+    <li><b>At-least-once.</b> Work always runs, and occasionally runs twice. You retry whenever you're unsure, so a crash causes repetition.</li>
+    <li><b>Exactly-once.</b> The ideal, but impossible across a network. A process can always fail after an external effect happened and before it recorded that fact.</li>
+  </ul>
+  <p>Your plan says this plainly (§8.3) and chooses at-least-once. Figure 2.2 shows why a job can run twice.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 860 320" role="img" aria-label="Timeline with four lanes: worker 1, the jobs row, worker 2 and the inbox. Worker 1 claims the job with a 60-second lease, and the jobs row shows running. Worker 1 sends the email and the SMTP server accepts it, so the email arrives in the inbox. Worker 1 crashes before marking the delivery succeeded. After 60 seconds the lease expires and the reaper requeues the job. Worker 2 claims the job and sends it again, and a second copy arrives in the inbox.">
+        <defs>
+          <marker id="idempotency-a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <line class="axis" x1="120" y1="24" x2="844" y2="24" marker-end="url(#idempotency-a2)"/>
+        <text class="t-mono" x="100" y="28" text-anchor="end">time</text>
+
+        <text class="t-head" x="20" y="75">Worker 1</text>
+        <text class="t-head" x="20" y="145">jobs row</text>
+        <text class="t-head" x="20" y="215">Worker 2</text>
+        <text class="t-head" x="20" y="285">Inbox</text>
+        <line class="axis" x1="20" y1="105" x2="844" y2="105"/>
+        <line class="axis" x1="20" y1="175" x2="844" y2="175"/>
+        <line class="axis" x1="20" y1="245" x2="844" y2="245"/>
+
+        <rect class="bx" x="120" y="48" width="140" height="44" rx="7"/>
+        <text x="190" y="67" text-anchor="middle">claims the job</text>
+        <text class="t-sm" x="190" y="83" text-anchor="middle">lease: 60 s</text>
+        <rect class="bx" x="266" y="48" width="140" height="44" rx="7"/>
+        <text x="336" y="67" text-anchor="middle">sends the email</text>
+        <text class="t-sm" x="336" y="83" text-anchor="middle">SMTP server accepts</text>
+        <rect class="bx-bad" x="412" y="48" width="140" height="44" rx="7"/>
+        <text x="482" y="67" text-anchor="middle">crashes before</text>
+        <text class="t-sm" x="482" y="83" text-anchor="middle">marking succeeded</text>
+
+        <rect class="bx" x="120" y="118" width="140" height="44" rx="7"/>
+        <text x="190" y="137" text-anchor="middle">running</text>
+        <text class="t-sm" x="190" y="153" text-anchor="middle">locked_by: worker 1</text>
+        <rect class="bx-pg" x="558" y="118" width="140" height="44" rx="7"/>
+        <text x="628" y="137" text-anchor="middle">lease expires</text>
+        <text class="t-sm" x="628" y="153" text-anchor="middle">reaper requeues it</text>
+
+        <rect class="bx" x="704" y="188" width="140" height="44" rx="7"/>
+        <text x="774" y="207" text-anchor="middle">claims the job</text>
+        <text class="t-sm" x="774" y="223" text-anchor="middle">sends it again</text>
+
+        <rect class="bx-ok" x="266" y="258" width="140" height="44" rx="7"/>
+        <text x="336" y="285" text-anchor="middle">email arrives</text>
+        <rect class="bx-bad" x="704" y="258" width="140" height="44" rx="7"/>
+        <text x="774" y="285" text-anchor="middle">second copy</text>
+
+        <path class="wire" d="M190 92 L190 116" marker-end="url(#idempotency-a2)"/>
+        <path class="wire" d="M336 92 L336 256" marker-end="url(#idempotency-a2)"/>
+        <path class="wire-dash" d="M552 78 C 600 78, 628 90, 628 116" marker-end="url(#idempotency-a2)"/>
+        <path class="wire" d="M698 140 C 740 140, 774 160, 774 186" marker-end="url(#idempotency-a2)"/>
+        <path class="wire" d="M774 232 L774 256" marker-end="url(#idempotency-a2)"/>
+      </svg>
+    </div>
+    <figcaption><b>Figure 2.2</b> Why work can run twice. The queue can't tell a worker that crashed after its side effect from one that crashed before it, so it must retry, and the side effect can repeat.</figcaption>
+  </figure>
+
+  <p>A slow worker causes the same thing. A long pause can outlast the 60-second lease, the reaper hands the job to another worker, and both finish it. A queue can't tell a dead worker from a slow one.</p>
+  <p>So the plan makes a second run harmless. For writes inside Postgres it does that completely. For an email or a webhook it records the outcome straight after the response to keep the window small, and webhooks carry a stable <code>webhook-id</code> so the receiver can discard a repeat.</p>
+
+  <div class="note principle">
+    <span class="label">Key principle</span>
+    <p>Retries make the system reliable, and idempotency makes retries safe. Design each step so that the answer to "what if this runs again?" is "nothing changes".</p>
+  </div>
+
+  <h3>Natural keys and unique constraints</h3>
+  <p>To make an insert safe to repeat, you need a precise rule for when two rows are the same thing, and a constraint in the database that enforces it.</p>
+  <p>That rule is a <b>natural key</b>, a value or combination of values taken from the meaning of the data. A <b>surrogate key</b>, such as an auto-generated <code>id</code>, is useful for references, but it can't detect a duplicate, because every insert gets a new one. Your plan puts a natural key with a <code>UNIQUE</code> constraint or primary key on every stage:</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Thing</th><th>What makes it the same thing</th><th>Constraint</th></tr></thead>
+    <tbody>
+      <tr><td>An article</td><td>Its normalised URL</td><td><code>UNIQUE(url_hash)</code></td></tr>
+      <tr><td>A score</td><td>The exact text the model reads, the rubric, the model and the prompt</td><td><code>PRIMARY KEY(input_hash, rubric_hash, model, prompt_version)</code></td></tr>
+      <tr><td>A briefing</td><td>One per user, profile and local date</td><td><code>UNIQUE(user_id, profile_id, briefing_date)</code></td></tr>
+      <tr><td>A delivery</td><td>One per briefing revision per destination</td><td><code>UNIQUE NULLS NOT DISTINCT (briefing_id, briefing_revision, channel, endpoint_id)</code></td></tr>
+      <tr><td>A pending job</td><td>Its dedupe key, while queued or running</td><td>Partial <code>UNIQUE(dedupe_key) WHERE state IN ('queued', 'running')</code></td></tr>
+      <tr><td>An API request</td><td>The user and the client's idempotency key</td><td><code>PRIMARY KEY(user_id, key)</code> on <code>idempotency_keys</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Two Postgres features in those keys</h4>
+  <ul>
+    <li><b><code>NULLS NOT DISTINCT</code></b> (PostgreSQL 15 and later). An email delivery has no webhook endpoint, so its <code>endpoint_id</code> is <code>NULL</code>. By default a unique constraint treats two <code>NULL</code>s as different, which would allow any number of email deliveries for one briefing. With <code>NULLS NOT DISTINCT</code> they count as equal, so there can be only one.</li>
+    <li><b>A partial unique index</b> applies only to rows that match its <code>WHERE</code> clause. The job index covers only <code>queued</code> and <code>running</code> rows. Two fetches of the same source can't be pending at once, but a new fetch is allowed once the last one has finished.</li>
+  </ul>
+
+  <h4>One dedupe key for each kind of job</h4>
+  <p>Every queue builds its key from the thing the job works on:</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Queue</th><th><code>dedupe_key</code></th></tr></thead>
+    <tbody>
+      <tr><td><code>fetch</code></td><td><code>fetch:{source_id}</code></td></tr>
+      <tr><td><code>extract</code></td><td><code>extract:{article_id}</code></td></tr>
+      <tr><td><code>score</code></td><td><code>score:{rubric_hash}:{input_hash}</code></td></tr>
+      <tr><td><code>build</code></td><td><code>build:{user_id}:{profile_id}:{briefing_date}</code></td></tr>
+      <tr><td><code>deliver</code></td><td><code>deliver:{delivery_id}</code></td></tr>
+      <tr><td><code>maintenance</code></td><td><code>maint:{task}:{utc_date}</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>The same index protects a replay. <code>briefing jobs replay &lt;id&gt;</code> turns the same dead row back to <code>queued</code>. If another live job with that key already exists, the index refuses the update, and replay reports "an equivalent job is already queued" and changes nothing.</p>
+
+  <h3>Why checking first doesn't work</h3>
+  <p>Checking in application code before inserting fails as soon as two workers overlap. This pattern is called <b>check-then-act</b>: select the row, and insert it only if nothing came back.</p>
+  <p>The gap between the check and the insert is the problem. Under Postgres's default isolation level, <code>READ COMMITTED</code>, each statement sees only data committed before it started. Two transactions can both check, both see no row, and both insert.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 840 330" role="img" aria-label="Two timelines of worker A and worker B, with time running downwards through t1 to t4. Left panel, check then insert: at t1 worker A selects by url_hash and finds no row; at t2 worker B does the same; at t3 A inserts row 101; at t4 B inserts row 102, a duplicate. Both checks passed, so both inserts ran. Right panel, insert with ON CONFLICT: at t1 A inserts row 101, not yet committed; at t2 B runs the same insert and waits on A's new key; at t3 A commits; at t4 B sees the conflict on h and no second row is created. The unique index decides, whatever the timing.">
+        <defs>
+          <marker id="idempotency-a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <line class="axis" x1="20" y1="64" x2="20" y2="278" marker-end="url(#idempotency-a3)"/>
+        <text class="t-mono" x="50" y="91" text-anchor="middle">t1</text>
+        <text class="t-mono" x="50" y="147" text-anchor="middle">t2</text>
+        <text class="t-mono" x="50" y="203" text-anchor="middle">t3</text>
+        <text class="t-mono" x="50" y="259" text-anchor="middle">t4</text>
+
+        <text class="t-head" x="250" y="28" text-anchor="middle">Check, then insert</text>
+        <text class="t-sm" x="160" y="54" text-anchor="middle">Worker A</text>
+        <text class="t-sm" x="340" y="54" text-anchor="middle">Worker B</text>
+        <rect class="bx" x="82" y="64" width="156" height="46" rx="7"/>
+        <text class="t-mono" x="160" y="83" text-anchor="middle">SELECT by url_hash</text>
+        <text class="t-sm" x="160" y="99" text-anchor="middle">no row: go ahead</text>
+        <rect class="bx" x="262" y="120" width="156" height="46" rx="7"/>
+        <text class="t-mono" x="340" y="139" text-anchor="middle">SELECT by url_hash</text>
+        <text class="t-sm" x="340" y="155" text-anchor="middle">no row: go ahead</text>
+        <rect class="bx" x="82" y="176" width="156" height="46" rx="7"/>
+        <text class="t-mono" x="160" y="195" text-anchor="middle">INSERT h</text>
+        <text class="t-sm" x="160" y="211" text-anchor="middle">row 101 created</text>
+        <rect class="bx-bad" x="262" y="232" width="156" height="46" rx="7"/>
+        <text class="t-mono" x="340" y="251" text-anchor="middle">INSERT h</text>
+        <text class="t-sm" x="340" y="267" text-anchor="middle">row 102: a duplicate</text>
+        <text class="t-sm" x="250" y="310" text-anchor="middle">Both checks passed, so both inserts ran.</text>
+
+        <line class="axis" x1="440" y1="16" x2="440" y2="318"/>
+
+        <text class="t-head" x="632" y="28" text-anchor="middle">Insert with ON CONFLICT</text>
+        <text class="t-sm" x="540" y="54" text-anchor="middle">Worker A</text>
+        <text class="t-sm" x="725" y="54" text-anchor="middle">Worker B</text>
+        <rect class="bx" x="462" y="64" width="156" height="46" rx="7"/>
+        <text class="t-mono" x="540" y="83" text-anchor="middle">INSERT … ON CONFLICT</text>
+        <text class="t-sm" x="540" y="99" text-anchor="middle">inserts row 101</text>
+        <rect class="bx" x="647" y="120" width="156" height="46" rx="7"/>
+        <text class="t-mono" x="725" y="139" text-anchor="middle">INSERT … ON CONFLICT</text>
+        <text class="t-sm" x="725" y="155" text-anchor="middle">waits on A's new key</text>
+        <rect class="bx" x="462" y="176" width="156" height="46" rx="7"/>
+        <text class="t-mono" x="540" y="195" text-anchor="middle">COMMIT</text>
+        <text class="t-sm" x="540" y="211" text-anchor="middle">row 101 is visible</text>
+        <rect class="bx-ok" x="647" y="232" width="156" height="46" rx="7"/>
+        <text class="t-mono" x="725" y="251" text-anchor="middle">conflict on h</text>
+        <text class="t-sm" x="725" y="267" text-anchor="middle">no second row</text>
+        <path class="wire-dash" d="M618 199 C 680 199, 725 205, 725 230" marker-end="url(#idempotency-a3)"/>
+        <text class="t-sm" x="632" y="310" text-anchor="middle">The unique index decides, whatever the timing.</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 2.3</b> The check-then-act race. On the left, the gap between each check and its insert lets both through. On the right, the second insert waits for the first transaction and then takes the conflict path.</figcaption>
+  </figure>
+
+  <p>A unique index closes the gap because the check and the insert become one operation inside the database. When worker B inserts a key that worker A has inserted but not committed, Postgres can't know whether A will commit, so B waits.</p>
+  <ul>
+    <li><b>If A commits,</b> B sees the conflict and takes the <code>ON CONFLICT</code> path.</li>
+    <li><b>If A rolls back,</b> B's insert goes ahead.</li>
+  </ul>
+  <p>Either way, exactly one row exists afterwards. Application code can't promise that without taking a lock of its own.</p>
+
+  <div class="split">
+    <div class="no"><h4>Check in code, then insert</h4><p>Correct when one worker runs at a time, and wrong as soon as two overlap. The bug appears only under load or during retries, so it's hard to reproduce. Adding a lock to fix it serialises every insert.</p></div>
+    <div class="yes"><h4>Constraint plus <code>ON CONFLICT</code></h4><p>The database is the only judge of whether a row exists. Inserts of the same key wait for each other only when they collide, and every outcome is one row. The rule also holds against bugs in code you haven't written yet.</p></div>
+  </div>
+
+  <h3>Upserts with <code>INSERT … ON CONFLICT</code></h3>
+  <p>A unique constraint on its own turns a duplicate insert into an error your code must catch. The <code>ON CONFLICT</code> clause tells Postgres what to do instead. An insert that becomes an update on conflict is called an <b>upsert</b>.</p>
+
+  <h4>Skipping the duplicate with <code>DO NOTHING</code></h4>
+  <p><code>ON CONFLICT DO NOTHING</code> skips the conflicting row silently. It suits rows that never change once written: an <code>article_sources</code> link, a cached score, a pending job. With <code>DO NOTHING</code> you can leave out the conflict target, and then a conflict with any unique constraint or index is skipped. That is how job enqueues work with the partial index on <code>dedupe_key</code>.</p>
+
+  <h4>Updating the existing row with <code>DO UPDATE</code></h4>
+  <p><code>ON CONFLICT (columns) DO UPDATE SET …</code> updates the existing row. It needs a conflict target so Postgres knows which constraint you mean. Inside <code>SET</code>, the special table <code>EXCLUDED</code> is the row you tried to insert. Postgres guarantees an atomic outcome even under heavy concurrency. Each row is either inserted or updated, never both and never neither.</p>
+  <p>Your plan's article upsert (§6.5) uses this form:</p>
+<pre><code>INSERT INTO articles (url_hash, url_canonical, content_hash, input_hash, title, …)
+VALUES (…)
+<span class="hl">ON CONFLICT (url_hash) DO UPDATE</span>
+   SET last_seen_at = now(),
+       content_hash = EXCLUDED.content_hash,          <span class="c">-- edited article</span>
+       input_hash   = CASE WHEN articles.body_text IS NULL
+                           THEN EXCLUDED.input_hash ELSE articles.input_hash END,
+       title        = EXCLUDED.title
+RETURNING id, <span class="hl">(xmax = 0) AS inserted</span>, content_hash;</code></pre>
+  <p>Two hashes do two jobs. <code>content_hash</code> comes from the feed's title and summary and decides whether two articles are copies of each other. <code>input_hash</code> covers the exact text the scorer reads and is the score cache key. The <code>CASE</code> keeps the stored <code>input_hash</code> once full text has been extracted, because the feed update doesn't carry that text.</p>
+
+  <h4>Knowing whether you inserted: <code>xmax = 0</code></h4>
+  <p>The fetch worker needs to know which articles are new, because only new rows go through the copy check. <code>RETURNING</code> reports a row either way, so the plan adds <code>(xmax = 0) AS inserted</code>.</p>
+  <p>Postgres uses <b>multi-version concurrency control</b> (MVCC). An update writes a new version of the row and leaves the old one for transactions that started earlier. Every row version carries hidden system columns:</p>
+  <ul>
+    <li><b><code>xmin</code></b> is the id of the transaction that created this version.</li>
+    <li><b><code>xmax</code></b> is zero for a version nobody has deleted, updated or locked. Otherwise it records the transaction that did.</li>
+  </ul>
+  <p>A freshly inserted row has <code>xmax = 0</code>. On the update path, Postgres first locks the existing row, and in the current implementation that leaves the new version's <code>xmax</code> non-zero. So inside that statement's <code>RETURNING</code>, <code>xmax = 0</code> is true for inserted rows and false for updated ones.</p>
+  <p>The documentation doesn't promise this behaviour, so treat it as something to test. An integration test that upserts the same article twice and expects <code>inserted</code> to be true, then false, catches a change on upgrade. The alternative, if a reviewer dislikes system columns, is a CTE that inserts with <code>DO NOTHING</code> and selects existing rows separately.</p>
+
+  <div class="note example">
+    <span class="label">Worked example</span>
+    <p>A source without extraction carries an article whose normalised URL hashes to <code>h1</code>. Its content hash is <code>c1</code> and its input hash is <code>i1</code>.</p>
+    <ol>
+      <li><b>First fetch.</b> The insert path creates row 101 and returns <code>(101, inserted = true, c1)</code>. No recent original has <code>c1</code>, so the row stays an original. <code>llm_scores</code> has no row for <code>(i1, your rubric hash)</code>, so a score job keyed <code>score:{rubric_hash}:i1</code> is enqueued.</li>
+      <li><b>Second fetch, same content.</b> The insert conflicts on <code>h1</code>. The update path moves <code>last_seen_at</code> and returns <code>(101, inserted = false, c1)</code>. Nothing is new or changed, so nothing is enqueued.</li>
+      <li><b>Third fetch, edited article.</b> The author fixes a paragraph, so the hashes become <code>c2</code> and <code>i2</code>. The update path stores both and returns <code>(101, inserted = false, c2)</code>. Scoring is enqueued for <code>(i2, rubric hash)</code> if the article is still inside the briefing window.</li>
+    </ol>
+    <p>Running step 2 a hundred times leaves one row and enqueues nothing. Only <code>last_seen_at</code> moves.</p>
+  </div>
+
+  <div class="note pitfall">
+    <span class="label">Common mistake</span>
+    <p>Expecting <code>RETURNING</code> to report skipped rows with <code>DO NOTHING</code>. It reports only rows actually inserted, so code that needs an existing row's id gets nothing back. A second trap is a batch whose <code>VALUES</code> list contains the same key twice, for example one URL under two tracking parameters that normalise to the same <code>url_hash</code>. With <code>DO UPDATE</code>, Postgres refuses with "ON CONFLICT DO UPDATE command cannot affect row a second time". Remove duplicates within the batch first.</p>
+  </div>
+
+  <h3>Guarding actions with a state machine</h3>
+  <p>Constraints stop duplicate rows. Some steps also need to stop a repeated action on a row that already exists. A delivery row exists before the email is sent, and no worker may send it again once it has succeeded.</p>
+  <p>The plan handles this with a <b>state machine</b>, a fixed set of states with allowed transitions, stored in a <code>status</code> column. A worker may act only if the row is in a state that allows the action.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 780 320" role="img" aria-label="Delivery state machine. A pending delivery, created by the builder, is claimed and becomes in_flight. From in_flight, a 2xx response leads to succeeded; attempts used up or a permanent failure leads to dead; a retryable failure goes back to pending. A loop on in_flight shows crash recovery after a lease expired. A long arrow from dead back to pending shows replay, which resets attempts to 0. A later worker that finds a succeeded delivery does nothing.">
+        <defs>
+          <marker id="idempotency-a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+          <marker id="idempotency-a4acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <text class="t-sm" x="105" y="102" text-anchor="middle">created by the builder</text>
+        <rect class="bx" x="40" y="112" width="130" height="46" rx="23"/><text class="t-head" x="105" y="140" text-anchor="middle">pending</text>
+        <rect class="bx-pg" x="300" y="112" width="140" height="46" rx="23"/><text class="t-head" x="370" y="140" text-anchor="middle">in_flight</text>
+        <rect class="bx-ok" x="610" y="30" width="130" height="46" rx="23"/><text class="t-head" x="675" y="58" text-anchor="middle">succeeded</text>
+        <rect class="bx-bad" x="610" y="200" width="130" height="46" rx="23"/><text class="t-head" x="675" y="228" text-anchor="middle">dead</text>
+
+        <path class="wire-acc" d="M170 135 L298 135" marker-end="url(#idempotency-a4acc)"/>
+        <text class="t-mono" x="234" y="127" text-anchor="middle">claim</text>
+
+        <path class="wire" d="M346 112 C 330 64, 410 64, 394 110" marker-end="url(#idempotency-a4)"/>
+        <text class="t-sm" x="370" y="36" text-anchor="middle">crash recovery</text>
+        <text class="t-sm" x="370" y="50" text-anchor="middle">(lease expired)</text>
+
+        <path class="wire" d="M440 124 L608 58" marker-end="url(#idempotency-a4)"/>
+        <text class="t-sm" x="515" y="80" text-anchor="middle">2xx</text>
+        <path class="wire" d="M440 146 L608 218" marker-end="url(#idempotency-a4)"/>
+        <text class="t-sm" x="520" y="196" text-anchor="end">attempts used up,</text>
+        <text class="t-sm" x="520" y="210" text-anchor="end">or permanent failure</text>
+
+        <path class="wire" d="M355 158 C 330 226, 140 226, 106 160" marker-end="url(#idempotency-a4)"/>
+        <text class="t-sm" x="228" y="232" text-anchor="middle">retryable failure</text>
+
+        <path class="wire-dash" d="M675 246 C 675 300, 60 300, 66 160" marker-end="url(#idempotency-a4)"/>
+        <text class="t-sm" x="370" y="306" text-anchor="middle">replay only, attempts reset to 0</text>
+
+        <text class="t-sm" x="675" y="98" text-anchor="middle">a later worker that</text>
+        <text class="t-sm" x="675" y="112" text-anchor="middle">finds this does nothing</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 2.4</b> The delivery state machine from plan §8.3. <code>succeeded</code> is terminal, and <code>dead</code> is left only by an explicit replay.</figcaption>
+  </figure>
+
+  <p>Two of the transitions in Figure 2.4 need a word:</p>
+  <ul>
+    <li><b><code>in_flight</code> to <code>in_flight</code>.</b> Crash recovery only. The job's lease expired mid-attempt, so the re-run records the earlier attempt as <code>outcome_unknown</code> and starts a new one at once.</li>
+    <li><b><code>dead</code> to <code>pending</code>.</b> Replay only, through the API or the CLI. <code>attempts</code> goes back to 0, and the event id stays the same.</li>
+  </ul>
+
+  <h4>The guarded <code>UPDATE</code></h4>
+  <p>Every transition is a conditional <code>UPDATE</code> that checks the current state in the same statement that changes it. No other worker can slip in between the check and the change.</p>
+<pre><code>UPDATE deliveries
+SET status = $to, …
+WHERE id = $id AND <span class="hl">status = ANY($allowed_from)</span>
+RETURNING 1;
+<span class="c">-- no row: the delivery already moved on (another worker, or a replay)</span>
+<span class="c">-- log delivery.stale_transition and stop without sending</span></code></pre>
+  <p>No code path writes <code>status</code> any other way, and a unit test runs every allowed and refused transition against the database.</p>
+  <p>The state machine can't close the crash window in Figure 2.2, because the email may or may not have left. It does guarantee that once <code>succeeded</code> is recorded, no later run sends again.</p>
+
+  <h4>Rebuilding a briefing with <code>--force</code> and <code>--resend</code></h4>
+  <p>Briefings have their own states: <code>building</code>, <code>ready</code>, <code>degraded</code> and <code>failed</code>. Re-running a build for a <code>ready</code> briefing returns it unchanged. To rebuild on purpose, you pass <code>--force</code>, and that reuses the same <code>briefings</code> row, because the unique key allows only one per user, profile and date.</p>
+  <ol class="steps">
+    <li><b>Rebuild in one transaction.</b> <code>--force</code> sets <code>status = 'building'</code>, increments <code>revision</code> and replaces the <code>briefing_items</code>. If nothing changed, the write-up cache makes it free.</li>
+    <li><b>Send nothing by default.</b> A forced rebuild creates no deliveries, so you can rebuild while fixing a bug without emailing yourself each time.</li>
+    <li><b>Send the update with <code>--resend</code>.</b> This creates new <code>deliveries</code> rows for the new revision, which the unique key allows because it includes <code>briefing_revision</code>. The new rows have new event ids, so a receiver that dedupes on <code>webhook-id</code> still sees the update.</li>
+  </ol>
+  <div class="tbl"><table>
+    <thead><tr><th>deliveries row</th><th><code>briefing_revision</code></th><th><code>channel</code></th><th><code>status</code></th></tr></thead>
+    <tbody>
+      <tr><td>from the 06:00 build</td><td>1</td><td><code>email</code></td><td><code>succeeded</code></td></tr>
+      <tr><td>after <code>--force --resend</code></td><td>2</td><td><code>email</code></td><td><code>pending</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Idempotency keys on the API</h3>
+  <p>The <code>Idempotency-Key</code> header lets a client retry a <code>POST</code> safely when it doesn't know whether the first attempt arrived.</p>
+  <p>Picture <code>POST /v1/briefings</code> where the network drops the response. If the client retries, it risks doing the work twice; if it doesn't, the work may never happen. The natural key already prevents a second briefing, but that isn't enough everywhere:</p>
+  <ul>
+    <li><b>Some endpoints have no natural key.</b> <code>POST /v1/deliveries/{id}/replay</code> can't tell "replay again on purpose" from "the same replay, retried".</li>
+    <li><b>The client needs the same answer.</b> A retry should get the original <code>job_id</code> back, so the client can track the work it started.</li>
+  </ul>
+
+  <h4>How the server handles a key</h4>
+  <p>The client generates a unique value, usually a random UUID, for each logical operation and reuses it only when retrying that operation. The server stores it in <code>idempotency_keys</code>, keyed by <code>(user_id, key)</code>, for 24 hours. Scoping by user means one client's key can never collide with another's.</p>
+  <p>Each row holds a <code>request_hash</code>, the SHA-256 of the method, path and canonical body, which separates a genuine retry from a mistake. It also holds a <code>state</code> (<code>in_progress</code> or <code>completed</code>), the stored response, and <code>locked_until</code>.</p>
+
+  <figure>
+    <div class="tbl"><table>
+      <thead><tr><th>What the server finds</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td>No row: <code>INSERT … ON CONFLICT DO NOTHING</code> inserted one with <code>state = 'in_progress'</code>, <code>locked_until = now() + 60 s</code></td><td>This request owns the key. Run the handler, then store the status and body and set <code>completed</code>, in the same transaction as the handler's writes where possible.</td></tr>
+        <tr><td>A row with a different <code>request_hash</code></td><td><code>422</code>, problem type <code>idempotency-key-reused</code>. The client is reusing a key for a different operation, and replaying the stored response would hide that bug.</td></tr>
+        <tr><td>Same hash, <code>completed</code></td><td>Return the stored response with <code>Idempotent-Replayed: true</code>. No work is repeated.</td></tr>
+        <tr><td>Same hash, <code>in_progress</code></td><td>A concurrent request with the same key. Return <code>409 Conflict</code> with <code>Retry-After: 1</code>. The handler never runs twice at once.</td></tr>
+        <tr><td>Same hash, <code>in_progress</code>, <code>locked_until</code> passed</td><td>The first request crashed. Take the key over with <code>UPDATE … WHERE locked_until &lt; now()</code> and run as the owner.</td></tr>
+      </tbody>
+    </table></div>
+    <figcaption><b>Figure 2.5</b> The five cases of the <code>Idempotency-Key</code> flow, from plan §5.1. A maintenance job deletes expired keys.</figcaption>
+  </figure>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 760 660" role="img" aria-label="Sequence diagram with three participants: client, API and Postgres. Phase 1, first request: the client sends POST /v1/briefings with Idempotency-Key k1 and body B. The API inserts k1 as in_progress with hash of B, enqueues the job, stores the 202 response and marks the key completed. The 202 response with job_id 42 is lost and the client times out. Phase 2, retry with the same body: the API looks up k1, finds it completed with a matching hash, and returns the stored 202 with job_id 42 and the Idempotent-Replayed header, creating no new job. Phase 3, same key with a different body C: the API finds that hash of C differs from hash of B and returns 422 idempotency-key-reused.">
+        <defs>
+          <marker id="idempotency-a5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+          <marker id="idempotency-a5acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="20" y="16" width="180" height="44" rx="8"/>
+        <text class="t-head" x="110" y="36" text-anchor="middle">Client</text>
+        <text class="t-sm" x="110" y="52" text-anchor="middle">retries on timeout</text>
+        <rect class="bx" x="290" y="16" width="180" height="44" rx="8"/>
+        <text class="t-head" x="380" y="36" text-anchor="middle">API</text>
+        <text class="t-sm" x="380" y="52" text-anchor="middle">POST /v1/briefings</text>
+        <rect class="bx-pg" x="560" y="16" width="180" height="44" rx="8"/>
+        <text class="t-head" x="650" y="36" text-anchor="middle">Postgres</text>
+        <text class="t-sm" x="650" y="52" text-anchor="middle">idempotency_keys, jobs</text>
+
+        <path class="wire-dash" d="M110 60 V 650"/>
+        <path class="wire-dash" d="M380 60 V 650"/>
+        <path class="wire-dash" d="M650 60 V 650"/>
+
+        <line class="axis" x1="20" y1="76" x2="740" y2="76"/>
+        <text class="t-head" x="245" y="98" text-anchor="middle">1. First request</text>
+
+        <path class="wire" d="M110 140 H378" marker-end="url(#idempotency-a5)"/>
+        <text class="t-mono" x="245" y="114" text-anchor="middle">POST /v1/briefings</text>
+        <text class="t-mono" x="245" y="128" text-anchor="middle">Idempotency-Key: k1, body B</text>
+
+        <path class="wire-acc" d="M380 190 H648" marker-end="url(#idempotency-a5acc)"/>
+        <text class="t-sm" x="515" y="164" text-anchor="middle">insert k1 in_progress, enqueue job,</text>
+        <text class="t-sm" x="515" y="177" text-anchor="middle">store 202, mark completed</text>
+
+        <path class="wire-dash" d="M380 240 H196" marker-end="url(#idempotency-a5)"/>
+        <line class="strike" x1="172" y1="232" x2="188" y2="248"/>
+        <line class="strike" x1="172" y1="248" x2="188" y2="232"/>
+        <text class="t-mono" x="280" y="214" text-anchor="middle">202 {job_id: 42}</text>
+        <text class="t-sm" x="280" y="227" text-anchor="middle">lost: the client times out</text>
+
+        <line class="axis" x1="20" y1="266" x2="740" y2="266"/>
+        <text class="t-head" x="245" y="290" text-anchor="middle">2. Retry, same body</text>
+
+        <path class="wire" d="M110 336 H378" marker-end="url(#idempotency-a5)"/>
+        <text class="t-mono" x="245" y="310" text-anchor="middle">POST /v1/briefings</text>
+        <text class="t-mono" x="245" y="324" text-anchor="middle">Idempotency-Key: k1, body B</text>
+
+        <path class="wire" d="M380 386 H648" marker-end="url(#idempotency-a5)"/>
+        <text class="t-sm" x="515" y="360" text-anchor="middle">look up k1: completed,</text>
+        <text class="t-sm" x="515" y="373" text-anchor="middle">hash(B) matches</text>
+
+        <path class="wire-acc" d="M380 436 H112" marker-end="url(#idempotency-a5acc)"/>
+        <text class="t-mono" x="245" y="410" text-anchor="middle">202 {job_id: 42}</text>
+        <text class="t-sm" x="245" y="423" text-anchor="middle">Idempotent-Replayed: true; no new job</text>
+
+        <line class="axis" x1="20" y1="462" x2="740" y2="462"/>
+        <text class="t-head" x="245" y="486" text-anchor="middle">3. Same key, new body</text>
+
+        <path class="wire" d="M110 532 H378" marker-end="url(#idempotency-a5)"/>
+        <text class="t-mono" x="245" y="506" text-anchor="middle">POST /v1/briefings</text>
+        <text class="t-mono" x="245" y="520" text-anchor="middle">Idempotency-Key: k1, body C</text>
+
+        <path class="wire" d="M380 582 H648" marker-end="url(#idempotency-a5)"/>
+        <text class="t-sm" x="515" y="556" text-anchor="middle">look up k1: found, but</text>
+        <text class="t-sm" x="515" y="569" text-anchor="middle">hash(C) differs from hash(B)</text>
+
+        <path class="wire" d="M380 632 H112" marker-end="url(#idempotency-a5)"/>
+        <text class="t-mono" x="245" y="606" text-anchor="middle">422 problem+json</text>
+        <text class="t-sm" x="245" y="619" text-anchor="middle">idempotency-key-reused</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 2.6</b> Three of the cases as a sequence. A retry with the same key and body gets the original response without repeating the work. Reusing the key for a different body is rejected with <code>422</code>.</figcaption>
+  </figure>
+
+  <p>When the key row and the handler's writes share one transaction, a concurrent duplicate never sees <code>in_progress</code>. Its insert waits on the uncommitted key, as in Figure 2.3, and then finds the completed row. The <code>409</code> and the <code>locked_until</code> takeover cover handlers that can't finish inside that one transaction.</p>
+
+  <h3>Every stage, one table</h3>
+  <p>Each stage of the pipeline relies on at least one of these tools. Figure 2.7 is the plan's own summary.</p>
+
+  <figure>
+    <div class="tbl"><table>
+      <thead><tr><th>Stage</th><th>What makes it idempotent</th><th>Tool</th></tr></thead>
+      <tbody>
+        <tr><td>Enqueue</td><td><code>dedupe_key</code> plus a partial unique index. Re-enqueueing a queued or running job is a no-op (<code>ON CONFLICT DO NOTHING</code>).</td><td>Constraint, upsert</td></tr>
+        <tr><td>Fetch</td><td>Upserts keyed by <code>url_hash</code>. Conditional GET means a re-fetch usually transfers nothing.</td><td>Constraint, upsert</td></tr>
+        <tr><td>Extract</td><td><code>dedupe_key = 'extract:{article_id}'</code>. Skipped if <code>body_text</code> is already set.</td><td>Constraint, state</td></tr>
+        <tr><td>Score</td><td><code>dedupe_key = 'score:{rubric_hash}:{input_hash}'</code>. Cache lookup first, by <code>(input_hash, rubric_hash, model, prompt_version)</code>, then <code>INSERT … ON CONFLICT DO NOTHING</code>.</td><td>Constraint, upsert</td></tr>
+        <tr><td>Build</td><td><code>dedupe_key = 'build:{user_id}:{profile_id}:{date}'</code> and <code>UNIQUE(user_id, profile_id, briefing_date)</code>. A <code>ready</code> briefing is returned unchanged unless <code>--force</code> is passed.</td><td>Constraint, state</td></tr>
+        <tr><td>Forced rebuild</td><td>Same row, <code>revision</code> incremented, items replaced in one transaction. Sends nothing without <code>--resend</code>.</td><td>Constraint, state</td></tr>
+        <tr><td>Deliver</td><td><code>UNIQUE(briefing_id, briefing_revision, channel, endpoint_id)</code>, <code>dedupe_key = 'deliver:{delivery_id}'</code> and the guarded state machine.</td><td>Constraint, state</td></tr>
+      </tbody>
+    </table></div>
+    <figcaption><b>Figure 2.7</b> How each stage is made safe to repeat, from plan §6.6.</figcaption>
+  </figure>
+
+  <h4>The one imperfection the plan accepts</h4>
+  <p>Scoring can still waste a call. The dedupe key stops two pending jobs for the same article and rubric, but two runs can overlap, for example a slow worker whose lease ran out and the worker that picked up the requeued job. Both miss the cache and call Haiku, and <code>DO NOTHING</code> keeps one result.</p>
+  <p>The cost is one recorded call in a rare case. Preventing it would mean locking the cache key for the seconds a call takes, which slows every scoring job. The plan narrows the window instead, by checking the cache before enqueueing and again just before calling the API.</p>
+
+  <h4>What idempotent doesn't cover</h4>
+  <p>A repeated fetch still writes a <code>fetch_log</code> row, and a repeated upsert still moves <code>last_seen_at</code>. Idempotency is about the outcomes that matter: articles, scores, briefings and deliveries, and the money and emails that follow from them. Log rows that record each attempt are expected to grow.</p>
+
+  <h3>The acceptance test: run the day twice</h3>
+  <p>Stage 1 isn't done until a whole day can run twice for free. <code>briefing run-daily --date 2026-11-09</code> runs the pipeline for a date. The second run must make <b>zero new LLM calls and zero new deliveries</b>. The plan requires this as an automated test and as a check on your real data.</p>
+<pre><code><span class="c"># a sketch: fixture and helper names are illustrative</span>
+def test_run_daily_twice_is_free(db, fake_llm, fake_sender):
+    run_daily(date(2026, 11, 9))
+    calls = fake_llm.call_count
+    deliveries = count_rows(db, "deliveries")
+    sent = fake_sender.sent_count
+
+    run_daily(date(2026, 11, 9))                       <span class="c"># the same day again</span>
+
+    <span class="hl">assert fake_llm.call_count == calls</span>                <span class="c"># no new LLM calls</span>
+    assert count_rows(db, "deliveries") == deliveries    <span class="c"># no new delivery rows</span>
+    <span class="hl">assert fake_sender.sent_count == sent</span>              <span class="c"># nothing sent</span></code></pre>
+  <p>Each assertion depends on a different layer. On the second run:</p>
+  <ul>
+    <li><b>Fetch</b> finds articles that already exist, so the upserts insert nothing and no scoring is enqueued.</li>
+    <li><b>Score</b> lookups, if any, hit the cache.</li>
+    <li><b>Build</b> finds the briefing already <code>ready</code> and returns it.</li>
+    <li><b>Deliver</b> finds rows that exist and are <code>succeeded</code>, so the unique key and the state guard both refuse a second send.</li>
+  </ul>
+  <p>If any layer loses its idempotency, an assertion fails and points at it. A cache key that includes a timestamp breaks the LLM-call assertion. A delivery key without <code>NULLS NOT DISTINCT</code> breaks the delivery assertions.</p>
+  <p>When you fixed Horizon's three bugs, each fix had to be checked by running the pipeline again. In a pipeline that passes this test, you can re-run a day as often as you like without paying for scoring again or emailing yourself.</p>
+
+  <div class="try">
+    <span class="label">Try it: upserts and a partial unique index</span>
+    <ol>
+      <li>Start a throwaway Postgres with <code>docker run --rm -e POSTGRES_PASSWORD=pw -p 5432:5432 postgres:17</code> and connect with <code>psql -h localhost -U postgres</code>.</li>
+      <li>Create a table and run this upsert twice:</li>
+    </ol>
+<pre><code>CREATE TABLE articles (url_hash text PRIMARY KEY, title text, seen int DEFAULT 1);
+
+INSERT INTO articles (url_hash, title) VALUES ('abc', 'First')
+ON CONFLICT (url_hash) DO UPDATE SET seen = articles.seen + 1
+RETURNING seen, (xmax = 0) AS inserted;</code></pre>
+    <ol start="3">
+      <li>Try the <code>DO NOTHING</code> form:</li>
+    </ol>
+<pre><code>INSERT INTO articles (url_hash, title) VALUES ('abc', 'Again')
+ON CONFLICT DO NOTHING
+RETURNING url_hash;          <span class="c">-- (0 rows): skipped rows are not returned</span></code></pre>
+    <ol start="4">
+      <li>Build the partial unique index that guards the job queue, and insert against it:</li>
+    </ol>
+<pre><code>CREATE TABLE jobs (id serial PRIMARY KEY, dedupe_key text, state text);
+CREATE UNIQUE INDEX ON jobs (dedupe_key) WHERE state IN ('queued', 'running');
+
+INSERT INTO jobs (dedupe_key, state) VALUES ('fetch:7', 'queued');   <span class="c">-- INSERT 0 1</span>
+INSERT INTO jobs (dedupe_key, state) VALUES ('fetch:7', 'queued')
+ON CONFLICT DO NOTHING;                                              <span class="c">-- INSERT 0 0</span>
+UPDATE jobs SET state = 'succeeded' WHERE dedupe_key = 'fetch:7';
+INSERT INTO jobs (dedupe_key, state) VALUES ('fetch:7', 'queued');   <span class="c">-- INSERT 0 1 again</span></code></pre>
+    <p>The first upsert returns <code>inserted = t</code>, and the second returns <code>f</code> with <code>seen = 2</code>. There is one row either way. The <code>DO NOTHING</code> insert returns no rows at all.</p>
+    <p>In the jobs table, the second insert is refused because a <code>fetch:7</code> job is already pending. Once that job has <code>succeeded</code>, the index no longer covers it and a new fetch can be queued. That is what the scheduler needs. It never has two copies of a job pending, and it can still repeat the work over time.</p>
+  </div>
+
+  <div class="ask">
+    <span class="label">If an interviewer asks</span>
+    <p class="q">"What happens if your daily job runs twice?"</p>
+    <p>"Nothing that matters. Every write is keyed on a natural key with a unique constraint, so a repeat does nothing or updates the same row. Scores come from a cache keyed by the hash of the exact text the model reads, the rubric hash, the model and the prompt version, so there are no new LLM calls. Deliveries are unique per briefing revision and destination and guarded by a state machine, so no second email. A test runs the day twice and asserts exactly that."</p>
+    <p class="q" style="margin-top:14px">"Why not just check whether the row exists before inserting?"</p>
+    <p>"Because two workers can both check, both see nothing and both insert. Under read committed there's a gap between the check and the insert. A unique constraint closes it inside the database. The second insert waits for the first transaction and then takes the conflict path, so there's exactly one row whatever the timing."</p>
+    <p class="q" style="margin-top:14px">"What does your API do if a client sends the same Idempotency-Key twice at once?"</p>
+    <p>"The first request inserts the key as <code>in_progress</code> and owns it. A second request with the same body that finds it still in progress gets <code>409</code> with <code>Retry-After: 1</code>, so the handler never runs twice at once. After that, retries get the stored response. A different body with the same key gets <code>422</code>. If the owner crashed, its lock expires after 60 seconds and the next request takes over."</p>
+  </div>
+  <label class="got"><input type="checkbox" id="got-idempotency" data-ch="idempotency"> I can explain this</label>
+</section>

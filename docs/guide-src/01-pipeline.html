@@ -1,0 +1,462 @@
+<!-- ============================================================ -->
+<section class="ch" id="pipeline">
+  <div class="ch-head"><span class="ch-num">Chapter 01</span><span class="plan-ref">plan §3, §9</span><h2>The big picture: one day in the pipeline</h2></div>
+
+  <p>Every day the system has to fetch about 15 feeds, score a few hundred new articles, write one briefing per user and get it into an inbox before the user's send time. Any of those steps can fail on a given day. A failure in one step must not stop the others, and it must not lose work.</p>
+  <p>The plan meets that requirement with one simple arrangement. A scheduler puts jobs in a Postgres table, workers take them off and carry them out, and each finished job commits its results together with the jobs that come next.</p>
+
+  <h3>The parts of the system</h3>
+  <p>Your system is one Python codebase that runs as two kinds of process, plus one PostgreSQL database.</p>
+  <ul>
+    <li><b><code>api</code></b> answers HTTP requests: subscriptions, profiles, reading briefings, and on-demand requests such as "build my briefing now".</li>
+    <li><b><code>worker</code></b> does the slow work: fetching feeds, extracting full text, scoring articles with the LLM, building briefings and sending them. One worker at a time also runs the scheduler.</li>
+    <li><b>PostgreSQL</b> holds all the data, and also the queue of work waiting to be done.</li>
+  </ul>
+  <p>The parts never call each other directly. One part writes a row to Postgres and commits; another part picks that row up later. That one rule is what makes retries, crash recovery and duplicate prevention work.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 900 356" role="img" aria-label="Component diagram. On the left, the scheduler, which runs each minute with one leader, and the API, which handles on-demand triggers, both write jobs into PostgreSQL. PostgreSQL holds the data, the jobs table, rate limits and budgets. Five kinds of worker claim jobs from it: fetch, extract, score, the briefing builder and delivery. Fetch and extract workers call feed hosts, score workers and the builder call the Anthropic API, and delivery workers send email and webhooks. A dashed arrow from the workers back to PostgreSQL shows that results and follow-on jobs are written in the same transaction.">
+        <defs>
+          <marker id="pipeline-a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+          <marker id="pipeline-a1acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="20" y="50" width="170" height="56" rx="8"/>
+        <text class="t-head" x="105" y="74" text-anchor="middle">Scheduler</text>
+        <text class="t-sm" x="105" y="92" text-anchor="middle">each minute, one leader</text>
+        <rect class="bx" x="20" y="230" width="170" height="56" rx="8"/>
+        <text class="t-head" x="105" y="254" text-anchor="middle">API</text>
+        <text class="t-sm" x="105" y="272" text-anchor="middle">on-demand triggers</text>
+
+        <rect class="bx-pg" x="250" y="110" width="180" height="120" rx="10"/>
+        <text class="t-head" x="340" y="154" text-anchor="middle">PostgreSQL</text>
+        <text class="t-sm" x="340" y="174" text-anchor="middle">data + jobs table</text>
+        <text class="t-sm" x="340" y="192" text-anchor="middle">rate limits, budgets</text>
+
+        <path class="wire" d="M190 80 L248 138" marker-end="url(#pipeline-a1)"/>
+        <path class="wire" d="M190 256 L248 206" marker-end="url(#pipeline-a1)"/>
+
+        <rect class="bx" x="520" y="20" width="170" height="40" rx="8"/><text x="605" y="45" text-anchor="middle">fetch workers</text>
+        <rect class="bx" x="520" y="80" width="170" height="40" rx="8"/><text x="605" y="105" text-anchor="middle">extract workers</text>
+        <rect class="bx" x="520" y="140" width="170" height="40" rx="8"/><text x="605" y="165" text-anchor="middle">score workers</text>
+        <rect class="bx" x="520" y="200" width="170" height="40" rx="8"/><text x="605" y="225" text-anchor="middle">briefing builder</text>
+        <rect class="bx" x="520" y="260" width="170" height="40" rx="8"/><text x="605" y="285" text-anchor="middle">delivery workers</text>
+
+        <path class="wire-acc" d="M430 130 L518 42" marker-end="url(#pipeline-a1acc)"/>
+        <path class="wire-acc" d="M430 150 L518 100" marker-end="url(#pipeline-a1acc)"/>
+        <path class="wire-acc" d="M430 170 L518 160" marker-end="url(#pipeline-a1acc)"/>
+        <path class="wire-acc" d="M430 190 L518 220" marker-end="url(#pipeline-a1acc)"/>
+        <path class="wire-acc" d="M430 210 L518 278" marker-end="url(#pipeline-a1acc)"/>
+        <text class="t-mono" x="452" y="62" text-anchor="middle">claim</text>
+
+        <rect class="bx" x="725" y="46" width="160" height="52" rx="8"/>
+        <text x="805" y="68" text-anchor="middle">Feed hosts</text>
+        <text class="t-sm" x="805" y="86" text-anchor="middle">feeds and article pages</text>
+        <rect class="bx" x="725" y="170" width="160" height="40" rx="8"/><text x="805" y="195" text-anchor="middle">Anthropic API</text>
+        <rect class="bx" x="725" y="260" width="160" height="40" rx="8"/><text x="805" y="285" text-anchor="middle">Email, webhooks</text>
+
+        <path class="wire" d="M690 40 L723 62" marker-end="url(#pipeline-a1)"/>
+        <path class="wire" d="M690 100 L723 84" marker-end="url(#pipeline-a1)"/>
+        <path class="wire" d="M690 160 L723 182" marker-end="url(#pipeline-a1)"/>
+        <path class="wire" d="M690 220 L723 200" marker-end="url(#pipeline-a1)"/>
+        <path class="wire" d="M690 280 L723 280" marker-end="url(#pipeline-a1)"/>
+
+        <path class="wire-dash" d="M560 300 C 520 335, 360 330, 345 234" marker-end="url(#pipeline-a1)"/>
+        <text class="t-sm" x="450" y="344" text-anchor="middle">results and follow-on jobs, written in the same transaction</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 1.1</b> Every path goes through Postgres. Workers never call each other, and each external system is reached by only one or two kinds of worker.</figcaption>
+  </figure>
+
+  <p>Each part has one job:</p>
+  <div class="cards">
+    <div class="card"><span class="label">worker process</span><h4>Scheduler</h4><p>Runs once a minute, decides what is due and writes job rows. Only one copy runs at a time.</p></div>
+    <div class="card"><span class="label">fetch queue</span><h4>Fetch workers</h4><p>Send a conditional GET through the per-host rate limiter and upsert <code>articles</code> and <code>article_sources</code>.</p></div>
+    <div class="card"><span class="label">extract queue</span><h4>Extract workers</h4><p>For sources flagged <code>extract_full_text</code>, fetch the article page and store its text, extracted with trafilatura.</p></div>
+    <div class="card"><span class="label">score queue</span><h4>Score workers</h4><p>Send up to 10 articles under one rubric to Claude Haiku 5.5 and store valid scores in <code>llm_scores</code>, the score cache.</p></div>
+    <div class="card"><span class="label">build queue</span><h4>Briefing builder</h4><p>Ranks cached scores, gets the write-up from Claude Sonnet 5.5, and writes <code>briefings</code> and <code>briefing_items</code>.</p></div>
+    <div class="card"><span class="label">deliver queue</span><h4>Delivery workers</h4><p>Send the email (SMTP in stage 1, SES later) or the signed webhook, and retry on a schedule.</p></div>
+    <div class="card"><span class="label">api process</span><h4>API</h4><p>FastAPI behind an Application Load Balancer (ALB). It serves user data and turns on-demand requests into jobs.</p></div>
+    <div class="card"><span class="label">system of record</span><h4>PostgreSQL</h4><p>Holds the data, the <code>jobs</code> table, rate-limit slots, budget reservations and the scheduler's leader lock.</p></div>
+  </div>
+
+  <p>There are four external systems: feed hosts, the Anthropic API, the mail service and users' webhook endpoints. Feed hosts are reached by fetch and extract workers through one per-host limiter. The Anthropic API is reached by score workers and the builder through one wrapper, <code>llm/client.py</code>. When one external system misbehaves, only the jobs that need it slow down or fail.</p>
+
+  <h3>One day, from first fetch to inbox</h3>
+  <p>A day runs in four stages: fetch, score, build and deliver. Figure 1.2 shows them as a sequence diagram. Time runs downwards, and every arrow starts or ends at Postgres. No arrow goes from one worker to another.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 900 780" role="img" aria-label="Sequence diagram of one day with six participants: scheduler, Postgres, fetch worker, score worker, briefing builder and delivery worker. Every minute the scheduler enqueues a fetch job per due source. A fetch worker claims it with SKIP LOCKED, takes a host slot and sends a conditional GET, then upserts articles and enqueues score jobs. A score worker claims a batch of ten, calls Haiku 5.5, validates the output and stores scores in llm_scores. At 06:00, thirty minutes before the send time, the scheduler enqueues a build job. The builder claims it, ranks the scores, gets a Sonnet write-up, writes the briefing row and enqueues one deliver job per destination. A delivery worker claims a deliver job, sends the email or signed webhook, and marks it succeeded or schedules a retry.">
+        <defs>
+          <marker id="pipeline-a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+          <marker id="pipeline-a2acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="63" y="16" width="124" height="48" rx="8"/>
+        <text class="t-head" x="125" y="37" text-anchor="middle">Scheduler</text>
+        <text class="t-sm" x="125" y="54" text-anchor="middle">leader only</text>
+        <rect class="bx-pg" x="201" y="16" width="124" height="48" rx="8"/>
+        <text class="t-head" x="263" y="37" text-anchor="middle">Postgres</text>
+        <text class="t-sm" x="263" y="54" text-anchor="middle">jobs + data</text>
+        <rect class="bx" x="339" y="16" width="124" height="48" rx="8"/>
+        <text class="t-head" x="401" y="37" text-anchor="middle">Fetch</text>
+        <text class="t-sm" x="401" y="54" text-anchor="middle">fetch worker</text>
+        <rect class="bx" x="477" y="16" width="124" height="48" rx="8"/>
+        <text class="t-head" x="539" y="37" text-anchor="middle">Score</text>
+        <text class="t-sm" x="539" y="54" text-anchor="middle">score worker</text>
+        <rect class="bx" x="615" y="16" width="124" height="48" rx="8"/>
+        <text class="t-head" x="677" y="37" text-anchor="middle">Build</text>
+        <text class="t-sm" x="677" y="54" text-anchor="middle">briefing builder</text>
+        <rect class="bx" x="753" y="16" width="124" height="48" rx="8"/>
+        <text class="t-head" x="815" y="37" text-anchor="middle">Deliver</text>
+        <text class="t-sm" x="815" y="54" text-anchor="middle">delivery worker</text>
+
+        <path class="wire-dash" d="M125 64 V 760"/>
+        <path class="wire-dash" d="M263 64 V 760"/>
+        <path class="wire-dash" d="M401 64 V 760"/>
+        <path class="wire-dash" d="M539 64 V 760"/>
+        <path class="wire-dash" d="M677 64 V 760"/>
+        <path class="wire-dash" d="M815 64 V 760"/>
+
+        <text class="t-mono" x="14" y="114">every minute</text>
+        <text class="t-mono" x="14" y="450">06:00</text>
+
+        <path class="wire-acc" d="M125 110 H261" marker-end="url(#pipeline-a2acc)"/>
+        <text class="t-sm" x="194" y="88" text-anchor="middle">1 enqueue fetch</text>
+        <text class="t-sm" x="194" y="101" text-anchor="middle">per due source</text>
+
+        <path class="wire" d="M263 158 H399" marker-end="url(#pipeline-a2)"/>
+        <text class="t-sm" x="332" y="136" text-anchor="middle">2 claim</text>
+        <text class="t-mono" x="332" y="149" text-anchor="middle">SKIP LOCKED</text>
+
+        <rect class="bx" x="395" y="186" width="12" height="40"/>
+        <text class="t-sm" x="470" y="198" text-anchor="middle">3 host slot,</text>
+        <text class="t-sm" x="470" y="211" text-anchor="middle">conditional GET</text>
+
+        <path class="wire-acc" d="M401 254 H265" marker-end="url(#pipeline-a2acc)"/>
+        <text class="t-sm" x="332" y="232" text-anchor="middle">4 upsert articles,</text>
+        <text class="t-sm" x="332" y="245" text-anchor="middle">enqueue score jobs</text>
+
+        <path class="wire" d="M263 302 H537" marker-end="url(#pipeline-a2)"/>
+        <text class="t-sm" x="332" y="280" text-anchor="middle">5 claim a batch</text>
+        <text class="t-sm" x="332" y="293" text-anchor="middle">of 10 articles</text>
+
+        <rect class="bx" x="533" y="330" width="12" height="40"/>
+        <text class="t-sm" x="608" y="342" text-anchor="middle">6 Haiku 5.5,</text>
+        <text class="t-sm" x="608" y="355" text-anchor="middle">validate output</text>
+
+        <path class="wire-acc" d="M539 398 H265" marker-end="url(#pipeline-a2acc)"/>
+        <text class="t-sm" x="332" y="376" text-anchor="middle">7 store scores</text>
+        <text class="t-mono" x="332" y="389" text-anchor="middle">llm_scores</text>
+
+        <path class="wire-acc" d="M125 446 H261" marker-end="url(#pipeline-a2acc)"/>
+        <text class="t-sm" x="194" y="424" text-anchor="middle">8 enqueue build</text>
+        <text class="t-sm" x="194" y="437" text-anchor="middle">30 min before send</text>
+
+        <path class="wire" d="M263 494 H675" marker-end="url(#pipeline-a2)"/>
+        <text class="t-sm" x="332" y="472" text-anchor="middle">9 claim</text>
+        <text class="t-mono" x="332" y="485" text-anchor="middle">build_briefing</text>
+
+        <rect class="bx" x="671" y="522" width="12" height="40"/>
+        <text class="t-sm" x="746" y="534" text-anchor="middle">10 rank, then</text>
+        <text class="t-sm" x="746" y="547" text-anchor="middle">Sonnet write-up</text>
+
+        <path class="wire-acc" d="M677 590 H265" marker-end="url(#pipeline-a2acc)"/>
+        <text class="t-sm" x="332" y="568" text-anchor="middle">11 briefing row,</text>
+        <text class="t-sm" x="332" y="581" text-anchor="middle">enqueue deliver</text>
+
+        <path class="wire" d="M263 638 H813" marker-end="url(#pipeline-a2)"/>
+        <text class="t-sm" x="332" y="616" text-anchor="middle">12 claim, one job</text>
+        <text class="t-sm" x="332" y="629" text-anchor="middle">per destination</text>
+
+        <rect class="bx" x="809" y="666" width="12" height="40"/>
+        <text class="t-sm" x="746" y="678" text-anchor="middle">13 send email</text>
+        <text class="t-sm" x="746" y="691" text-anchor="middle">or signed webhook</text>
+
+        <path class="wire-acc" d="M815 734 H265" marker-end="url(#pipeline-a2acc)"/>
+        <text class="t-sm" x="332" y="712" text-anchor="middle">14 mark succeeded,</text>
+        <text class="t-sm" x="332" y="725" text-anchor="middle">or retry later</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 1.2</b> One day as a sequence of writes and claims, for a source without full-text extraction. Orange arrows are writes into Postgres; grey arrows are workers claiming jobs. The small bars are work done outside the database.</figcaption>
+  </figure>
+
+  <p>The numbered steps break down like this:</p>
+  <ol class="steps">
+    <li><b>Fetch (steps 1 to 4).</b> Each minute the scheduler inserts a <code>fetch</code> job for every active source whose <code>next_fetch_at</code> has passed. A fetch worker claims it, takes a host slot and sends a conditional GET. A <code>304 Not Modified</code> ends the job; a <code>200</code> is parsed and the articles are upserted.</li>
+    <li><b>Enqueue the next step (step 4, same transaction).</b> For each new or changed article, the worker enqueues scoring against every subscriber's rubric that has no cached score. For a source flagged <code>extract_full_text</code>, it enqueues an <code>extract</code> job instead, which enqueues the scoring once the full text is stored. So an article is scored once, on its final text.</li>
+    <li><b>Score (steps 5 to 7).</b> A score worker claims up to 10 jobs for one rubric and sends them to Haiku 5.5 in one call. It checks that every article came back exactly once with a score from 0 to 10, and stores the valid scores.</li>
+    <li><b>Build (steps 8 to 11).</b> At each user's send time minus 30 minutes, in their own timezone, the scheduler enqueues <code>build_briefing(user, date)</code>. The builder ranks the cached scores above the profile's threshold, takes the top <code>max_items</code>, gets the write-up from Sonnet 5.5 and writes the briefing as <code>ready</code>, plus one <code>deliver</code> job per destination.</li>
+    <li><b>Deliver (steps 12 to 14).</b> A delivery worker sends the email or webhook, records the attempt and marks the delivery <code>succeeded</code>, or schedules the next retry. After the last retry the delivery becomes <code>dead</code> and a copy goes to <code>dead_letters</code>.</li>
+  </ol>
+  <p>Fetching and scoring run all day as feeds become due. By the time the build job runs, most of the scores it needs already exist, so the build makes one LLM call for the write-up and reads everything else from the cache.</p>
+  <p>Queues also have priorities: <code>deliver</code> above <code>build</code> above <code>score</code> above <code>extract</code> above <code>fetch</code>. A backlog of fetches can never hold up a briefing that is ready to go out.</p>
+
+  <div class="note example">
+    <span class="label">Worked example</span>
+    <p>Your send time is 06:30 in <code>Europe/London</code>, your <code>ai-news</code> profile has a threshold of 6.0, and source 7 is a blog fetched every 30 minutes without extraction.</p>
+    <ol>
+      <li>At 05:41 the scheduler inserts a fetch job for source 7 with <code>dedupe_key = 'fetch:7'</code>. At 05:42 the source is still due and the scheduler tries again. The partial unique index rejects the duplicate, and <code>ON CONFLICT DO NOTHING</code> discards it.</li>
+      <li>At 05:42 a fetch worker claims the job. The host's slot is free and the GET returns <code>200</code> with 20 entries. In one transaction the worker upserts the 20 articles, learns that 3 are new, enqueues 3 score jobs keyed <code>score:{rubric_hash}:{input_hash}</code>, and sets <code>next_fetch_at</code> to 06:12.</li>
+      <li>A few seconds later a score worker claims a batch that includes the 3 articles. Haiku returns 8, 4 and 7, and three rows go into <code>llm_scores</code>.</li>
+      <li>At 06:00 the scheduler enqueues the build for you, <code>ai-news</code> and 2026-11-09, with <code>dedupe_key = 'build:{user_id}:{profile_id}:2026-11-09'</code>. The 8 and the 7 clear the 6.0 threshold and the 4 doesn't. Sonnet writes the blurbs and the briefing is written as <code>ready</code>.</li>
+      <li>In the same transaction the builder enqueues one deliver job for email. A delivery worker sends it at about 06:02.</li>
+    </ol>
+    <p>If the fetch had timed out, the job would have gone back to <code>queued</code> with a backoff delay and run again a few seconds later. Only the articles' arrival time would change.</p>
+  </div>
+
+  <h3>Why the parts talk only through Postgres</h3>
+  <h4>What goes wrong with direct calls</h4>
+  <p>The obvious design is for the fetcher to call the scorer as soon as it has new articles. That ties the two together in time. Both must be running at the same moment, and the fetcher must decide what to do when the scorer isn't. Every option it has is bad:</p>
+  <ul>
+    <li><b>Retry at once.</b> This hammers a service that is already struggling.</li>
+    <li><b>Hold the work in memory and try later.</b> The work disappears when the process restarts, which happens on every deploy.</li>
+    <li><b>Give up.</b> The work is lost.</li>
+  </ul>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="Two panels. Left, workers call each other: the fetch worker saves 12 new articles and calls the score worker directly; the score worker is down so the call fails, and the fetcher must choose whether to retry, buffer in memory or drop the work. Right, workers hand off through Postgres: the fetch worker commits articles and score jobs together; the score worker is down; the score jobs wait as queued rows; the score worker restarts and claims them.">
+        <text class="t-head" x="215" y="26" text-anchor="middle">Workers call each other</text>
+        <rect class="bx-ok" x="40" y="46" width="350" height="36" rx="7"/><text x="215" y="69" text-anchor="middle">Fetch worker saves 12 new articles</text>
+        <rect class="bx" x="40" y="96" width="350" height="36" rx="7"/><text x="215" y="119" text-anchor="middle">It calls the score worker directly</text>
+        <rect class="bx-bad" x="40" y="146" width="350" height="36" rx="7"/><text x="215" y="169" text-anchor="middle">Score worker is down, so the call fails</text>
+        <rect class="bx-ghost" x="40" y="196" width="350" height="36" rx="7"/><text class="t-sm" x="215" y="219" text-anchor="middle">Retry now, buffer in memory, or drop the work?</text>
+        <text class="t-sm" x="215" y="258" text-anchor="middle">The fetcher has to handle the scorer's failures,</text>
+        <text class="t-sm" x="215" y="274" text-anchor="middle">and work held in memory dies with the process.</text>
+
+        <line class="axis" x1="430" y1="20" x2="430" y2="280"/>
+
+        <text class="t-head" x="645" y="26" text-anchor="middle">Workers hand off through Postgres</text>
+        <rect class="bx-ok" x="470" y="46" width="350" height="36" rx="7"/><text x="645" y="69" text-anchor="middle">Fetch commits articles and score jobs</text>
+        <rect class="bx-bad" x="470" y="96" width="350" height="36" rx="7"/><text x="645" y="119" text-anchor="middle">Score worker is down</text>
+        <rect class="bx-pg" x="470" y="146" width="350" height="36" rx="7"/><text x="645" y="169" text-anchor="middle">Score jobs wait as queued rows</text>
+        <rect class="bx-ok" x="470" y="196" width="350" height="36" rx="7"/><text x="645" y="219" text-anchor="middle">Score worker restarts and claims them</text>
+        <text class="t-sm" x="645" y="258" text-anchor="middle">The fetcher never learns that the scorer was down,</text>
+        <text class="t-sm" x="645" y="274" text-anchor="middle">and nothing is lost while it is.</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 1.3</b> The same outage under two designs. With a shared table, the producer is finished once its rows commit, and the consumer can be absent for any length of time without loss.</figcaption>
+  </figure>
+
+  <h4>What a committed row gives you</h4>
+  <p>In your plan a job ends when it commits its results and the jobs that should follow, in one transaction. That gives you six properties at once.</p>
+  <ul>
+    <li><b>Failure isolation.</b> Producer and consumer never need to run at the same time. A crashed score worker leaves score jobs waiting as rows.</li>
+    <li><b>Durability at every hand-off.</b> A committed job row survives any crash or deploy. Work in progress is protected by a <b>lease</b>, a time limit on a worker's claim to a job. A worker that dies stops renewing its lease, and the reaper puts the job back in the queue.</li>
+    <li><b>Retry by the unit of work.</b> Each job carries its own <code>attempts</code>, <code>run_at</code> and <code>last_error</code>, so one failed fetch is retried on its own.</li>
+    <li><b>Atomic hand-off.</b> The queue and the data are in the same database, so an article and the job to score it commit together or not at all. This avoids the <b>dual-write problem</b>, where one write succeeds and the other is lost.</li>
+    <li><b>Visibility.</b> Every queued, running or dead job is a row. <code>SELECT queue, state, count(*) FROM jobs GROUP BY 1, 2</code> shows the whole pipeline.</li>
+    <li><b>Shared coordination state.</b> The per-host rate limiter and the budget reservations also live in Postgres, so they work across several worker processes without Redis.</li>
+  </ul>
+<pre><code><span class="c">-- step 4 of Figure 1.2 as one transaction (shape only)</span>
+BEGIN;
+INSERT INTO articles (url_hash, url_canonical, content_hash, input_hash, title, …)
+VALUES (…)
+ON CONFLICT (url_hash) DO UPDATE SET last_seen_at = now(), …;
+<span class="c">-- the follow-on work, in the same transaction</span>
+<span class="hl">INSERT INTO jobs (queue, kind, payload, dedupe_key) VALUES ('score', …)
+ON CONFLICT DO NOTHING;</span>
+NOTIFY jobs_score;      <span class="c">-- wakes idle score workers once this commits</span>
+COMMIT;                 <span class="c">-- both, or neither</span></code></pre>
+
+  <div class="note principle">
+    <span class="label">Key principle</span>
+    <p>A step is finished when its results and its follow-on jobs are committed in the same transaction. Any other hand-off, such as a direct call, an in-memory queue or a message sent after the commit, can lose work in a crash or repeat it on a retry.</p>
+  </div>
+
+  <h4>What it costs</h4>
+  <p>Routing everything through one database has real costs, and the plan names them (§9.2, ADR-001):</p>
+  <ul>
+    <li><b>One point of failure.</b> If Postgres is down, nothing is fetched, scored or sent, because the queue fails along with the data.</li>
+    <li><b>A throughput ceiling.</b> A small RDS instance handles thousands of jobs per second before index churn and vacuum pressure hurt. Stage 1 needs about a thousand jobs a day.</li>
+    <li><b>Pickup latency.</b> Idle workers <code>LISTEN</code> for the <code>NOTIFY</code> each enqueue sends, and a 5-second poll catches anything missed.</li>
+    <li><b>A written switch condition.</b> If the stage 3 load test shows claim contention, for example a p95 claim time over 50 ms, the <code>deliver</code> queue moves to SQS first.</li>
+  </ul>
+
+  <div class="note pitfall">
+    <span class="label">Common mistake</span>
+    <p>Adding a side channel for one special case, for example letting the builder call the delivery code directly to save a few seconds. If the process dies between building and sending, nothing records that a send is owed.</p>
+  </div>
+
+  <h3>How one image runs as the API or a worker</h3>
+  <p>The whole codebase is built into one Docker image, tagged with the git commit SHA. A CLI subcommand chooses what a container does.</p>
+<pre><code><span class="c"># in the Dockerfile</span>
+ENTRYPOINT ["briefing"]
+CMD ["api"]                <span class="c"># the default; each ECS task definition sets its own command</span></code></pre>
+  <ul>
+    <li><b><code>briefing api</code></b> starts uvicorn from inside the program, so the server settings live in code.</li>
+    <li><b><code>briefing worker</code></b> starts the job loops and, if it wins the leader lock, the scheduler loop.</li>
+    <li><b><code>briefing migrate</code></b> runs the Alembic migrations. The deploy pipeline runs it as a one-off ECS task before new code starts.</li>
+  </ul>
+  <p>Each ECS task definition sets its own command, so one image serves all three without an environment-variable switch.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 860 370" role="img" aria-label="One Docker image, tagged with the git SHA, with ENTRYPOINT briefing, runs three commands. briefing api is FastAPI behind the ALB, serving CRUD, reads and on-demand triggers, with health endpoints healthz and readyz; it reads from Postgres and enqueues jobs. briefing worker runs job loops with slots per queue (fetch 8, score 4, build 2, deliver 4), runs the scheduler loop if it is the leader, and writes a heartbeat every 15 seconds; it claims jobs and writes results. briefing migrate is a one-off task before new code starts, and applies migrations. PostgreSQL holds the data and jobs table, and its advisory lock picks one scheduler leader.">
+        <defs>
+          <marker id="pipeline-a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="20" y="140" width="170" height="90" rx="10"/>
+        <text class="t-head" x="105" y="168" text-anchor="middle">One Docker image</text>
+        <text class="t-sm" x="105" y="188" text-anchor="middle">tagged with the git SHA</text>
+        <text class="t-mono" x="105" y="208" text-anchor="middle">ENTRYPOINT briefing</text>
+
+        <path class="wire" d="M190 160 L268 82" marker-end="url(#pipeline-a4)"/>
+        <path class="wire" d="M190 185 L268 210" marker-end="url(#pipeline-a4)"/>
+        <path class="wire" d="M190 210 L268 318" marker-end="url(#pipeline-a4)"/>
+
+        <rect class="bx" x="270" y="20" width="250" height="110" rx="10"/>
+        <text class="t-head" x="395" y="48" text-anchor="middle">briefing api</text>
+        <text class="t-sm" x="395" y="70" text-anchor="middle">FastAPI behind the ALB</text>
+        <text class="t-sm" x="395" y="88" text-anchor="middle">CRUD, reads, on-demand triggers</text>
+        <text class="t-mono" x="395" y="110" text-anchor="middle">/healthz  /readyz</text>
+
+        <rect class="bx" x="270" y="150" width="250" height="120" rx="10"/>
+        <text class="t-head" x="395" y="178" text-anchor="middle">briefing worker</text>
+        <text class="t-sm" x="395" y="198" text-anchor="middle">job loops with slots per queue</text>
+        <text class="t-mono" x="395" y="216" text-anchor="middle">fetch 8 score 4 build 2 deliver 4</text>
+        <text class="t-sm" x="395" y="236" text-anchor="middle">scheduler loop, if leader</text>
+        <text class="t-sm" x="395" y="254" text-anchor="middle">heartbeat every 15 s</text>
+
+        <rect class="bx-ghost" x="270" y="290" width="250" height="64" rx="10"/>
+        <text class="t-head" x="395" y="316" text-anchor="middle">briefing migrate</text>
+        <text class="t-sm" x="395" y="336" text-anchor="middle">one-off task, before new code starts</text>
+
+        <rect class="bx-pg" x="630" y="100" width="210" height="120" rx="10"/>
+        <text class="t-head" x="735" y="133" text-anchor="middle">PostgreSQL</text>
+        <text class="t-sm" x="735" y="153" text-anchor="middle">data + jobs table</text>
+        <text class="t-sm" x="735" y="171" text-anchor="middle">advisory lock picks</text>
+        <text class="t-sm" x="735" y="187" text-anchor="middle">one scheduler leader</text>
+
+        <path class="wire" d="M520 75 L628 132" marker-start="url(#pipeline-a4)" marker-end="url(#pipeline-a4)"/>
+        <text class="t-sm" x="592" y="66" text-anchor="middle">reads, enqueues</text>
+        <path class="wire" d="M520 210 L628 178" marker-start="url(#pipeline-a4)" marker-end="url(#pipeline-a4)"/>
+        <text class="t-sm" x="594" y="250" text-anchor="middle">claims, writes results</text>
+        <path class="wire" d="M520 322 L660 224" marker-end="url(#pipeline-a4)"/>
+        <text class="t-sm" x="604" y="340" text-anchor="middle">applies migrations</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 1.4</b> One artefact, three commands. The API and the worker share code and a database but scale, report health and fail separately. The slot counts are the plan's examples.</figcaption>
+  </figure>
+
+  <h4>Why one image</h4>
+  <p>You get one build and one version to deploy, test and roll back, and the same artefact runs under <code>docker compose</code>, in CI and in AWS (ADR-002). Every log line carries <code>service</code> and <code>version</code>.</p>
+
+  <h4>Why two services</h4>
+  <ul>
+    <li><b>Scaling.</b> The API runs one task behind the ALB. The worker service can scale on queue depth.</li>
+    <li><b>Health checks.</b> The ALB checks <code>/healthz</code>, which only proves the API process responds. The worker's container check runs <code>briefing worker-health</code>, which checks a timestamp file the main loop touches on every turn. Neither fails during a database outage, because restarting a task wouldn't fix the database.</li>
+    <li><b>Latency isolation.</b> A worker stuck on a slow feed has no effect on API latency, because no request waits for a worker.</li>
+  </ul>
+
+  <div class="split">
+    <div class="no"><h4>The API does the work inline</h4><p><code>POST /v1/briefings</code> ranks, calls Sonnet and sends the email before it responds. The request takes as long as the slowest dependency, a client timeout leaves the outcome unknown, and a deploy cuts the work off halfway.</p></div>
+    <div class="yes"><h4>The API enqueues and returns <code>202</code></h4><p>The endpoint inserts a build job and answers <code>202 Accepted</code> with a <code>job_id</code> in a few milliseconds. The client polls <code>GET /v1/jobs/{id}</code>. The slow work runs in a worker with retries, and the request is idempotent per user, profile and date.</p></div>
+  </div>
+
+  <p>In stage 1 the queue, a worker and the scheduler run as one process, driven from the CLI. In stage 2 <code>briefing api</code> and <code>briefing worker</code> run separately. On a deploy, ECS sends <code>SIGTERM</code>, and the worker stops claiming, lets running jobs finish for up to 25 seconds and leaves the rest for the reaper.</p>
+
+  <h3>What the scheduler does each minute</h3>
+  <p>The scheduler is the only part that creates work on a timetable. Everything else creates work because other work finished or because an API request asked for it. Each tick, it:</p>
+  <ul>
+    <li><b>Enqueues fetches</b> for every active source whose <code>next_fetch_at</code> has passed.</li>
+    <li><b>Enqueues builds</b> at each user's <code>send_time</code> minus 30 minutes, in the user's IANA timezone, using Python's <code>zoneinfo</code>. A send time that falls in a spring-forward gap moves forward by the length of the gap. A send time that happens twice in an autumn overlap uses the first occurrence.</li>
+    <li><b>Reaps expired leases.</b> A job whose lease ran out goes back to <code>queued</code> with a backoff delay. The crashed run counts as an attempt, so a job that has used all its attempts goes to <code>dead</code> instead.</li>
+    <li><b>Releases expired budget reservations</b>, the money held for an LLM call that hasn't settled. A normal reservation lives 15 minutes, which covers a worker that crashed during a call.</li>
+  </ul>
+  <p>The scheduler only writes rows, so a missed tick does no harm. The next tick finds the same due work.</p>
+
+  <h4>Choosing one leader with an advisory lock</h4>
+  <p>Only one copy of the scheduler may run, or every due feed would be queued once per worker. The plan picks a leader with a Postgres <b>advisory lock</b>, a lock on a number your application chooses, which Postgres grants to one database session at a time.</p>
+<pre><code><span class="c">-- every worker, every tick</span>
+SELECT <span class="hl">pg_try_advisory_lock(&lt;constant&gt;)</span>;   <span class="c">-- true for one session only</span>
+
+<span class="c">-- the leader then enqueues due fetches (plan §6.1 step 1)</span>
+INSERT INTO jobs (queue, kind, payload, dedupe_key)
+SELECT 'fetch', 'fetch', jsonb_build_object('source_id', id), 'fetch:' || id
+FROM sources
+WHERE status = 'active' AND next_fetch_at &lt;= now()
+ON CONFLICT DO NOTHING;                      <span class="c">-- a fetch already pending is skipped</span></code></pre>
+  <p><code>pg_try_advisory_lock</code> returns <code>true</code> or <code>false</code> at once, without waiting, and the worker that gets <code>true</code> leads. If its process dies, its connection closes, Postgres frees the lock, and another worker takes it on its next tick.</p>
+  <p>The lock belongs to a database session, so the leader must keep one connection open while it leads. A pooler in transaction mode would break this, because consecutive statements could land on different server connections. The plan uses a normal pool per task.</p>
+
+  <h4>Why a repeated tick is harmless</h4>
+  <p>Every kind of job has a <b>dedupe key</b>, and a partial unique index allows only one queued or running job per key. A fetch is keyed <code>fetch:{source_id}</code>, and a build is keyed <code>build:{user_id}:{profile_id}:{briefing_date}</code>. Two ticks that see the same due work insert one job between them, and <code>briefings</code> also allows only one row per user, profile and local date.</p>
+
+  <h3>Where the code lives</h3>
+  <p>The plan proposes one package per stage, and one home for each external dependency.</p>
+<pre><code>src/briefing_engine/
+  api/            FastAPI routers, auth dependency, pagination, problem+json errors
+  ingest/         fetcher, host limiter, retry policy, feed parsers, url/content normalisation
+  llm/            client wrapper, prompts, schemas, scorer, writer, cache, cost/pricing, budgets
+  delivery/       email renderer + sender, webhook signer + sender
+  queue/          jobs table access, worker loop, leases, scheduler
+  db/             SQLAlchemy Core tables, repositories, Alembic migrations
+  observability/  logging config, metrics, health
+  cli.py          admin + ops commands (create-user, run-daily, replay, import-horizon-config)
+tests/
+  unit/  integration/  e2e/  fixtures/
+infra/            Terraform</code></pre>
+  <ul>
+    <li><b><code>ingest/</code>, <code>llm/</code>, <code>delivery/</code>.</b> Each external system's rate limits, error handling and test fakes sit in one package. <code>llm/client.py</code> is the only module that imports the Anthropic SDK. It sends no sampling parameters and classifies errors by exception type and status code, which stops Horizon's <code>temperature</code> bug coming back.</li>
+    <li><b><code>queue/</code>.</b> Claiming, leases, the worker loop and the scheduler sit behind a <code>Queue</code> interface. You can test it on its own with concurrency tests, and swap it for the <code>procrastinate</code> library (ADR-003) or move one queue to SQS without touching ingestion or delivery.</li>
+    <li><b><code>db/</code>.</b> Table definitions and migrations live together, so CI can check that the tables Alembic creates match the ones the code defines.</li>
+    <li><b><code>cli.py</code>.</b> Admin actions run straight against the database, which keeps admin permissions out of the public API.</li>
+  </ul>
+
+  <h3>How a failure stays inside one step</h3>
+  <p>Every hand-off is a committed row, so a failure stays inside the job that hit it. Figure 1.5 lists what typically goes wrong at each step and what limits the damage.</p>
+
+  <figure>
+    <div class="tbl"><table>
+      <thead><tr><th>Step</th><th>What can fail</th><th>How it is contained</th><th>What you see</th></tr></thead>
+      <tbody>
+        <tr><td>Scheduler</td><td>The leader process dies</td><td>Its session ends, the advisory lock is freed, and another worker leads within one tick. It only writes rows, so nothing in progress is lost.</td><td>At most a short delay</td></tr>
+        <tr><td>Enqueue</td><td>A tick repeats, or two ticks overlap</td><td>The partial unique index on <code>dedupe_key</code> and <code>ON CONFLICT DO NOTHING</code></td><td>Nothing</td></tr>
+        <tr><td>Fetch</td><td>Timeout, <code>5xx</code>, <code>429</code>, <code>404</code>, bad feed</td><td>Retries are rescheduled jobs with backoff. <code>Retry-After</code> sets <code>hosts.blocked_until</code> for the whole host, clamped to 24 hours. After 5 consecutive failures the source is marked <code>broken</code>. Other sources carry on.</td><td>Rows in <code>fetch_log</code>; fewer items from one source</td></tr>
+        <tr><td>Extract</td><td>The article page can't be fetched or parsed</td><td>When the extract job ends <code>dead</code>, its failure hook enqueues scoring on the feed summary, so the article is still scored.</td><td>A score based on the summary</td></tr>
+        <tr><td>Score</td><td>Invalid output, refusal, API outage</td><td>The batch is split and retried down to one article. Failures aren't cached, so the next run tries again. If the API stays down, the build waits until send time minus 10 minutes and sends a heuristic-ranked briefing.</td><td>"Not scored" footer entries, or a <code>degraded</code> banner</td></tr>
+        <tr><td>Build</td><td>Write-up refusal or failure, budget exhausted</td><td>Server-side fallbacks for the write-up, then a <code>degraded</code> briefing that uses Haiku's reasons as blurbs. When the budget runs low, work is cut in a fixed order before any overspend.</td><td>A plainer briefing, still on time</td></tr>
+        <tr><td>Deliver</td><td>Receiver down, SMTP or SES error</td><td>Retries at 1 min, 5 min, 30 min, 2 h, 6 h and 12 h, then <code>dead</code> with a <code>dead_letters</code> row and a replay command. An endpoint is disabled after 3 consecutive dead deliveries.</td><td>An alarm on <code>delivery.dead</code></td></tr>
+        <tr><td>Any worker</td><td>Process killed, or a deploy</td><td>The lease (60 seconds by default) stops being renewed and expires. The reaper requeues the job, or marks it <code>dead</code> if its attempts are used up.</td><td>A delay of about a minute</td></tr>
+        <tr><td>Postgres</td><td>Database unavailable</td><td>Not contained. Every stage waits. API requests get <code>503</code> with <code>Retry-After: 5</code>, workers log <code>db.unavailable</code> and back off, and <code>/readyz</code> fails so alarms fire. No task is restarted, and committed jobs are still there afterwards.</td><td>The pipeline pauses</td></tr>
+      </tbody>
+    </table></div>
+    <figcaption><b>Figure 1.5</b> Failure containment by step. The last row is the price of the Postgres-first design, recorded in plan §9.2.</figcaption>
+  </figure>
+
+  <p>Two ideas run through the table.</p>
+  <ul>
+    <li><b>A retry is a new attempt at one job, at a later time.</b> No worker sits in a loop waiting, and a crash between attempts loses nothing.</li>
+    <li><b>On time with less beats late with everything.</b> A briefing that can't be fully scored or written up still goes out at the send time, marked <code>degraded</code>. A failure costs the reader some quality, never the briefing, unless the database is down.</li>
+  </ul>
+  <p>Retries are only safe if running a job twice does no harm. A lease can expire while a slow worker is still running, and a worker can crash after an email was sent but before it was recorded. So every step must give the same result when it runs again.</p>
+
+  <div class="try">
+    <span class="label">Try it: elect a leader with an advisory lock</span>
+    <ol>
+      <li>Start a throwaway Postgres with <code>docker run --rm -e POSTGRES_PASSWORD=pw -p 5432:5432 postgres:17</code>.</li>
+      <li>Open <b>two</b> sessions with <code>psql -h localhost -U postgres</code>.</li>
+      <li>In the first, run <code>SELECT pg_try_advisory_lock(42);</code></li>
+      <li>In the second, run the same statement.</li>
+      <li>Quit the first session with <code>\q</code>, then run the statement again in the second.</li>
+    </ol>
+<pre><code>SELECT pg_try_advisory_lock(42);   <span class="c">-- session 1: t, this session leads</span>
+SELECT pg_try_advisory_lock(42);   <span class="c">-- session 2: f, returns at once</span>
+<span class="c">-- session 1 quits</span>
+SELECT pg_try_advisory_lock(42);   <span class="c">-- session 2: t, it leads now</span></code></pre>
+    <p>The first session gets <code>t</code> and the second gets <code>f</code> without waiting. Quitting the first session is what happens when a leader's process dies. Its lock is freed, so the second session's next call returns <code>t</code>. That is the whole of the scheduler's leader election, with no extra service.</p>
+  </div>
+
+  <div class="ask">
+    <span class="label">If an interviewer asks</span>
+    <p class="q">"Walk me through what happens at 6:00 a.m."</p>
+    <p>"Fetching and scoring have been running all night as feeds became due, so most scores are already cached. At 06:00, 30 minutes before my send time, the scheduler inserts a build job. A worker claims it, ranks the cached scores, gets the write-up from Sonnet, writes the briefing row and, in the same transaction, enqueues a delivery job per destination. A delivery worker sends the email and records the result. No component calls another. Each step commits its results and the next jobs together, so any step can fail and be retried on its own."</p>
+    <p class="q" style="margin-top:14px">"How does a container know whether it's the API or a worker?"</p>
+    <p>"It's one image with <code>briefing</code> as the entrypoint, and the command picks the mode: <code>briefing api</code>, <code>briefing worker</code> or <code>briefing migrate</code>. Each ECS task definition sets its command. So I build, test and roll back one artefact, and the two services still scale and report health separately."</p>
+    <p class="q" style="margin-top:14px">"What happens if the database goes down?"</p>
+    <p>"Everything pauses, because the queue is in the database. That's the trade-off I accepted for transactional enqueue and one fewer service. The health checks ECS acts on don't touch the database, so nothing restarts in a loop, and committed jobs are still there when it comes back. If the stage 3 load test showed claim contention, I'd move the delivery queue to SQS first."</p>
+  </div>
+  <label class="got"><input type="checkbox" id="got-pipeline" data-ch="pipeline"> I can explain this</label>
+</section>

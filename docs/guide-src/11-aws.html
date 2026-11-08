@@ -1,0 +1,618 @@
+<!-- ============================================================ -->
+<section class="ch" id="aws">
+  <div class="ch-head"><span class="ch-num">Chapter 11</span><span class="plan-ref">plan §3, §11–12, ADR-002, ADR-009, ADR-014</span><h2>Running it on AWS</h2></div>
+
+  <p>Stage 2 moves the service from <code>docker compose</code> into AWS. One <code>terraform apply</code> into an empty account, plus one pipeline run, must give a working system with nothing set up by hand, and deploys, crashes and database blips must not lose a job.</p>
+
+  <h3>What runs where</h3>
+  <p>The deployment is one image, two always-on services and one database.</p>
+  <ul>
+    <li><b>ECR</b> (Elastic Container Registry) holds the image and keeps the last 20 versions.</li>
+    <li><b><code>api</code></b> is one Fargate task running FastAPI behind an Application Load Balancer (ALB).</li>
+    <li><b><code>worker</code></b> is one Fargate task running the job loops and the scheduler.</li>
+    <li><b>RDS PostgreSQL 17</b> is a single-AZ <code>db.t4g.micro</code> holding the data and the job queue.</li>
+    <li><b>Secrets Manager, SES and CloudWatch</b> hold secrets, send email, and collect logs, metrics and alarms.</li>
+  </ul>
+  <p>It all sits in a VPC (your own isolated network in AWS) across two <b>availability zones</b>, separate data centres in one region. The ALB and the RDS subnet group both require two.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 880 560" role="img" aria-label="AWS architecture. API clients connect over HTTPS to an Application Load Balancer spanning public subnets in two availability zones inside a VPC. Its health check is GET /healthz. The load balancer forwards to the api service, one Fargate task in zone a with a public IP, which accepts traffic only from the load balancer. The worker service, one task in zone b with a public IP, accepts no inbound traffic. Both tasks connect to a single-AZ RDS PostgreSQL 17 instance in a private subnet in zone a, which has no route to the internet; a Multi-AZ standby in the private subnet of zone b is shown dashed as the production setting. The worker makes outbound connections to internet services such as feed hosts, the Anthropic API and webhook endpoints, and to ECR, Secrets Manager, SES and CloudWatch, which sends alarms through SNS to email.">
+        <defs>
+          <marker id="aws-a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+          <marker id="aws-a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="120" y="14" width="200" height="44" rx="8"/>
+        <text class="t-head" x="220" y="33" text-anchor="middle">API clients</text>
+        <text class="t-sm" x="220" y="49" text-anchor="middle">HTTPS + API key</text>
+        <rect class="bx" x="520" y="14" width="340" height="44" rx="8"/>
+        <text class="t-head" x="690" y="33" text-anchor="middle">Internet services</text>
+        <text class="t-sm" x="690" y="49" text-anchor="middle">feed hosts, Anthropic API, user webhook endpoints</text>
+
+        <rect class="bx-ghost" x="10" y="72" width="860" height="478" rx="10"/>
+        <text class="t-mono" x="22" y="90">AWS region</text>
+        <rect class="bx-ghost" x="22" y="100" width="580" height="440" rx="8"/>
+        <text class="t-mono" x="34" y="118">VPC</text>
+        <rect class="bx-ghost" x="34" y="128" width="276" height="400" rx="6"/>
+        <text class="t-sm" x="46" y="146">Availability zone a</text>
+        <rect class="bx-ghost" x="318" y="128" width="276" height="400" rx="6"/>
+        <text class="t-sm" x="330" y="146">Availability zone b</text>
+        <rect class="bx" x="44" y="156" width="256" height="190" rx="6"/>
+        <text class="t-mono" x="56" y="172">public subnet</text>
+        <rect class="bx" x="328" y="156" width="256" height="190" rx="6"/>
+        <text class="t-mono" x="572" y="172" text-anchor="end">public subnet</text>
+        <rect class="bx" x="44" y="358" width="256" height="160" rx="6"/>
+        <text class="t-mono" x="56" y="374">private subnet</text>
+        <rect class="bx" x="328" y="358" width="256" height="160" rx="6"/>
+        <text class="t-mono" x="572" y="374" text-anchor="end">private subnet</text>
+
+        <rect class="bx-pg" x="60" y="182" width="524" height="44" rx="8"/>
+        <text class="t-head" x="322" y="202" text-anchor="middle">Application Load Balancer</text>
+        <text class="t-sm" x="322" y="218" text-anchor="middle">HTTPS listener · health check GET /healthz</text>
+
+        <rect class="bx-ok" x="60" y="262" width="224" height="76" rx="8"/>
+        <text class="t-head" x="172" y="284" text-anchor="middle">api service</text>
+        <text class="t-sm" x="172" y="302" text-anchor="middle">1 Fargate task · briefing api</text>
+        <text class="t-mono" x="172" y="320" text-anchor="middle">public IP · in: ALB only</text>
+        <rect class="bx-ok" x="344" y="262" width="224" height="76" rx="8"/>
+        <text class="t-head" x="456" y="284" text-anchor="middle">worker service</text>
+        <text class="t-sm" x="456" y="302" text-anchor="middle">1 task · briefing worker</text>
+        <text class="t-mono" x="456" y="320" text-anchor="middle">public IP · no inbound</text>
+
+        <rect class="bx-pg" x="60" y="386" width="224" height="80" rx="8"/>
+        <text class="t-head" x="172" y="408" text-anchor="middle">RDS PostgreSQL 17</text>
+        <text class="t-sm" x="172" y="426" text-anchor="middle">db.t4g.micro · single-AZ</text>
+        <text class="t-mono" x="172" y="442" text-anchor="middle">in: ECS tasks only</text>
+        <text class="t-mono" x="172" y="458" text-anchor="middle">not publicly accessible</text>
+        <text class="t-sm" x="172" y="496" text-anchor="middle">no route to the internet</text>
+        <rect class="bx-ghost" x="344" y="386" width="224" height="80" rx="8"/>
+        <text class="t-sm" x="456" y="420" text-anchor="middle">standby replica</text>
+        <text class="t-sm" x="456" y="438" text-anchor="middle">Multi-AZ, production only</text>
+        <text class="t-sm" x="456" y="496" text-anchor="middle">no route to the internet</text>
+
+        <path class="wire-acc" d="M240 58 V180" marker-end="url(#aws-a2)"/>
+        <path class="wire-acc" d="M172 226 V260" marker-end="url(#aws-a2)"/>
+        <path class="wire" d="M172 338 V384" marker-end="url(#aws-a1)"/>
+        <path class="wire" d="M420 338 V352 H240 V384" marker-end="url(#aws-a1)"/>
+
+        <path class="wire" d="M568 300 H612"/>
+        <path class="wire" d="M612 400 V60" marker-end="url(#aws-a1)"/>
+        <path class="wire" d="M612 135 H628" marker-end="url(#aws-a1)"/>
+        <path class="wire" d="M612 220 H628" marker-end="url(#aws-a1)"/>
+        <path class="wire" d="M612 305 H628" marker-end="url(#aws-a1)"/>
+        <path class="wire" d="M612 400 H628" marker-end="url(#aws-a1)"/>
+
+        <rect class="bx" x="630" y="104" width="228" height="62" rx="8"/>
+        <text class="t-head" x="744" y="130" text-anchor="middle">ECR</text>
+        <text class="t-sm" x="744" y="148" text-anchor="middle">one image, last 20 kept</text>
+        <rect class="bx" x="630" y="189" width="228" height="62" rx="8"/>
+        <text class="t-head" x="744" y="215" text-anchor="middle">Secrets Manager</text>
+        <text class="t-sm" x="744" y="233" text-anchor="middle">Anthropic, Fernet, HMAC keys</text>
+        <rect class="bx" x="630" y="274" width="228" height="62" rx="8"/>
+        <text class="t-head" x="744" y="300" text-anchor="middle">Amazon SES</text>
+        <text class="t-sm" x="744" y="318" text-anchor="middle">email, domain identity, DKIM</text>
+        <rect class="bx" x="630" y="359" width="228" height="82" rx="8"/>
+        <text class="t-head" x="744" y="384" text-anchor="middle">CloudWatch</text>
+        <text class="t-sm" x="744" y="402" text-anchor="middle">logs (30 days), EMF metrics</text>
+        <text class="t-sm" x="744" y="420" text-anchor="middle">alarms → SNS → email</text>
+        <text class="t-sm" x="744" y="478" text-anchor="middle">Tasks reach AWS APIs and the</text>
+        <text class="t-sm" x="744" y="494" text-anchor="middle">internet through their public IPs</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 11.1</b> The stage 2 deployment. Only the load balancer accepts connections from the internet, and the database sits in private subnets with no internet route. The database is 20 GB gp3, encrypted, with 7 days of automated backups. Only the worker's outbound calls are drawn.</figcaption>
+  </figure>
+
+  <h3>One image, three commands</h3>
+  <p>The image's <code>ENTRYPOINT</code> is the <code>briefing</code> CLI, with a default <code>CMD</code> of <code>api</code>. Each ECS task definition sets its own <code>command</code>, so one image runs three ways with no environment-variable switches.</p>
+  <ul>
+    <li><b><code>briefing api</code></b> starts uvicorn from inside the program, so the server's settings live in code.</li>
+    <li><b><code>briefing worker</code></b> starts the job loops and the scheduler.</li>
+    <li><b><code>briefing migrate</code></b> runs the Alembic migrations and exits.</li>
+  </ul>
+  <p>On <b>Fargate</b>, AWS supplies the machines, so there's no server to patch. A <b>task definition</b> is a versioned template for one container (image, command, CPU, memory, secrets, roles, health check), and each change makes a new revision. A <b>task</b> is one running copy. A <b>service</b> keeps a set number of tasks running and rolls out a new revision when you point it at one.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 820 374" role="img" aria-label="One ECR image, tagged with git SHA 3f9c2ab and with ENTRYPOINT briefing, is used by three task definitions. The api task definition sets command briefing api and 0.25 vCPU with 0.5 GB. The worker task definition sets command briefing worker and a stop timeout of 30 seconds. The migrate task definition sets command briefing migrate. In the ECS cluster, the api service keeps one task running behind the load balancer, with a dashed replacement task during a deploy. The worker service keeps one task and can add a dashed extra task when scaled. The migrate task definition runs as a one-off task that the pipeline starts once per deploy and waits on for exit code 0.">
+        <defs>
+          <marker id="aws-a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="14" y="160" width="180" height="80" rx="8"/>
+        <text class="t-head" x="104" y="184" text-anchor="middle">ECR image</text>
+        <text class="t-mono" x="104" y="204" text-anchor="middle">briefing-engine:3f9c2ab</text>
+        <text class="t-mono" x="104" y="222" text-anchor="middle">ENTRYPOINT briefing</text>
+
+        <rect class="bx" x="244" y="46" width="210" height="90" rx="8"/>
+        <text class="t-head" x="349" y="70" text-anchor="middle">Task definition: api</text>
+        <text class="t-mono" x="349" y="92" text-anchor="middle">command: briefing api</text>
+        <text class="t-mono" x="349" y="112" text-anchor="middle">0.25 vCPU · 0.5 GB</text>
+        <rect class="bx" x="244" y="162" width="210" height="90" rx="8"/>
+        <text class="t-head" x="349" y="186" text-anchor="middle">Task definition: worker</text>
+        <text class="t-mono" x="349" y="208" text-anchor="middle">command: briefing worker</text>
+        <text class="t-mono" x="349" y="228" text-anchor="middle">stopTimeout: 30 s</text>
+        <rect class="bx" x="244" y="278" width="210" height="80" rx="8"/>
+        <text class="t-head" x="349" y="302" text-anchor="middle">Task definition: migrate</text>
+        <text class="t-mono" x="349" y="324" text-anchor="middle">command: briefing migrate</text>
+        <text class="t-sm" x="349" y="344" text-anchor="middle">same image, same secrets</text>
+
+        <path class="wire" d="M194 184 L242 92" marker-end="url(#aws-a3)"/>
+        <path class="wire" d="M194 200 L242 207" marker-end="url(#aws-a3)"/>
+        <path class="wire" d="M194 216 L242 316" marker-end="url(#aws-a3)"/>
+
+        <rect class="bx-ghost" x="500" y="10" width="306" height="354" rx="10"/>
+        <text class="t-mono" x="514" y="28">ECS cluster</text>
+        <rect class="bx-pg" x="514" y="38" width="278" height="106" rx="8"/>
+        <text class="t-head" x="528" y="60">Service: api</text>
+        <text class="t-sm" x="528" y="78">keeps 1 task running · behind ALB</text>
+        <rect class="bx-ok" x="528" y="90" width="120" height="44" rx="6"/>
+        <text class="t-head" x="588" y="108" text-anchor="middle">task</text>
+        <text class="t-mono" x="588" y="124" text-anchor="middle">running</text>
+        <rect class="bx-ghost" x="658" y="90" width="120" height="44" rx="6"/>
+        <text class="t-sm" x="718" y="108" text-anchor="middle">replacement</text>
+        <text class="t-sm" x="718" y="124" text-anchor="middle">during a deploy</text>
+
+        <rect class="bx-pg" x="514" y="154" width="278" height="106" rx="8"/>
+        <text class="t-head" x="528" y="176">Service: worker</text>
+        <text class="t-sm" x="528" y="194">1 task · scalable on queue depth</text>
+        <rect class="bx-ok" x="528" y="206" width="120" height="44" rx="6"/>
+        <text class="t-head" x="588" y="224" text-anchor="middle">task</text>
+        <text class="t-mono" x="588" y="240" text-anchor="middle">running</text>
+        <rect class="bx-ghost" x="658" y="206" width="120" height="44" rx="6"/>
+        <text class="t-sm" x="718" y="224" text-anchor="middle">extra task</text>
+        <text class="t-sm" x="718" y="240" text-anchor="middle">when scaled</text>
+
+        <rect class="bx" x="514" y="270" width="278" height="84" rx="8"/>
+        <text class="t-head" x="528" y="294">One-off task: migrate</text>
+        <text class="t-sm" x="528" y="314">the pipeline runs it once per deploy</text>
+        <text class="t-sm" x="528" y="334">and waits for exit code 0</text>
+
+        <path class="wire" d="M454 91 H512" marker-end="url(#aws-a3)"/>
+        <path class="wire" d="M454 207 H512" marker-end="url(#aws-a3)"/>
+        <path class="wire" d="M454 318 H512" marker-end="url(#aws-a3)"/>
+      </svg>
+    </div>
+    <figcaption><b>Figure 11.2</b> One image, three task definitions. They differ mainly in the command they run. Two become long-running services, and the migrate definition runs as a one-off task during each deploy.</figcaption>
+  </figure>
+  <p>ECS uses the <b>task execution role</b> to pull the image and fetch secrets before your code starts. Your code runs as the <b>task role</b>, which may only read the named secrets and send through SES.</p>
+
+  <h3>Why Fargate and not Lambda</h3>
+  <p>ADR-002 chose Fargate because the worker is a long-running process. A Lambda invocation lasts at most 15 minutes and is frozen between events, and three parts of the queue need code that keeps running.</p>
+  <ul>
+    <li><b>Lease heartbeats.</b> A worker extends its job's lease every 20 seconds. If the process is frozen, the lease expires and the reaper hands the job to another worker.</li>
+    <li><b><code>LISTEN</code>.</b> Postgres delivers a <code>NOTIFY</code> only to sessions connected and listening when it commits.</li>
+    <li><b>The scheduler's lock.</b> <code>pg_try_advisory_lock</code> lasts as long as its database session.</li>
+  </ul>
+  <p>Connections are the second problem. Two Fargate tasks with small pools hold a dozen or so. Lambda opens one per concurrent request, so 200 requests at once would exceed the default limit on a 1 GiB <code>db.t4g.micro</code>, roughly a hundred. The usual fix, <b>RDS Proxy</b>, costs extra and pins any client that uses <code>LISTEN</code> to its own connection.</p>
+  <div class="split">
+    <div class="no"><h4>Lambda for this design</h4><p>About $0 when idle. Needs SQS triggers, an EventBridge schedule, RDS Proxy, API Gateway and a handler adapter. Loses transactional enqueue, <code>LISTEN</code> and the advisory-lock leader. <b>Cold starts</b>, the delay while Lambda creates an environment, land in the reported API p95.</p></div>
+    <div class="yes"><h4>Fargate for this design</h4><p>About $9 a month per 0.25 vCPU / 0.5 GB task, always on. Runs the queue as designed, with ordinary pooling, the same image as <code>docker compose</code> and no cold starts.</p></div>
+  </div>
+  <p>ADR-002 also rejects App Runner, which hides too much for a portfolio piece, and a single EC2 instance, which means managing a server.</p>
+
+  <h3>How the network avoids a NAT gateway</h3>
+  <p>The ECS tasks run in public subnets with public IPs, and the database runs in private subnets with no route to the internet. That layout needs no NAT gateway, which the plan prices at about $32 a month, the largest single item.</p>
+  <ul>
+    <li><b>Public subnet.</b> Its route table sends internet traffic to an internet gateway, so anything with a public IP can reach out.</li>
+    <li><b>Private subnet.</b> It has no such route. Outbound traffic needs a <b>NAT gateway</b>, which forwards outbound connections and accepts no new inbound ones.</li>
+    <li><b>Security group.</b> A stateful firewall, so replies to connections the task opened come back in automatically.</li>
+  </ul>
+  <p>The tasks must reach AWS APIs, feed hosts and Anthropic. Their security groups accept inbound traffic only from the ALB's security group, so outbound calls work and unsolicited packets are dropped.</p>
+  <p>The database needs no outbound internet, so its two private subnets need no NAT. It isn't publicly accessible, its security group admits only the ECS tasks, and they reach it over the VPC's local route.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 820 325" role="img" aria-label="Two layouts for the worker task. Left, the plan's layout, about zero dollars extra: a worker task with a public IP in a public subnet connects outbound through the internet gateway to the internet. Its security group allows inbound only from the load balancer's security group and outbound to anywhere, so direct inbound traffic from the internet is dropped, while replies to outbound calls are allowed back. Right, the production alternative, about 32 dollars a month for one NAT gateway: the worker task has no public IP and sits in a private subnet. Its outbound traffic goes through a NAT gateway in a public subnet, then the internet gateway. VPC endpoints can serve AWS APIs privately.">
+        <defs>
+          <marker id="aws-a5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+          <marker id="aws-a6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <text class="t-head" x="205" y="26" text-anchor="middle">Your plan: public subnet</text>
+        <text class="t-sm" x="205" y="44" text-anchor="middle">about $0 extra per month</text>
+        <rect class="bx" x="30" y="60" width="350" height="36" rx="8"/>
+        <text class="t-sm" x="205" y="82" text-anchor="middle">internet: feed hosts, Anthropic, AWS APIs</text>
+        <rect class="bx" x="130" y="116" width="150" height="30" rx="6"/>
+        <text class="t-sm" x="205" y="135" text-anchor="middle">internet gateway</text>
+        <rect class="bx-ghost" x="30" y="162" width="350" height="148" rx="8"/>
+        <text class="t-mono" x="368" y="180" text-anchor="end">public subnet</text>
+        <rect class="bx-ok" x="60" y="200" width="160" height="60" rx="8"/>
+        <text class="t-head" x="140" y="224" text-anchor="middle">worker task</text>
+        <text class="t-mono" x="140" y="244" text-anchor="middle">has a public IP</text>
+        <rect class="bx" x="236" y="200" width="134" height="60" rx="8"/>
+        <text class="t-sm" x="303" y="218" text-anchor="middle">security group</text>
+        <text class="t-mono" x="303" y="236" text-anchor="middle">in: ALB SG only</text>
+        <text class="t-mono" x="303" y="252" text-anchor="middle">out: any</text>
+        <path class="wire-acc" d="M200 198 L236 148" marker-end="url(#aws-a5)"/>
+        <path class="wire-acc" d="M205 116 V98" marker-end="url(#aws-a5)"/>
+        <path class="wire-dash" d="M70 98 V196" marker-end="url(#aws-a6)"/>
+        <path class="strike" d="M63 143 L77 157"/>
+        <path class="strike" d="M77 143 L63 157"/>
+        <text class="t-sm" x="84" y="154">inbound dropped</text>
+        <text class="t-sm" x="60" y="290">replies to outbound calls are allowed back</text>
+
+        <path class="axis" d="M410 14 V312"/>
+
+        <text class="t-head" x="615" y="26" text-anchor="middle">Production: private subnet</text>
+        <text class="t-sm" x="615" y="44" text-anchor="middle">about $32 a month for one NAT gateway</text>
+        <rect class="bx" x="440" y="60" width="350" height="36" rx="8"/>
+        <text class="t-sm" x="615" y="82" text-anchor="middle">internet: feed hosts, Anthropic</text>
+        <rect class="bx" x="540" y="116" width="150" height="30" rx="6"/>
+        <text class="t-sm" x="615" y="135" text-anchor="middle">internet gateway</text>
+        <rect class="bx-ghost" x="440" y="158" width="350" height="54" rx="8"/>
+        <text class="t-mono" x="778" y="176" text-anchor="end">public</text>
+        <rect class="bx-pg" x="540" y="168" width="150" height="34" rx="6"/>
+        <text class="t-sm" x="615" y="189" text-anchor="middle">NAT gateway</text>
+        <rect class="bx-ghost" x="440" y="222" width="350" height="88" rx="8"/>
+        <text class="t-mono" x="778" y="240" text-anchor="end">private</text>
+        <rect class="bx-ok" x="460" y="248" width="160" height="50" rx="8"/>
+        <text class="t-head" x="540" y="270" text-anchor="middle">worker task</text>
+        <text class="t-mono" x="540" y="288" text-anchor="middle">no public IP</text>
+        <rect class="bx-ghost" x="640" y="250" width="130" height="46" rx="6"/>
+        <text class="t-sm" x="705" y="270" text-anchor="middle">VPC endpoints</text>
+        <text class="t-sm" x="705" y="286" text-anchor="middle">for AWS APIs</text>
+        <path class="wire-acc" d="M560 248 L590 204" marker-end="url(#aws-a5)"/>
+        <path class="wire-acc" d="M615 168 V148" marker-end="url(#aws-a5)"/>
+        <path class="wire-acc" d="M615 116 V98" marker-end="url(#aws-a5)"/>
+        <path class="wire" d="M620 273 H638" marker-end="url(#aws-a6)"/>
+      </svg>
+    </div>
+    <figcaption><b>Figure 11.3</b> Two ways to let the worker call out while refusing unsolicited inbound connections. The production layout adds a second barrier, no public address at all, at the price of a NAT gateway. The database is in private subnets in both.</figcaption>
+  </figure>
+  <p>The price is defence in depth. With public IPs the security group is the only barrier, so one bad rule, such as a port opened to <code>0.0.0.0/0</code> while debugging, exposes a task. The documented production setting is private subnets with NAT. <b>VPC endpoints</b> could replace NAT for AWS services, but the worker would still need NAT for feed hosts and Anthropic.</p>
+  <div class="note principle"><span class="label">Key principle</span><p>A cost-saving shortcut is defensible when you can say what protection it gives up, what still protects you, and what production would do instead.</p></div>
+  <p>The plan proposes this no-NAT layout and about $50 a month always on, but both are open question Q6, still undecided.</p>
+
+  <h3>Terraform in two roots</h3>
+  <p>Every AWS resource is described in Terraform under <code>infra/</code>, so the environment can be reviewed and rebuilt. ADR-009 picked Terraform because it's common in backend job postings, isn't tied to one cloud, and its <code>plan</code> output reads well in pull requests. CDK in Python is the alternative. Terraform or CDK is open question Q8, and the plan leans towards Terraform.</p>
+  <p>Terraform keeps a <b>state file</b> mapping each resource in the configuration, such as <code>aws_ecs_service.worker</code>, to the real object in AWS. <code>terraform plan</code> shows what will change, and <code>apply</code> does it. A <code>-/+</code> (destroy and recreate) on the database means data loss, so plans get read in review.</p>
+  <p>State lives in S3, so CI and your laptop share one record, with S3's native locking (<code>use_lockfile = true</code>) instead of a DynamoDB table.</p>
+
+  <h4>Who creates the state bucket</h4>
+  <p>The bucket must exist before anything can keep state in it, so there are two roots.</p>
+  <ul>
+    <li><b><code>infra/bootstrap/</code></b> is applied once, by hand, with admin credentials. It creates the state bucket (versioned, encrypted, public access blocked, <code>prevent_destroy</code>), the GitHub OIDC provider and the CI roles.</li>
+    <li><b><code>infra/main/</code></b> holds everything else, with its state in that bucket.</li>
+  </ul>
+  <p>Bootstrap starts on local state. After its first apply, <code>terraform init -migrate-state</code> moves that state into the new bucket under its own key, so no local state file is left to lose or commit.</p>
+<pre><code><span class="c"># infra/main/backend.tf (bucket, key and region are placeholders)</span>
+terraform {
+  backend "s3" {
+    bucket       = "&lt;state-bucket&gt;"
+    key          = "main/terraform.tfstate"
+    region       = "&lt;region&gt;"
+    encrypt      = true
+    <span class="hl">use_lockfile = true</span>   <span class="c"># native S3 locking, no DynamoDB table</span>
+  }
+}
+
+<span class="c"># infra/bootstrap, once: apply with local state, then move it into the bucket</span>
+terraform init &amp;&amp; terraform apply
+<span class="c"># add backend "s3" { key = "bootstrap/terraform.tfstate" ... }, then:</span>
+<span class="hl">terraform init -migrate-state</span></code></pre>
+
+  <h3>Deploying without stored keys: GitHub OIDC</h3>
+  <p>The pipeline gets AWS permissions through OpenID Connect (OIDC), so no long-lived AWS key sits in GitHub waiting to leak. Each workflow job gets a short-lived signed JWT whose <code>sub</code> (subject) claim says where the job runs and <code>aud</code> (audience) says who it's for. AWS STS checks it against the role's trust policy and returns temporary credentials.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 820 370" role="img" aria-label="GitHub OIDC sequence. The deploy job runs in the production environment after approval. 1: it requests an ID token from the GitHub OIDC issuer. 2: the issuer returns a signed JWT containing sub, aud and exp claims. 3: the job calls AWS STS AssumeRoleWithWebIdentity with the role ARN and the JWT. 4: STS checks the JWT signature with GitHub's published keys and matches sub and aud against the role's trust policy. 5: STS returns temporary credentials that expire after about an hour by default. 6: the job uses them to push the image to ECR, run the migration and deploy on ECS.">
+        <defs>
+          <marker id="aws-a7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+          <marker id="aws-a8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="15" y="16" width="170" height="44" rx="8"/>
+        <text class="t-head" x="100" y="35" text-anchor="middle">GitHub OIDC issuer</text>
+        <text class="t-sm" x="100" y="51" text-anchor="middle">signs ID tokens</text>
+        <rect class="bx-pg" x="225" y="16" width="170" height="44" rx="8"/>
+        <text class="t-head" x="310" y="35" text-anchor="middle">Deploy job</text>
+        <text class="t-sm" x="310" y="51" text-anchor="middle">env: production</text>
+        <rect class="bx" x="435" y="16" width="170" height="44" rx="8"/>
+        <text class="t-head" x="520" y="35" text-anchor="middle">AWS STS</text>
+        <text class="t-sm" x="520" y="51" text-anchor="middle">issues temporary keys</text>
+        <rect class="bx" x="635" y="16" width="170" height="44" rx="8"/>
+        <text class="t-head" x="720" y="35" text-anchor="middle">ECR and ECS</text>
+        <text class="t-sm" x="720" y="51" text-anchor="middle">your AWS account</text>
+
+        <path class="wire-dash" d="M100 60 V350"/>
+        <path class="wire-dash" d="M310 60 V350"/>
+        <path class="wire-dash" d="M520 60 V350"/>
+        <path class="wire-dash" d="M720 60 V350"/>
+
+        <text class="t-sm" x="205" y="88" text-anchor="middle">1 request an ID token</text>
+        <path class="wire" d="M310 96 H102" marker-end="url(#aws-a7)"/>
+        <text class="t-sm" x="205" y="133" text-anchor="middle">2 signed JWT: sub, aud, exp</text>
+        <path class="wire" d="M100 141 H308" marker-end="url(#aws-a7)"/>
+        <text class="t-sm" x="415" y="178" text-anchor="middle">3 AssumeRoleWithWebIdentity</text>
+        <path class="wire-acc" d="M310 186 H518" marker-end="url(#aws-a8)"/>
+        <rect class="bx-pg" x="415" y="200" width="210" height="62" rx="6"/>
+        <text class="t-sm" x="520" y="218" text-anchor="middle">4 check the JWT signature</text>
+        <text class="t-sm" x="520" y="234" text-anchor="middle">and match sub and aud to</text>
+        <text class="t-sm" x="520" y="250" text-anchor="middle">the role's trust policy</text>
+        <text class="t-sm" x="415" y="282" text-anchor="middle">5 temporary keys (about 1 hour)</text>
+        <path class="wire-acc" d="M520 290 H312" marker-end="url(#aws-a8)"/>
+        <text class="t-sm" x="620" y="324" text-anchor="middle">6 push, migrate, deploy</text>
+        <path class="wire" d="M310 332 H718" marker-end="url(#aws-a7)"/>
+      </svg>
+    </div>
+    <figcaption><b>Figure 11.4</b> The OIDC exchange. Only a short-lived token bound to your repository and the <code>production</code> environment crosses from GitHub to AWS, and the credentials it buys expire on their own.</figcaption>
+  </figure>
+  <p>A job that uses a GitHub <b>environment</b>, a named deploy target that can require approval, presents <code>sub = repo:simonoconnordev/briefing-engine:environment:production</code>. The branch isn't in it. The plan uses two roles, both requiring <code>aud = sts.amazonaws.com</code>.</p>
+  <ul>
+    <li><b>Deploy role.</b> It trusts only that <code>environment:production</code> subject. The environment requires your approval and allows only <code>main</code>, so the approval can't be skipped.</li>
+    <li><b>Plan role.</b> It's read-only and trusts <code>…:pull_request</code>, so pull requests can run <code>terraform plan</code> but never apply.</li>
+  </ul>
+<pre><code><span class="c"># Trust policy condition on the deploy role</span>
+"Condition": {
+  "StringEquals": {
+    "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+    <span class="hl">"token.actions.githubusercontent.com:sub":
+      "repo:simonoconnordev/briefing-engine:environment:production"</span>
+  }
+}
+
+<span class="c"># In the deploy workflow</span>
+jobs:
+  deploy:
+    environment: production
+    permissions:
+      id-token: write   <span class="c"># allow the job to request an ID token</span>
+      contents: read</code></pre>
+  <div class="note pitfall"><span class="label">Common mistake</span><p>Writing the deploy role's condition as <code>…:ref:refs/heads/main</code>. A job with an environment never presents that subject, so every deploy fails with access denied. The opposite mistake is <code>StringLike</code> with <code>repo:simonoconnordev/*</code>, which lets every repository you own assume the role.</p></div>
+
+  <h3>What happens on a deploy</h3>
+  <p>After CI passes on <code>main</code> and you approve the <code>production</code> environment, the deploy runs in a fixed order.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 820 270" role="img" aria-label="Deploy pipeline. CI checks pass on main and you approve the production environment. The image is built and tagged with the git SHA, then pushed to ECR using the OIDC role. A one-off ECS task runs briefing migrate; if it fails, the deploy stops. Both services are updated to a new task definition revision. A rolling update starts the new task first and then stops the old one, with the circuit breaker on. If the new tasks are healthy, the rollout completes and the pipeline makes a final GET /readyz check. If they are unhealthy, the circuit breaker rolls back automatically to the last good deployment. The manual path is to redeploy the previous SHA.">
+        <defs>
+          <marker id="aws-a9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="12" y="20" width="142" height="84" rx="8"/>
+        <text class="t-head" x="83" y="46" text-anchor="middle">CI + approval</text>
+        <text class="t-sm" x="83" y="64" text-anchor="middle">checks pass on main</text>
+        <text class="t-sm" x="83" y="80" text-anchor="middle">approve production</text>
+        <rect class="bx" x="175" y="20" width="142" height="84" rx="8"/>
+        <text class="t-head" x="246" y="46" text-anchor="middle">Build image</text>
+        <text class="t-sm" x="246" y="64" text-anchor="middle">tag = git SHA</text>
+        <text class="t-mono" x="246" y="80" text-anchor="middle">3f9c2ab</text>
+        <rect class="bx" x="338" y="20" width="142" height="84" rx="8"/>
+        <text class="t-head" x="409" y="46" text-anchor="middle">Push to ECR</text>
+        <text class="t-sm" x="409" y="64" text-anchor="middle">via the OIDC role</text>
+        <text class="t-mono" x="409" y="80" text-anchor="middle">:3f9c2ab</text>
+        <rect class="bx-pg" x="501" y="20" width="142" height="84" rx="8"/>
+        <text class="t-head" x="572" y="46" text-anchor="middle">Migrate</text>
+        <text class="t-sm" x="572" y="64" text-anchor="middle">one-off ECS task</text>
+        <text class="t-mono" x="572" y="82" text-anchor="middle">briefing migrate</text>
+        <rect class="bx" x="664" y="20" width="142" height="84" rx="8"/>
+        <text class="t-head" x="735" y="46" text-anchor="middle">Update services</text>
+        <text class="t-sm" x="735" y="64" text-anchor="middle">new task definition</text>
+        <text class="t-sm" x="735" y="80" text-anchor="middle">revision for each</text>
+        <path class="wire" d="M154 62 H173" marker-end="url(#aws-a9)"/>
+        <path class="wire" d="M317 62 H336" marker-end="url(#aws-a9)"/>
+        <path class="wire" d="M480 62 H499" marker-end="url(#aws-a9)"/>
+        <path class="wire" d="M643 62 H662" marker-end="url(#aws-a9)"/>
+        <text class="t-sm" x="572" y="124" text-anchor="middle">if it fails, the deploy stops</text>
+        <path class="wire" d="M735 104 V140 H410 V158" marker-end="url(#aws-a9)"/>
+
+        <rect class="bx-pg" x="300" y="160" width="220" height="76" rx="8"/>
+        <text class="t-head" x="410" y="184" text-anchor="middle">Rolling update</text>
+        <text class="t-sm" x="410" y="202" text-anchor="middle">new task first, then old stops</text>
+        <text class="t-mono" x="410" y="220" text-anchor="middle">circuit breaker on</text>
+        <rect class="bx-ok" x="590" y="168" width="216" height="60" rx="8"/>
+        <text class="t-head" x="698" y="192" text-anchor="middle">Rollout complete</text>
+        <text class="t-sm" x="698" y="212" text-anchor="middle">final gate: GET /readyz</text>
+        <rect class="bx-bad" x="14" y="168" width="216" height="60" rx="8"/>
+        <text class="t-head" x="122" y="192" text-anchor="middle">Automatic rollback</text>
+        <text class="t-sm" x="122" y="212" text-anchor="middle">to the last good deployment</text>
+        <path class="wire" d="M520 198 H588" marker-end="url(#aws-a9)"/>
+        <text class="t-sm" x="554" y="190" text-anchor="middle">healthy</text>
+        <path class="wire" d="M300 198 H232" marker-end="url(#aws-a9)"/>
+        <text class="t-sm" x="266" y="190" text-anchor="middle">unhealthy</text>
+        <text class="t-sm" x="122" y="252" text-anchor="middle">manual: redeploy previous SHA</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 11.5</b> From approval to running code. The migration runs once, before any new code starts, and the code can always be rolled back by pointing the services at an earlier image tag.</figcaption>
+  </figure>
+  <ol>
+    <li><b>Tag with the git SHA.</b> <code>3f9c2ab</code> always means one commit, and it's the <code>version</code> in every log line.</li>
+    <li><b>Migrate in a one-off task.</b> <code>briefing migrate</code> runs inside the VPC, so the database never accepts connections from GitHub, and only once, so tasks don't race to migrate.</li>
+    <li><b>Roll out.</b> ECS starts each new task beside the old one, waits for its health checks, then drains the old one. A circuit breaker rolls back if new tasks keep failing.</li>
+    <li><b>Final gate.</b> The pipeline calls <code>/readyz</code> on the new tasks.</li>
+  </ol>
+
+  <h4>Why old code keeps working after the migration</h4>
+  <p>For a while, old tasks serve against a schema that's ahead of them. So every migration must work with the code before it, and a breaking change uses <b>expand/contract</b>, adding the new form first and dropping the old one only when nothing reads it.</p>
+  <p>Each migration also sets <code>schema_meta.schema_version</code> to its sequence number. The code declares <code>MIN_SCHEMA_VERSION</code>, the oldest schema it can run on, and <code>/readyz</code> checks <code>schema_version &gt;= MIN_SCHEMA_VERSION</code>.</p>
+  <div class="note example"><span class="label">Worked example</span>
+    <ol>
+      <li>The database is at version 13, and the running release declares <code>MIN_SCHEMA_VERSION = 12</code>.</li>
+      <li>The new release adds a column in migration 14 and declares <code>MIN_SCHEMA_VERSION = 14</code>.</li>
+      <li>The migration runs. Old tasks check <code>14 &gt;= 12</code> and stay ready.</li>
+      <li>New tasks check <code>14 &gt;= 14</code> and pass the final gate. An exact-match check would have failed every old task as soon as migration 14 finished.</li>
+    </ol>
+  </div>
+  <p>Rollback means redeploying the previous image tag, which is safe because old code works against the newer schema.</p>
+
+  <h3>Health checks that don't make outages worse</h3>
+  <p>ADR-014 splits the health checks by who acts on them, so a database outage never triggers a restart.</p>
+  <ul>
+    <li><b><code>GET /healthz</code></b> (liveness) checks that the process is up and its event loop responds. The ALB target group uses it, so ECS replaces an API task only if that task is stuck.</li>
+    <li><b><code>GET /readyz</code></b> (readiness) runs <code>SELECT 1</code> within 1 second plus the schema check, and returns <code>503</code> naming the failing check. It gates deploys and drives a CloudWatch synthetic alarm, and it isn't wired to the ALB.</li>
+    <li><b><code>briefing worker-health</code></b> is the worker's container check. The main loop touches a timestamp file every iteration, whether or not its database calls worked, so the check fails only if the loop is stuck for 2 minutes.</li>
+    <li><b><code>workers.last_heartbeat_at</code></b> is updated every 15 seconds and only drives the "no heartbeat for 5 minutes" alarm.</li>
+  </ul>
+  <div class="note principle"><span class="label">Key principle</span><p>A health check that ECS acts on must fail only when restarting the task would help. A restart can't fix a database outage. It only adds a restart loop on top of it.</p></div>
+  <p>During an outage, API requests that need the database fail within the pool's 2-second connection timeout with <code>503</code> problem+json and <code>Retry-After: 5</code>. The worker logs <code>db.unavailable</code> and backs off from 1 second up to 30. When Postgres returns, both carry on.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 820 300" role="img" aria-label="Failure scenario with illustrative timings: the database is unavailable from 20 to 50 seconds. Design A, where ECS acts on a check that includes the database: the container fails three checks and is killed at 45 seconds, the replacement runs until about 105 seconds, and the service is unavailable from 20 to about 105 seconds. Design B, the plan's design, where the checks ECS acts on ignore the database: the container keeps running throughout, requests get fast 503 responses from 20 to about 52 seconds, and service resumes as soon as the pool reconnects.">
+        <text class="t-head" x="10" y="22">A. ECS acts on a check that includes the database</text>
+        <text class="t-sm" x="10" y="50">Database</text>
+        <rect class="bx-ok" x="140" y="36" width="73" height="20" rx="3"/>
+        <rect class="bx-bad" x="213" y="36" width="110" height="20" rx="3"/>
+        <text class="t-sm" x="268" y="50" text-anchor="middle">down</text>
+        <rect class="bx-ok" x="323" y="36" width="477" height="20" rx="3"/>
+        <text class="t-sm" x="10" y="80">Container</text>
+        <rect class="bx-ok" x="140" y="66" width="165" height="20" rx="3"/>
+        <rect class="bx-bad" x="305" y="66" width="220" height="20" rx="3"/>
+        <text class="t-sm" x="415" y="80" text-anchor="middle">killed, then replaced</text>
+        <rect class="bx-ok" x="525" y="66" width="275" height="20" rx="3"/>
+        <text class="t-sm" x="10" y="110">Serving</text>
+        <rect class="bx-ok" x="140" y="96" width="73" height="20" rx="3"/>
+        <rect class="bx-bad" x="213" y="96" width="312" height="20" rx="3"/>
+        <text class="t-sm" x="369" y="110" text-anchor="middle">unavailable for about 85 s</text>
+        <rect class="bx-ok" x="525" y="96" width="275" height="20" rx="3"/>
+
+        <text class="t-head" x="10" y="152">B. The plan: the checks ECS acts on ignore the database</text>
+        <text class="t-sm" x="10" y="180">Database</text>
+        <rect class="bx-ok" x="140" y="166" width="73" height="20" rx="3"/>
+        <rect class="bx-bad" x="213" y="166" width="110" height="20" rx="3"/>
+        <text class="t-sm" x="268" y="180" text-anchor="middle">down</text>
+        <rect class="bx-ok" x="323" y="166" width="477" height="20" rx="3"/>
+        <text class="t-sm" x="10" y="210">Container</text>
+        <rect class="bx-ok" x="140" y="196" width="660" height="20" rx="3"/>
+        <text class="t-sm" x="470" y="210" text-anchor="middle">keeps running, pool reconnects</text>
+        <text class="t-sm" x="10" y="240">Serving</text>
+        <rect class="bx-ok" x="140" y="226" width="73" height="20" rx="3"/>
+        <rect class="bx-bad" x="213" y="226" width="118" height="20" rx="3"/>
+        <text class="t-sm" x="272" y="240" text-anchor="middle">fast 503s</text>
+        <rect class="bx-ok" x="331" y="226" width="469" height="20" rx="3"/>
+
+        <path class="axis" d="M140 262 H800"/>
+        <path class="axis" d="M140 258 V266"/><text class="t-mono" x="140" y="282" text-anchor="middle">0 s</text>
+        <path class="axis" d="M250 258 V266"/><text class="t-mono" x="250" y="282" text-anchor="middle">30</text>
+        <path class="axis" d="M360 258 V266"/><text class="t-mono" x="360" y="282" text-anchor="middle">60</text>
+        <path class="axis" d="M470 258 V266"/><text class="t-mono" x="470" y="282" text-anchor="middle">90</text>
+        <path class="axis" d="M580 258 V266"/><text class="t-mono" x="580" y="282" text-anchor="middle">120</text>
+        <path class="axis" d="M690 258 V266"/><text class="t-mono" x="690" y="282" text-anchor="middle">150</text>
+        <path class="axis" d="M800 258 V266"/><text class="t-mono" x="790" y="282" text-anchor="middle">180</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 11.6</b> A 30-second database blip under both designs, with illustrative timings. In design A every task fails at once, ECS kills them all, and users wait for replacements long after the database is back. In design B nothing is killed, and service resumes as soon as connections succeed.</figcaption>
+  </figure>
+  <p>In a longer outage design A loops, killing each replacement in turn, and every killed worker abandons its jobs until their leases expire.</p>
+
+  <h3>Shutting down without losing work</h3>
+  <p>ECS stops a task by sending <code>SIGTERM</code>, waiting the <code>stopTimeout</code> of 30 seconds, then sending <code>SIGKILL</code>, which can't be caught. The worker uses that window like this.</p>
+  <ol>
+    <li><b>At 0 s</b> it stops claiming new jobs.</li>
+    <li><b>Up to 25 s</b> running jobs finish, with their heartbeats still extending their leases.</li>
+    <li><b>At 25 s</b> it exits and leaves any unfinished jobs, so <code>SIGKILL</code> never arrives.</li>
+    <li><b>When those leases expire</b> (60 seconds by default), the reaper requeues the jobs. Idempotent handlers make the rerun harmless.</li>
+  </ol>
+  <p>An API task is first removed from the target group, so the ALB sends it nothing new, and uvicorn finishes the requests in progress.</p>
+  <div class="note pitfall"><span class="label">Common mistake</span><p>Writing <code>ENTRYPOINT briefing</code> in shell form. Then <code>/bin/sh</code> is PID 1 and doesn't pass <code>SIGTERM</code> on, so every deploy waits for <code>SIGKILL</code>. Shell form also ignores <code>CMD</code> and the ECS <code>command</code>. Use <code>ENTRYPOINT ["briefing"]</code> and <code>CMD ["api"]</code>.</p></div>
+
+  <h3>Knowing when it's unwell</h3>
+  <p>The plan watches the system through structured logs, metrics carried inside those logs, and five alarms.</p>
+  <h4>Logs</h4>
+  <p><code>structlog</code> writes one JSON object per line to stdout, kept in CloudWatch for 30 days. Each line has a stable <code>event</code> name, the git SHA as <code>version</code>, and whichever ids apply, so Logs Insights can filter on fields. Secrets, email bodies and article text are never logged, with a redaction processor as the backstop.</p>
+<pre><code><span class="c"># one log line (wrapped here for reading)</span>
+{"ts": "2026-11-08T06:02:14.381Z", "level": "info",
+ "event": "fetch.completed", "service": "worker", "version": "3f9c2ab",
+ "job_id": 48213, "queue": "fetch", "source_id": 17, "host": "hnrss.org",
+ "outcome": "not_modified", "duration_ms": 212}
+
+<span class="c"># Logs Insights: which hosts rate-limited us today?</span>
+fields host
+| filter <span class="hl">event = "fetch.completed" and outcome = "rate_limited"</span>
+| stats count(*) by host</code></pre>
+<pre><code>SECRET_FIELDS = {"authorization", "api_key", "webhook_secret", "smtp_password"}
+API_KEY = re.compile(r"<span class="hl">bek_[A-Za-z0-9_]+</span>")   <span class="c"># the plan's API key format</span>
+
+def redact(logger, method_name, event_dict):
+    for key, value in event_dict.items():
+        if key.lower() in SECRET_FIELDS:
+            event_dict[key] = "[redacted]"
+        elif isinstance(value, str):
+            event_dict[key] = API_KEY.sub("[redacted]", value)
+    return event_dict</code></pre>
+  <h4>Metrics</h4>
+  <p>Metrics use CloudWatch <b>Embedded Metric Format</b> (EMF), a log line with an <code>_aws</code> block naming the metric fields, so no agent is needed. Each dimension combination is billed as its own metric, so dimensions stay small, such as queue and outcome, and <code>user_id</code> stays in the log line.</p>
+<pre><code>{"_aws": {"Timestamp": 1794117734381,
+          "CloudWatchMetrics": [{"Namespace": "&lt;namespace&gt;",
+                                 "Dimensions": [["queue"]],
+                                 "Metrics": [{"Name": "oldest_queued_job_age_s",
+                                              "Unit": "Seconds"}]}]},
+ "queue": "build", <span class="hl">"oldest_queued_job_age_s": 42</span>}</code></pre>
+  <h4>Alarms</h4>
+  <p>The alarms email you through SNS, each for a failure you'd otherwise notice only as a missing briefing.</p>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>Alarm</th><th>What it catches</th></tr></thead>
+      <tbody>
+        <tr><td><code>oldest_queued_job_age_s &gt; 900</code> on <code>build</code> or <code>deliver</code></td><td>Workers stopped, stuck or overwhelmed, so briefings are at risk of being late</td></tr>
+        <tr><td>No worker heartbeat for 5 minutes</td><td>The worker is down. An alarm on absence must treat missing data as breaching, or silence looks healthy.</td></tr>
+        <tr><td>Any <code>delivery.dead</code></td><td>A delivery used up its retries and needs a replay</td></tr>
+        <tr><td>5xx rate over 5% for 5 minutes</td><td>The API is failing for clients</td></tr>
+        <tr><td>LLM daily spend over 2× its 7-day average</td><td>A runaway loop, a cache bug or a pricing mistake</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The case-study figures come from SQL over the ledger tables, such as <code>llm_calls</code> and <code>fetch_log</code>, which stay exact while CloudWatch rolls old metrics up.</p>
+
+  <h3>What it costs, and tearing it down</h3>
+  <p>The plan estimates about $50 a month always on, plus about $2 of LLM usage.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 760 270" role="img" aria-label="Monthly cost bar chart drawn to scale at 12 pixels per dollar. Application Load Balancer about 18 dollars. Two Fargate tasks about 18 dollars. RDS about 15 dollars. Everything else about 2 dollars. LLM usage about 2 dollars, shown in a different colour because it is not infrastructure. A dashed bar shows the NAT gateway the plan avoids, about 32 dollars.">
+        <text class="t-sm" x="195" y="45" text-anchor="end">Load balancer (ALB)</text>
+        <rect class="bar" x="210" y="30" width="216" height="22"/>
+        <text class="t-mono" x="434" y="45">$18</text>
+        <text class="t-sm" x="195" y="79" text-anchor="end">Two Fargate tasks</text>
+        <rect class="bar" x="210" y="64" width="216" height="22"/>
+        <text class="t-mono" x="434" y="79">$18</text>
+        <text class="t-sm" x="195" y="113" text-anchor="end">RDS db.t4g.micro</text>
+        <rect class="bar" x="210" y="98" width="180" height="22"/>
+        <text class="t-mono" x="398" y="113">$15</text>
+        <text class="t-sm" x="195" y="147" text-anchor="end">Everything else</text>
+        <rect class="bar" x="210" y="132" width="24" height="22"/>
+        <text class="t-mono" x="242" y="147">$2</text>
+        <text class="t-sm" x="195" y="181" text-anchor="end">LLM usage (yours)</text>
+        <rect class="bar-alt" x="210" y="166" width="24" height="22"/>
+        <text class="t-mono" x="242" y="181">$2</text>
+        <text class="t-sm" x="195" y="215" text-anchor="end">NAT gateway (avoided)</text>
+        <rect class="bx-ghost" x="210" y="200" width="384" height="22"/>
+        <text class="t-mono" x="602" y="215">$32</text>
+        <path class="axis" d="M210 236 H630"/>
+        <path class="axis" d="M210 232 V240"/><text class="t-mono" x="210" y="256" text-anchor="middle">$0</text>
+        <path class="axis" d="M330 232 V240"/><text class="t-mono" x="330" y="256" text-anchor="middle">$10</text>
+        <path class="axis" d="M450 232 V240"/><text class="t-mono" x="450" y="256" text-anchor="middle">$20</text>
+        <path class="axis" d="M570 232 V240"/><text class="t-mono" x="570" y="256" text-anchor="middle">$30</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 11.7</b> The plan's estimated monthly cost, drawn to scale. The components add up to about $53, which the plan rounds to $50. The avoided NAT gateway would have been the largest single item. AWS prices vary by region and change over time.</figcaption>
+  </figure>
+  <p>The ALB, tasks and database bill by the hour even when idle. Running <code>terraform destroy</code> between demos saves money but loses continuous uptime, and that's part of open question Q6. Stage 2 requires one tested destroy and rebuild. Expect these snags.</p>
+  <ul>
+    <li><b>The data goes with the database.</b> Take a snapshot first, because the ledger tables hold your case-study numbers.</li>
+    <li><b>Secret names stay reserved.</b> Secrets Manager keeps deleted secrets for a recovery window, 30 days by default, so a quick re-apply fails unless it's shortened.</li>
+    <li><b>The state bucket stays.</b> It belongs to <code>infra/bootstrap/</code> with <code>prevent_destroy</code>, so destroying <code>infra/main/</code> never touches it.</li>
+  </ul>
+
+  <div class="try">
+    <span class="label">Try it</span>
+    <p><b>1. Watch a database outage.</b></p>
+    <ol>
+      <li>Run the stack with <code>docker compose</code> and stop Postgres with <code>docker compose stop db</code>.</li>
+      <li>Call <code>/healthz</code>, <code>/readyz</code> and <code>GET /v1/articles</code>, then start Postgres and call them again.</li>
+    </ol>
+    <p>While Postgres is down, <code>/healthz</code> returns <code>200</code>, and the other two return <code>503</code> within about 2 seconds, the articles request with <code>Retry-After: 5</code>. Afterwards all three succeed with no restart.</p>
+    <p><b>2. Test graceful shutdown.</b></p>
+    <ol>
+      <li>Enqueue a few slow jobs.</li>
+      <li>Run <code>docker stop --time 30</code> on the worker.</li>
+    </ol>
+    <p>It should log its shutdown and exit well before 30 seconds. Exit code 137 means <code>SIGKILL</code> was needed, so check the exec form.</p>
+  </div>
+
+  <div class="ask">
+    <span class="label">If an interviewer asks</span>
+    <p class="q">"Why not Lambda? It's cheaper."</p>
+    <p>"Only when idle. My worker heartbeats leases, listens for Postgres notifications and holds a session-level advisory lock. Lambda freezes between invocations, so I'd rebuild around SQS, lose transactional enqueue, and add RDS Proxy, which pins <code>LISTEN</code> sessions anyway."</p>
+    <p class="q">"Your containers have public IPs. Isn't that insecure?"</p>
+    <p>"It saves a $32-a-month NAT gateway. The security groups only accept traffic from the load balancer, and the database is in private subnets with no internet route. I give up defence in depth, and in production I'd use private subnets with NAT."</p>
+    <p class="q">"Why doesn't your load balancer's health check test the database?"</p>
+    <p>"ECS replaces tasks that fail it, and that can't fix a database, so a blip would kill every task at once. The ALB checks <code>/healthz</code>, the API returns fast 503s while the database is down, and <code>/readyz</code> gates deploys and drives an alarm."</p>
+  </div>
+  <label class="got"><input type="checkbox" id="got-aws" data-ch="aws"> I can explain this</label>
+</section>

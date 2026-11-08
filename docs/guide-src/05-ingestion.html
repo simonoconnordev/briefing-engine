@@ -1,0 +1,609 @@
+<!-- ============================================================ -->
+<section class="ch" id="ingestion">
+  <div class="ch-head"><span class="ch-num">Chapter 05</span><span class="plan-ref">plan §6.1–6.4</span><h2>Being polite to feed hosts</h2></div>
+
+  <p>Every briefing starts by fetching feeds from hosts you don't control. If the service asks too often or too clumsily, those hosts throttle or block it, and the briefing quietly loses its sources.</p>
+  <p>You have seen this happen. Horizon fetched two Reddit feeds in the same minute, Reddit answered <code>429 Too Many Requests</code>, and the briefing went out without them. The plan's answer is a shared per-host rate limit, honouring <code>Retry-After</code>, backoff with jitter, conditional requests and an identifying User-Agent.</p>
+
+  <h3>What happens in one fetch</h3>
+  <p>Every step runs as a job in the Postgres queue, and every wait goes back into the queue instead of holding a worker.</p>
+  <ol class="steps">
+    <li><b>Schedule.</b> Once a minute the scheduler selects sources where <code>status = 'active' AND next_fetch_at &lt;= now()</code> and enqueues <code>fetch(source_id)</code> with <code>dedupe_key = 'fetch:{source_id}'</code>. A partial unique index on <code>dedupe_key</code> means a source can never have two fetch jobs queued or running at once.</li>
+    <li><b>Take a host slot.</b> The fetch worker asks the per-host limiter when it may send. If the slot is in the future, the job goes back to the queue with <code>run_at</code> set to that slot.</li>
+    <li><b>Send a conditional GET.</b> The request carries the validators from the last successful fetch, so an unchanged feed costs almost nothing.</li>
+    <li><b>Classify the result.</b> One table in code turns every status code and network error into one action.</li>
+    <li><b>Store and hand on.</b> On a <code>200</code> the worker parses the feed with <code>feedparser</code> (Hacker News has its own adapter), normalises each entry, and upserts <code>articles</code> and <code>article_sources</code>. For each new or changed original article it enqueues the next job.</li>
+    <li><b>Set the next due time.</b> <code>next_fetch_at = now() + fetch_interval</code>, where the interval grows for feeds that rarely change.</li>
+  </ol>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 880 500" role="img" aria-label="Ingestion flow. The scheduler selects due sources each minute and enqueues fetch jobs into the jobs table with a dedupe key. A fetch worker claims a job and takes a host slot from the hosts table. If the slot is in the future, the job is deferred to its slot without using an attempt. If the slot is now, the worker sends a conditional GET and classifies the result. A 200 is parsed and normalised, and one transaction upserts articles and article_sources and enqueues score jobs, or an extract job if the source is flagged. A 304 or an unchanged body is logged. Retryable errors and rate limits reschedule the job. Fatal errors increment consecutive_failures. The 200 and 304 paths finish by setting next_fetch_at to now plus fetch_interval.">
+        <defs>
+          <marker id="ingestion-a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+          <marker id="ingestion-a1acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <text class="t-sm" x="535" y="22" text-anchor="middle">slot in the future: defer the job to its slot (no attempt used)</text>
+        <path class="wire-dash" d="M760 50 V32 H310 V48" marker-end="url(#ingestion-a1)"/>
+
+        <rect class="bx" x="20" y="50" width="150" height="70" rx="8"/>
+        <text class="t-head" x="95" y="80" text-anchor="middle">Scheduler</text>
+        <text class="t-sm" x="95" y="100" text-anchor="middle">selects due sources</text>
+
+        <rect class="bx-pg" x="220" y="50" width="180" height="70" rx="8"/>
+        <text class="t-head" x="310" y="74" text-anchor="middle">jobs table</text>
+        <text class="t-mono" x="310" y="92" text-anchor="middle">fetch(source_id)</text>
+        <text class="t-mono" x="310" y="108" text-anchor="middle">dedupe fetch:{id}</text>
+
+        <rect class="bx" x="450" y="50" width="160" height="70" rx="8"/>
+        <text class="t-head" x="530" y="80" text-anchor="middle">Fetch worker</text>
+        <text class="t-sm" x="530" y="100" text-anchor="middle">claims the job</text>
+
+        <rect class="bx-pg" x="660" y="50" width="200" height="70" rx="8"/>
+        <text class="t-head" x="760" y="80" text-anchor="middle">Take a host slot</text>
+        <text class="t-sm" x="760" y="100" text-anchor="middle">shared row in hosts</text>
+
+        <path class="wire" d="M170 85 H218" marker-end="url(#ingestion-a1)"/>
+        <path class="wire" d="M400 85 H448" marker-end="url(#ingestion-a1)"/>
+        <path class="wire" d="M610 85 H658" marker-end="url(#ingestion-a1)"/>
+
+        <path class="wire-acc" d="M760 120 V168" marker-end="url(#ingestion-a1acc)"/>
+        <text class="t-sm" x="770" y="148">slot is now</text>
+
+        <rect class="bx" x="660" y="170" width="200" height="70" rx="8"/>
+        <text class="t-head" x="760" y="200" text-anchor="middle">Conditional GET</text>
+        <text class="t-sm" x="760" y="220" text-anchor="middle">sends stored validators</text>
+
+        <rect class="bx" x="400" y="170" width="200" height="70" rx="8"/>
+        <text class="t-head" x="500" y="200" text-anchor="middle">Classify the result</text>
+        <text class="t-sm" x="500" y="220" text-anchor="middle">one table in code (§6.3)</text>
+        <path class="wire" d="M660 205 H602" marker-end="url(#ingestion-a1)"/>
+
+        <path class="wire" d="M500 240 V262"/>
+        <path class="wire" d="M120 262 H765"/>
+        <path class="wire" d="M120 262 V288" marker-end="url(#ingestion-a1)"/>
+        <path class="wire" d="M335 262 V288" marker-end="url(#ingestion-a1)"/>
+        <path class="wire" d="M550 262 V288" marker-end="url(#ingestion-a1)"/>
+        <path class="wire" d="M765 262 V288" marker-end="url(#ingestion-a1)"/>
+
+        <rect class="bx-ok" x="20" y="290" width="200" height="80" rx="8"/>
+        <text class="t-head" x="120" y="316" text-anchor="middle">200: parse</text>
+        <text class="t-sm" x="120" y="336" text-anchor="middle">feedparser or HN adapter</text>
+        <text class="t-sm" x="120" y="354" text-anchor="middle">normalise each entry</text>
+
+        <rect class="bx" x="235" y="290" width="200" height="80" rx="8"/>
+        <text class="t-head" x="335" y="316" text-anchor="middle">304 or same body</text>
+        <text class="t-sm" x="335" y="336" text-anchor="middle">log not_modified or</text>
+        <text class="t-sm" x="335" y="354" text-anchor="middle">unchanged_body</text>
+
+        <rect class="bx" x="450" y="290" width="200" height="80" rx="8"/>
+        <text class="t-head" x="550" y="316" text-anchor="middle">Retryable or 429</text>
+        <text class="t-sm" x="550" y="336" text-anchor="middle">reschedule with backoff</text>
+        <text class="t-sm" x="550" y="354" text-anchor="middle">or Retry-After + jitter</text>
+
+        <rect class="bx-bad" x="665" y="290" width="200" height="80" rx="8"/>
+        <text class="t-head" x="765" y="316" text-anchor="middle">Fatal</text>
+        <text class="t-sm" x="765" y="336" text-anchor="middle">consecutive_failures + 1</text>
+        <text class="t-sm" x="765" y="354" text-anchor="middle">after 5 in a row: broken</text>
+
+        <path class="wire" d="M120 370 V408" marker-end="url(#ingestion-a1)"/>
+        <rect class="bx-pg" x="20" y="410" width="400" height="76" rx="8"/>
+        <text class="t-head" x="220" y="434" text-anchor="middle">One transaction</text>
+        <text class="t-sm" x="220" y="454" text-anchor="middle">upsert articles and article_sources</text>
+        <text class="t-sm" x="220" y="472" text-anchor="middle">enqueue score jobs, or an extract job if flagged</text>
+
+        <path class="wire" d="M420 448 H448" marker-end="url(#ingestion-a1)"/>
+        <path class="wire" d="M335 370 V392 H600 V408" marker-end="url(#ingestion-a1)"/>
+        <rect class="bx" x="450" y="410" width="415" height="76" rx="8"/>
+        <text class="t-head" x="657" y="434" text-anchor="middle">Set next_fetch_at</text>
+        <text class="t-mono" x="657" y="454" text-anchor="middle">now() + fetch_interval</text>
+        <text class="t-sm" x="657" y="472" text-anchor="middle">the interval adapts to how often the feed changes</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 5.1</b> One fetch, from the scheduler to the next due time. The shaded boxes at the top are shared rows in Postgres. Every path that has to wait (a future slot, a retry, a rate limit) goes back into the queue.</figcaption>
+  </figure>
+
+  <h4>Why some articles are extracted before they are scored</h4>
+  <p>Some feeds carry only a short summary, so their sources have <code>extract_full_text</code> set and scoring waits for the full text.</p>
+  <ul>
+    <li><b>No extraction.</b> The fetch worker finds the rubrics of everyone subscribed to this source and enqueues a score job for each (<code>input_hash</code>, <code>rubric_hash</code>) pair not already in <code>llm_scores</code>. The <b><code>input_hash</code></b> is a hash of exactly the text the scorer will read.</li>
+    <li><b>Extraction.</b> The fetch worker enqueues <code>extract(article_id)</code> instead. The extract job runs trafilatura on the article page, stores <code>body_text</code> (truncated to 20k characters), recomputes <code>input_hash</code>, and only then enqueues scoring. So an article is never scored on its summary and again on its full text.</li>
+    <li><b>Extraction fails for good.</b> If the extract job ends up <code>dead</code>, its failure hook enqueues scoring on the summary, so the article is still scored.</li>
+  </ul>
+  <p>Every enqueue commits in the same transaction as the write it depends on. Extraction is another request to the same host, so it goes through the same per-host limiter.</p>
+
+  <h3>Turning a response into an action</h3>
+  <p>One explicit table maps every result to a class and every class to one action, with a unit test for each row. The first digit of the status code is only a first guess. <code>429</code>, <code>408 Request Timeout</code> and <code>425 Too Early</code> are all <code>4xx</code> (client) codes, yet another attempt can fix each of them.</p>
+
+  <figure>
+    <div class="tbl"><table>
+      <thead><tr><th>Result</th><th>Class</th><th>Retry?</th><th>Action</th></tr></thead>
+      <tbody>
+        <tr><td><code>200</code></td><td>ok</td><td>No need</td><td>Parse, or skip parsing if the body hash is unchanged</td></tr>
+        <tr><td><code>304</code></td><td>not modified</td><td>No need</td><td>Record <code>not_modified</code>, don't parse</td></tr>
+        <tr><td><code>429</code>, <code>503</code> with <code>Retry-After</code></td><td>rate limited</td><td class="good">Yes, after the wait</td><td>Honour <code>Retry-After</code>, set <code>hosts.blocked_until</code></td></tr>
+        <tr><td><code>408</code>, <code>425</code>, <code>429</code> or <code>5xx</code> without the header, connection reset, timeout, DNS failure</td><td>retryable</td><td class="good">Yes</td><td>Exponential backoff with full jitter</td></tr>
+        <tr><td><code>301</code>, <code>308</code></td><td>permanent redirect</td><td>Follow</td><td>Update <code>sources.url</code> after the SSRF check, record the change</td></tr>
+        <tr><td><code>401</code>, <code>403</code>, <code>404</code></td><td>fatal for this run</td><td class="badc">No</td><td><code>consecutive_failures++</code>; marked <code>broken</code> after 5</td></tr>
+        <tr><td><code>410 Gone</code></td><td>fatal, permanent</td><td class="badc">No</td><td>Mark <code>broken</code> immediately</td></tr>
+        <tr><td>Parse error, or over 5 MB</td><td>fatal for this run</td><td class="badc">No</td><td>Record it, count it as a failure</td></tr>
+      </tbody>
+    </table></div>
+    <figcaption><b>Figure 5.2</b> The classification table from plan §6.3. Each outcome is written to <code>fetch_log.outcome</code>, which feeds the case-study metrics.</figcaption>
+  </figure>
+
+  <p>A <b>retryable</b> failure is one where the same request, sent again soon, has a fair chance of working. A <b>fatal</b> one gives the same answer however often you ask, so retrying only wastes the host's capacity and looks like a badly behaved bot. Two rows need a closer look.</p>
+  <ul>
+    <li><b>Counted before acting.</b> A <code>404</code> can be a brief mistake during a site deployment, so a source is marked <code>broken</code> only after 5 fatal results in a row. <code>410 Gone</code> says the removal was deliberate, so it is marked <code>broken</code> at once.</li>
+    <li><b>Moved.</b> A <code>301</code> or <code>308</code> updates <code>sources.url</code>, after the new address passes the <b>SSRF guard</b> (the check that refuses private and internal addresses). Temporary redirects are followed for the current request only.</li>
+  </ul>
+
+  <div class="note principle"><span class="label">Key principle</span><p>Decide what to do from the meaning of each response, written down once in a tested table. Horizon's first bug came from the opposite approach, matching error message text, which broke as soon as the wording changed.</p></div>
+
+  <h3>How long to wait before a retry</h3>
+  <p>The plan waits longer after each failure, with a random element, and never sleeps inside the worker. The formula is the same for every queue:</p>
+<pre><code>def backoff(n: int, base: float = 2.0, cap: float = 300.0) -&gt; float:
+    <span class="c">"""n is the attempt that just failed, counted from 1."""</span>
+    return <span class="hl">random.uniform(0, min(cap, base * 2 ** (n - 1)))</span>
+
+<span class="c"># fetch queue: base = 2 s, cap = 5 min, max_attempts = 4</span></code></pre>
+  <p><b>Exponential backoff</b> doubles the wait after each failure, so a brief blip is retried quickly and a longer outage gets fewer and fewer requests. Retrying at once would add load to a server that is already struggling. The <b>cap</b> stops the wait growing without limit.</p>
+  <p><code>min(cap, base * 2 ** (n - 1))</code> is the <b>ceiling</b> of the wait, and the random draw below it is the jitter. Counting from 1 gives these ceilings:</p>
+  <ul>
+    <li><b>After attempt 1.</b> Up to 2 s.</li>
+    <li><b>After attempt 2.</b> Up to 4 s.</li>
+    <li><b>After attempt 3.</b> Up to 8 s, before the fourth and last attempt of this fetch cycle.</li>
+    <li><b>After attempt 4.</b> No retry. <code>attempts</code> has reached <code>max_attempts</code>, so the job becomes <code>dead</code> and the source waits for its next fetch cycle.</li>
+  </ul>
+  <p>Only <code>base</code>, <code>cap</code> and <code>max_attempts</code> change from queue to queue. Figure 5.3 draws the ceilings to scale.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 760 330" role="img" aria-label="Bar chart of the backoff ceiling against the attempt that just failed, counted from 1, drawn to scale. The ceilings are 2, 4, 8, 16, 32, 64, 128 and 256 seconds for attempts 1 to 8, then 300 seconds for attempts 9 and 10, where the 5 minute cap applies. The first three bars, the waits that can happen within one fetch cycle, are tiny compared with the cap.">
+        <rect class="bar" x="470" y="16" width="12" height="12" rx="2"/>
+        <text class="t-sm" x="488" y="27">waits within one fetch cycle</text>
+        <rect class="bar-alt" x="470" y="36" width="12" height="12" rx="2"/>
+        <text class="t-sm" x="488" y="47">ceilings if more attempts were allowed</text>
+        <text class="t-sm" x="10" y="27">ceiling, seconds</text>
+
+        <line class="axis" x1="70" y1="270" x2="740" y2="270"/>
+        <line class="axis" x1="70" y1="70" x2="70" y2="270"/>
+        <line class="axis" x1="66" y1="207.5" x2="70" y2="207.5"/>
+        <line class="axis" x1="66" y1="145" x2="70" y2="145"/>
+        <text class="t-mono" x="62" y="274" text-anchor="end">0</text>
+        <text class="t-mono" x="62" y="211" text-anchor="end">100</text>
+        <text class="t-mono" x="62" y="149" text-anchor="end">200</text>
+        <text class="t-mono" x="62" y="86" text-anchor="end">300</text>
+
+        <path class="wire-dash" d="M70 82.5 H740"/>
+        <text class="t-sm" x="78" y="76">cap = 300 s (5 min)</text>
+
+        <rect class="bar" x="80" y="268.75" width="42" height="1.25"/>
+        <rect class="bar" x="146" y="267.5" width="42" height="2.5"/>
+        <rect class="bar" x="212" y="265" width="42" height="5"/>
+        <rect class="bar-alt" x="278" y="260" width="42" height="10"/>
+        <rect class="bar-alt" x="344" y="250" width="42" height="20"/>
+        <rect class="bar-alt" x="410" y="230" width="42" height="40"/>
+        <rect class="bar-alt" x="476" y="190" width="42" height="80"/>
+        <rect class="bar-alt" x="542" y="110" width="42" height="160"/>
+        <rect class="bar-alt" x="608" y="82.5" width="42" height="187.5"/>
+        <rect class="bar-alt" x="674" y="82.5" width="42" height="187.5"/>
+
+        <text class="t-mono" x="101" y="262" text-anchor="middle">2</text>
+        <text class="t-mono" x="167" y="261" text-anchor="middle">4</text>
+        <text class="t-mono" x="233" y="259" text-anchor="middle">8</text>
+        <text class="t-mono" x="299" y="254" text-anchor="middle">16</text>
+        <text class="t-mono" x="365" y="244" text-anchor="middle">32</text>
+        <text class="t-mono" x="431" y="224" text-anchor="middle">64</text>
+        <text class="t-mono" x="497" y="184" text-anchor="middle">128</text>
+        <text class="t-mono" x="563" y="104" text-anchor="middle">256</text>
+        <text class="t-mono" x="629" y="76" text-anchor="middle">300</text>
+        <text class="t-mono" x="695" y="76" text-anchor="middle">300</text>
+
+        <text class="t-mono" x="101" y="288" text-anchor="middle">1</text>
+        <text class="t-mono" x="167" y="288" text-anchor="middle">2</text>
+        <text class="t-mono" x="233" y="288" text-anchor="middle">3</text>
+        <text class="t-mono" x="299" y="288" text-anchor="middle">4</text>
+        <text class="t-mono" x="365" y="288" text-anchor="middle">5</text>
+        <text class="t-mono" x="431" y="288" text-anchor="middle">6</text>
+        <text class="t-mono" x="497" y="288" text-anchor="middle">7</text>
+        <text class="t-mono" x="563" y="288" text-anchor="middle">8</text>
+        <text class="t-mono" x="629" y="288" text-anchor="middle">9</text>
+        <text class="t-mono" x="695" y="288" text-anchor="middle">10</text>
+        <text class="t-sm" x="405" y="314" text-anchor="middle">attempt that just failed (n, counted from 1)</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 5.3</b> Backoff ceilings drawn to scale. Without the cap, attempts 9 and 10 would allow 512 s and 1,024 s. Within one fetch cycle the waits stay at 8 s or less, so for fetches the attempt limit matters more than the cap.</figcaption>
+  </figure>
+
+  <p>A retry is a rescheduled job, never a <code>sleep()</code>. The worker sets <code>run_at = now() + backoff(attempts)</code> and puts the job back in <code>queued</code>. It doesn't touch <code>attempts</code>, because the claim already incremented it. The worker is free at once, and a crash between attempts loses nothing.</p>
+
+  <h3>Why every client needs a different wait</h3>
+  <p>Backoff alone still lets failed clients come back together. If 100 clients fail at the same moment and follow the same fixed schedule, they all retry in the same instant, and the server, just recovered, gets a spike that may knock it over again. This is a <b>thundering herd</b>.</p>
+  <p><b>Jitter</b> adds randomness to each client's wait. The plan uses <b>full jitter</b>, where the wait is drawn uniformly from zero up to the ceiling. The name was popularised by an AWS Architecture Blog article on backoff. Both charts below use the same scale.</p>
+
+  <div class="jit">
+    <div class="jit-head"><p>100 clients, all failed at 0 s, on their 4th attempt (backoff 16 s)</p><button class="btn" type="button" id="jit-again">Roll the dice again</button></div>
+    <div class="chart-wrap"><svg id="jit-none" viewBox="0 0 640 170" role="img" aria-label="Without jitter, all 100 retries land in the same second, at 16 seconds."></svg></div>
+    <p class="cap" id="jit-none-cap">No jitter: all 100 retries land in the same second.</p>
+    <div class="chart-wrap"><svg id="jit-full" viewBox="0 0 640 170" role="img" aria-label="With full jitter, the same 100 retries spread across 0 to 16 seconds."></svg></div>
+    <p class="cap" id="jit-full-cap">Full jitter: the same retries spread across 16 seconds.</p>
+  </div>
+  <p>The total is the same in both charts, but the peak drops from 100 requests in one second to about six a second. The average wait halves too, since a uniform draw from 0 to 16 s averages 8 s.</p>
+  <p>In your service the herd is your own jobs for many sources on one host, released together after an outage. The per-host limiter spaces those out, and jitter covers load it can't see, such as several hosts behind the same CDN.</p>
+
+  <h3>When the host says how long to wait</h3>
+  <p>A <code>429</code> or <code>503</code> may carry a <code>Retry-After</code> header (RFC 9110) that tells you how long to stay away. It comes in two forms, and the parser accepts both:</p>
+<pre><code>Retry-After: 120                              <span class="c"># delay-seconds: wait 120 s from now</span>
+Retry-After: Wed, 21 Oct 2026 07:28:00 GMT    <span class="c"># HTTP-date: wait until this moment</span></code></pre>
+  <p>An HTTP-date depends on two clocks agreeing, so a host with a wrong clock can send a date in the past. Every case reduces to one wait, in code like this:</p>
+<pre><code>from email.utils import parsedate_to_datetime
+
+DAY = 24 * 3600
+
+def retry_after_wait(header: str, now: datetime) -&gt; float | None:
+    <span class="c">"""Seconds to wait, or None to ignore the header and use normal backoff."""</span>
+    try:
+        secs = float(int(header))                                    <span class="c"># "120"</span>
+    except ValueError:
+        try:
+            secs = (parsedate_to_datetime(header) - now).total_seconds()
+        except (TypeError, ValueError):
+            return None                                              <span class="c"># "soon"</span>
+    if secs &lt; 0:
+        return None                          <span class="c"># negative, or a date in the past</span>
+    if secs &gt; DAY:
+        log.warning("retry_after_anomaly", value=header)
+    return <span class="hl">min(max(secs, 1), DAY)</span>             <span class="c"># clamp to [1 s, 24 h]</span>
+
+def retry_after_jitter(wait: float) -&gt; float:
+    return random.uniform(0, <span class="hl">min(60, max(1, 0.1 * wait))</span>)</code></pre>
+  <p>What the worker then does with a valid wait:</p>
+  <ul>
+    <li><b>Block the whole host, every time.</b> It sets <code>hosts.blocked_until = now() + wait</code>, however long the wait. The host asked the service to stay away, so every source on it waits. Anything over 24 hours is clamped and logged as <code>retry_after_anomaly</code>, so a misconfigured header can't block a host for a year.</li>
+    <li><b>Waits up to 6 hours.</b> The job is rescheduled for <code>blocked_until</code> plus jitter. This uses an attempt, because a request was made.</li>
+    <li><b>Waits over 6 hours.</b> This run gives up on the source, logs <code>rate_limited</code> and doesn't retry. Its <code>next_fetch_at</code> is set to at least <code>blocked_until</code>, so the next scheduled fetch can't come early.</li>
+  </ul>
+  <p>The jitter is added on top of the wait, so no client comes back early. It is up to 10% of the wait, at least 1 s and at most 60 s, which spreads out clients given the same second without stretching long waits much.</p>
+
+  <div class="note example"><span class="label">Worked example</span>
+    <p>A fetch of <code>www.reddit.com</code> gets a <code>429</code> at 07:20:00 UTC on Wednesday 21 October 2026. Here is what six possible headers would do.</p>
+    <ol>
+      <li><code>Retry-After: 120</code>. The wait is 120 s, so <code>blocked_until</code> is 07:22:00. Jitter is drawn from 0 to 12 s, so the job runs between 07:22:00 and 07:22:12.</li>
+      <li><code>Retry-After: Wed, 21 Oct 2026 07:28:00 GMT</code>. The wait is 480 s, <code>blocked_until</code> is 07:28:00, and jitter is 0 to 48 s.</li>
+      <li><code>Retry-After: 0</code>. Clamped up to 1 s, so the host is blocked until 07:20:01. Jitter is 0 to 1 s, the 1-second minimum.</li>
+      <li><code>Retry-After: 7200</code> (2 hours). <code>blocked_until</code> is 09:20:00. Ten per cent would be 720 s, so the 60 s maximum applies and the job runs between 09:20:00 and 09:21:00.</li>
+      <li><code>Retry-After: soon</code>, <code>-30</code>, or a date of 07:15:00. All are ignored. Nothing is blocked, and the job gets ordinary full-jitter backoff.</li>
+      <li><code>Retry-After: 86400</code> (24 hours). <code>blocked_until</code> is 07:20:00 the next day. The wait is over 6 hours, so this run gives up, <code>fetch_log</code> records <code>rate_limited</code> with <code>retry_after_s = 86400</code>, and <code>next_fetch_at</code> moves to at least 07:20:00 tomorrow.</li>
+    </ol>
+  </div>
+
+  <h3>Sharing one rate limit across every worker</h3>
+  <p>The limit is per host and lives in Postgres, one row per hostname in the <code>hosts</code> table. The default is one request every 2 seconds, and <code>www.reddit.com</code> is seeded with 10 seconds, because both Horizon subreddit feeds hit it in the same minute.</p>
+  <p>The host is the unit a site operator throttles, and the limit has to be shared because your workers run as several processes. An in-memory limiter only sees its own process, so three processes could each send to Reddit in the same second.</p>
+
+  <h4>The ticket machine</h4>
+  <p>Think of the ticket machine at a delicatessen counter, which hands out each number exactly once. The <code>hosts</code> row works the same way. <code>next_allowed_at</code> holds the next free slot, and taking a ticket reads it as your slot and moves it on one interval, in one atomic statement:</p>
+<pre><code>UPDATE hosts
+SET next_allowed_at = <span class="hl">GREATEST(now(), next_allowed_at, COALESCE(blocked_until, now()))</span>
+                      + make_interval(secs =&gt; min_interval_ms / 1000.0)
+WHERE host = $1
+RETURNING next_allowed_at - make_interval(secs =&gt; min_interval_ms / 1000.0) AS my_slot;</code></pre>
+  <ol class="steps">
+    <li><b>The lock.</b> <code>UPDATE … WHERE host = $1</code> takes a row lock. A second worker waits until the first commits, then works from the row as the first left it, so each slot is handed out once.</li>
+
+    <li><b>The earliest moment.</b> <code>GREATEST(…)</code> picks the latest of now, the next free slot, and the end of any <code>Retry-After</code> block. Postgres's <code>GREATEST</code> ignores <code>NULL</code>s, so the <code>COALESCE</code> mainly states intent.</li>
+    <li><b>The next customer.</b> Adding one interval stores the slot after yours. Dividing by <code>1000.0</code> keeps fractions of a second.</li>
+    <li><b>Your ticket.</b> In <code>RETURNING</code>, columns refer to the updated row, so subtracting one interval gives back the time <code>GREATEST</code> chose. One round trip books the slot and reports it.</li>
+  </ol>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 820 335" role="img" aria-label="Timeline of three workers taking slots for www.reddit.com, whose interval is 10 seconds. Worker A asks at 06:00:00 and gets slot 06:00:00, so it fetches immediately and the row moves to 06:00:10. Worker B asks at 06:00:00.4 and gets slot 06:00:10; its job is deferred without using an attempt, and the row moves to 06:00:20. Worker C asks at 06:00:01 and gets slot 06:00:20, and the row moves to 06:00:30. When each deferred job runs at its slot, it reuses the stored slot instead of taking a second ticket. While the jobs wait in the queue, the workers are free for other hosts.">
+        <text class="t-head" x="20" y="73">Worker A</text>
+        <text class="t-sm" x="140" y="52">takes slot 06:00:00: fetches now; row moves to 06:00:10</text>
+        <rect class="bar" x="140" y="60" width="30" height="18" rx="3"/>
+
+        <text class="t-head" x="20" y="143">Worker B</text>
+        <text class="t-sm" x="148" y="122">takes slot 06:00:10: deferred, no attempt used; row moves to 06:00:20</text>
+        <rect class="bx-ghost" x="148" y="130" width="192" height="18" rx="3"/>
+        <rect class="bar" x="340" y="130" width="30" height="18" rx="3"/>
+        <text class="t-sm" x="340" y="166">runs at 06:00:10 and reuses its stored slot</text>
+
+        <text class="t-head" x="20" y="223">Worker C</text>
+        <text class="t-sm" x="160" y="202">takes slot 06:00:20: deferred; row moves to 06:00:30</text>
+        <rect class="bx-ghost" x="160" y="210" width="380" height="18" rx="3"/>
+        <rect class="bar" x="540" y="210" width="30" height="18" rx="3"/>
+        <text class="t-sm" x="540" y="246">reuses slot 06:00:20</text>
+
+        <line class="axis" x1="140" y1="270" x2="780" y2="270"/>
+        <line class="axis" x1="140" y1="266" x2="140" y2="274"/>
+        <line class="axis" x1="340" y1="266" x2="340" y2="274"/>
+        <line class="axis" x1="540" y1="266" x2="540" y2="274"/>
+        <line class="axis" x1="740" y1="266" x2="740" y2="274"/>
+        <text class="t-mono" x="140" y="290" text-anchor="middle">06:00:00</text>
+        <text class="t-mono" x="340" y="290" text-anchor="middle">06:00:10</text>
+        <text class="t-mono" x="540" y="290" text-anchor="middle">06:00:20</text>
+        <text class="t-mono" x="740" y="290" text-anchor="middle">06:00:30</text>
+
+        <rect class="bar" x="140" y="306" width="22" height="12" rx="2"/>
+        <text class="t-sm" x="170" y="316">request to Reddit</text>
+        <rect class="bx-ghost" x="300" y="306" width="22" height="12" rx="2"/>
+        <text class="t-sm" x="330" y="316">job waiting in the queue; the worker is free for other hosts</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 5.4</b> Three workers take tickets for <code>www.reddit.com</code> (10 s interval) within one second. Each <code>UPDATE</code> sees the previous one's result, so when every job runs on time the requests reach Reddit exactly 10 seconds apart. Figure 5.5 shows what happens when they don't run on time.</figcaption>
+  </figure>
+
+  <h4>Waiting without holding a worker</h4>
+  <p>If <code>my_slot</code> has arrived, the worker fetches now. If it is in the future, the worker stores the slot in the job (<code>payload.host_slot = my_slot</code>), sets <code>run_at = my_slot</code>, and releases the job as a <b>deferral</b>, a release where no work was done.</p>
+  <div class="split">
+    <div class="no"><h4>Sleep until the slot</h4><p>Workers B and C sit idle for 10 s and 19 s while jobs for other hosts wait. With 20 Reddit jobs, the twentieth sleeps for over three minutes, and a crash mid-sleep strands the job until its lease expires.</p></div>
+    <div class="yes"><h4>Defer to the slot</h4><p>Worker B releases the job in a few milliseconds and claims a job for another host. The job waits in the queue at no cost, already stored with its new time, so a crash loses nothing.</p></div>
+  </div>
+  <p>A deferral doesn't count as an attempt. The claim added 1 to <code>attempts</code>, and the deferral takes it back and adds 1 to <code>deferrals</code> instead, so a busy host can't use up a job's four attempts before a single request is sent. More than 100 deferrals logs <code>job.deferral_storm</code> and raises an alert.</p>
+  <p>A blocked host works the same way. Before taking a ticket the worker checks <code>blocked_until</code>, and if the host is blocked the job is deferred to <code>blocked_until</code> plus jitter, again without using an attempt.</p>
+
+  <h4>Using the ticket you already hold</h4>
+  <p>In revision 2, when a deferred job runs again within 30 s after its <code>host_slot</code>, it uses that slot and skips the <code>UPDATE</code>. One request gets one ticket. Revision 3 records a flaw in this rule, and the flaw only makes sense once you know exactly how the rule works.</p>
+  <p>Without this rule the job could loop for ever. In Figure 5.4, B's first ticket moved <code>next_allowed_at</code> to 06:00:20. A second ticket at 06:00:10 would give B 06:00:20 or a slot after it, so it would be deferred again, and again. With the rule, B arrives at 06:00:10.2, is inside its 30-second window, and fetches.</p>
+<pre><code>slot = job.payload.get("host_slot")
+if slot is None or now &gt; slot + timedelta(seconds=30):   <span class="c"># no ticket, or it has gone</span>
+    slot = take_ticket(host)                              <span class="c"># the UPDATE … RETURNING</span>
+    if slot &gt; now:
+        return defer(job, run_at=slot, host_slot=slot)    <span class="c"># attempts −1, deferrals +1</span>
+<span class="hl">fetch(source)</span>                                             <span class="c"># inside our slot</span></code></pre>
+  <p>Two cases always take a new ticket. A job more than 30 s late (because of a worker backlog) has lost its slot. A retry after a failed request is a new request.</p>
+
+  <h4>Why the ticket rule is still open (Q16)</h4>
+  <p>The ticket rule can't guarantee the spacing it promises. A slot is reserved when the job is deferred, but the request is sent whenever a worker next picks the job up, and nothing stops two late jobs from sending together. A design review found two counterexamples.</p>
+  <ul>
+    <li><b>Late jobs bunch up.</b> With a 10 s interval, jobs A, B and C hold slots at 0, 10 and 20 s. A worker backlog delays all three until 25 s. Each is within 30 s of its own slot, so each reuses it, and three requests reach the host in the same second.</li>
+    <li><b>A shorter window still fails.</b> Cut the grace window to the interval, 10 s. Job A, with slot 0, is picked up at 9 s, and job B, with slot 10, at 10 s. Both are inside their windows, so their requests start 1 s apart.</li>
+  </ul>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 820 410" role="img" aria-label="Two timelines from 0 to 30 seconds for a host with a 10 second interval. In the first, with the 30 second grace window, jobs A, B and C hold slots at 0, 10 and 20 seconds, wait in the queue, and all start their requests together at 25 seconds. In the second, with the grace window cut to 10 seconds, job A holds slot 0 and starts at 9 seconds, and job B holds slot 10 and starts at 10 seconds, so the two requests start 1 second apart.">
+        <text class="t-head" x="20" y="32">Revision 2 rule: 30 s grace window</text>
+
+        <text class="t-sm" x="20" y="74">Job A, slot 0 s</text>
+        <rect class="bx-ghost" x="150" y="57" width="14" height="18" rx="3"/>
+        <path class="wire-dash" d="M164 66 H650"/>
+        <rect class="bar" x="650" y="57" width="14" height="18" rx="3"/>
+
+        <text class="t-sm" x="20" y="114">Job B, slot 10 s</text>
+        <rect class="bx-ghost" x="350" y="97" width="14" height="18" rx="3"/>
+        <path class="wire-dash" d="M364 106 H650"/>
+        <rect class="bar" x="650" y="97" width="14" height="18" rx="3"/>
+        <text class="t-sm" x="676" y="114">all start at 25 s</text>
+
+        <text class="t-sm" x="20" y="154">Job C, slot 20 s</text>
+        <rect class="bx-ghost" x="550" y="137" width="14" height="18" rx="3"/>
+        <path class="wire-dash" d="M564 146 H650"/>
+        <rect class="bar" x="650" y="137" width="14" height="18" rx="3"/>
+
+        <line class="axis" x1="150" y1="180" x2="750" y2="180"/>
+        <line class="axis" x1="150" y1="176" x2="150" y2="184"/>
+        <line class="axis" x1="350" y1="176" x2="350" y2="184"/>
+        <line class="axis" x1="550" y1="176" x2="550" y2="184"/>
+        <line class="axis" x1="650" y1="176" x2="650" y2="184"/>
+        <line class="axis" x1="750" y1="176" x2="750" y2="184"/>
+        <text class="t-mono" x="150" y="199" text-anchor="middle">0 s</text>
+        <text class="t-mono" x="350" y="199" text-anchor="middle">10 s</text>
+        <text class="t-mono" x="550" y="199" text-anchor="middle">20 s</text>
+        <text class="t-mono" x="650" y="199" text-anchor="middle">25 s</text>
+        <text class="t-mono" x="750" y="199" text-anchor="middle">30 s</text>
+
+        <text class="t-head" x="20" y="242">Grace window cut to the interval: 10 s</text>
+
+        <text class="t-sm" x="20" y="276">Job A, slot 0 s</text>
+        <rect class="bx-ghost" x="150" y="259" width="14" height="18" rx="3"/>
+        <path class="wire-dash" d="M164 268 H330"/>
+        <rect class="bar" x="330" y="259" width="14" height="18" rx="3"/>
+
+        <text class="t-sm" x="384" y="298">A starts at 9 s and B at 10 s, only 1 s apart</text>
+
+        <text class="t-sm" x="20" y="320">Job B, slot 10 s</text>
+        <rect class="bx-ghost" x="350" y="303" width="14" height="18" rx="3"/>
+        <rect class="bar" x="350" y="303" width="14" height="18" rx="3"/>
+
+        <line class="axis" x1="150" y1="344" x2="750" y2="344"/>
+        <line class="axis" x1="150" y1="340" x2="150" y2="348"/>
+        <line class="axis" x1="350" y1="340" x2="350" y2="348"/>
+        <line class="axis" x1="550" y1="340" x2="550" y2="348"/>
+        <line class="axis" x1="750" y1="340" x2="750" y2="348"/>
+        <text class="t-mono" x="150" y="363" text-anchor="middle">0 s</text>
+        <text class="t-mono" x="350" y="363" text-anchor="middle">10 s</text>
+        <text class="t-mono" x="550" y="363" text-anchor="middle">20 s</text>
+        <text class="t-mono" x="750" y="363" text-anchor="middle">30 s</text>
+
+        <rect class="bx-ghost" x="150" y="382" width="14" height="12" rx="2"/>
+        <text class="t-sm" x="172" y="392">slot reserved at deferral</text>
+        <path class="wire-dash" d="M340 388 H370"/>
+        <text class="t-sm" x="378" y="392">job waiting in the queue</text>
+        <rect class="bar" x="540" y="382" width="14" height="12" rx="2"/>
+        <text class="t-sm" x="562" y="392">request starts</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 5.5</b> The two counterexamples to the ticket rule, for a host with a 10 s interval. The slots themselves are correctly 10 s apart in both cases. The requests start whenever the queue releases each job, and those times can be much closer together.</figcaption>
+  </figure>
+
+  <p>A shorter window reduces the bunching but can't remove it. The slot records only when a job was allowed to send, and the moment the request actually starts is decided by the queue.</p>
+
+  <h4>The candidate fix: claim the host just before sending</h4>
+  <p>The plan's candidate fix moves the claim from deferral time to dispatch time. Immediately before sending, the worker runs one conditional <code>UPDATE</code>:</p>
+<pre><code>UPDATE hosts
+SET next_allowed_at = now() + make_interval(secs =&gt; min_interval_ms / 1000.0)
+WHERE host = $1
+  <span class="hl">AND next_allowed_at &lt;= now()</span>
+  <span class="hl">AND (blocked_until IS NULL OR blocked_until &lt;= now())</span>
+RETURNING 1;</code></pre>
+  <ul>
+    <li><b>A row comes back.</b> The host was free, and this worker has just moved <code>next_allowed_at</code> one interval ahead. It sends the request at once.</li>
+    <li><b>No row comes back.</b> The host is busy or blocked. The job defers to <code>next_allowed_at</code> plus a little jitter (or to <code>blocked_until</code>, if the host is blocked), reserves nothing, and runs the same <code>UPDATE</code> when it comes back.</li>
+  </ul>
+  <p>A claim can only succeed once the previous claim's interval has passed, so successful claims are at least one interval apart. In the first counterexample, A, B and C all try at 25 s. The row lock lets one of them win, the other two defer to just after 35 s, and the jitter decides which of those goes next. The job holds no ticket while it waits, so <code>payload.host_slot</code> and the 30-second window both disappear.</p>
+  <p>The trade-off is arrival order. Whichever job comes back first after <code>next_allowed_at</code> wins, so one job could in principle keep losing the race. At a few requests a minute per host that's unlikely, and its <code>deferrals</code> count makes it visible, with the alert at 100 deferrals.</p>
+  <p>This is still a candidate. The plan keeps Q16 open until an integration test passes that delays workers at chosen points and asserts on the recorded request start times in <code>fetch_log.started_at</code>, requiring starts for one host to be at least one interval apart. The test checks start times rather than slot values, because the revision 2 slots were always correctly spaced and the requests still weren't. The limiter is needed by checkpoint 1.2, which makes runs repeatable and recoverable. Checkpoint 1.1 fetches one feed and needs no limiter, so the open question doesn't hold it up.</p>
+
+  <div class="note pitfall"><span class="label">Common mistake</span><p>Taking the slot in the same transaction as the fetch. The row lock lasts until the transaction ends, so every other worker asking for that host would wait for the whole download. Take the slot in its own short transaction, commit, then send the request.</p></div>
+
+  <p>The cost is one database round trip per fetch, about a millisecond, which saves running Redis for a shared limiter (ADR-001, Postgres first).</p>
+
+  <h4>One 429 pauses the whole host</h4>
+  <p>Because <code>GREATEST</code> includes <code>blocked_until</code>, every new slot for that host starts after the block, whichever source asks. Reddit limits your client as a whole, so a <code>429</code> on one subreddit feed means a request for another would probably get one too. A block in the past has no effect, because <code>now()</code> is then larger, so it needs no clean-up. The candidate dispatch-time claim gets the same effect from its <code>blocked_until</code> condition, since no claim can succeed while the block lasts.</p>
+
+  <h3>Fetching quiet feeds less often</h3>
+  <p>Each source starts at its <code>base_interval</code> of 30 minutes, but many feeds publish once a day. The plan counts unchanged fetches in <code>sources.unchanged_count</code> and stretches the interval when the count reaches 5.</p>
+  <ul>
+    <li><b>Unchanged.</b> A <code>304</code>, a soft 304 (an identical body), or a <code>200</code> with no new or changed articles. It adds 1 to <code>unchanged_count</code>.</li>
+    <li><b>Changed.</b> Any new or changed article resets <code>unchanged_count</code> to 0 and <code>fetch_interval</code> to <code>base_interval</code>.</li>
+    <li><b>Five in a row.</b> When <code>unchanged_count</code> reaches 5, <code>fetch_interval</code> doubles, capped at 6 hours, and the count goes back to 0. The next doubling needs another 5 unchanged fetches at the new, longer interval.</li>
+    <li><b>Failed.</b> A failed fetch touches neither the counter nor the interval. Failures have their own path through retries and <code>consecutive_failures</code>.</li>
+  </ul>
+  <figure>
+    <div class="tbl"><table>
+      <thead><tr><th>Interval</th><th>Unchanged fetches at this interval</th><th>Time spent here</th></tr></thead>
+      <tbody>
+        <tr><td>30 min (base)</td><td>5</td><td>2.5 hours</td></tr>
+        <tr><td>1 hour</td><td>5</td><td>5 hours</td></tr>
+        <tr><td>2 hours</td><td>5</td><td>10 hours</td></tr>
+        <tr><td>4 hours</td><td>5</td><td>20 hours</td></tr>
+        <tr><td>6 hours (cap)</td><td>any number</td><td>until something changes</td></tr>
+      </tbody>
+    </table></div>
+    <figcaption><b>Figure 5.6</b> The adaptive interval for a feed that never changes. After about a day and a half it settles at four fetches a day instead of 48. The first new article brings it straight back to every 30 minutes.</figcaption>
+  </figure>
+
+  <h3>Not downloading what hasn't changed</h3>
+  <p>A <b>conditional request</b> asks for the feed only if it has changed since your copy. Most fetches find nothing new, so this saves the host's bandwidth and your parsing time. It works with <b>validators</b>, values the server sends to identify a version.</p>
+  <ul>
+    <li><b><code>ETag</code>.</b> An opaque quoted string the server chooses, often a hash or version number. A weak ETag, prefixed <code>W/</code>, promises equivalent content without byte-for-byte identity.</li>
+    <li><b><code>Last-Modified</code>.</b> The date the resource last changed, to the second.</li>
+  </ul>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 800 420" role="img" aria-label="Sequence diagram between the fetch worker and the feed host. First, the worker sends GET /feed.xml with no validators. The host replies 200 OK with ETag v42, Last-Modified Sat, 07 Nov 2026 21:00:00 GMT, and the full body. The worker stores the ETag, Last-Modified and a SHA-256 of the body. After thirty minutes the worker sends GET /feed.xml with If-None-Match v42 and If-Modified-Since with the stored date. The host replies 304 Not Modified with no body. The worker has nothing to parse or score and keeps its stored validators.">
+        <defs>
+          <marker id="ingestion-a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+          <marker id="ingestion-a2acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="110" y="20" width="140" height="40" rx="8"/>
+        <text class="t-head" x="180" y="45" text-anchor="middle">Fetch worker</text>
+        <rect class="bx" x="550" y="20" width="140" height="40" rx="8"/>
+        <text class="t-head" x="620" y="45" text-anchor="middle">Feed host</text>
+        <path class="wire-dash" d="M180 60 V405"/>
+        <path class="wire-dash" d="M620 60 V405"/>
+
+        <text class="t-mono" x="400" y="92" text-anchor="middle">GET /feed.xml (no validators yet)</text>
+        <path class="wire" d="M180 100 H618" marker-end="url(#ingestion-a2)"/>
+
+        <text x="400" y="128" text-anchor="middle">200 OK, full body</text>
+        <text class="t-mono" x="400" y="146" text-anchor="middle">ETag: "v42"</text>
+        <text class="t-mono" x="400" y="162" text-anchor="middle">Last-Modified: Sat, 07 Nov 2026 21:00:00 GMT</text>
+        <path class="wire" d="M620 172 H182" marker-end="url(#ingestion-a2)"/>
+
+        <rect class="bx-pg" x="15" y="186" width="155" height="60" rx="6"/>
+        <text class="t-sm" x="92" y="206" text-anchor="middle">stores etag,</text>
+        <text class="t-sm" x="92" y="222" text-anchor="middle">last_modified and</text>
+        <text class="t-sm" x="92" y="238" text-anchor="middle">last_body_sha256</text>
+
+        <text class="t-sm" x="400" y="218" text-anchor="middle">after 30 minutes</text>
+
+        <text class="t-mono" x="400" y="252" text-anchor="middle">GET /feed.xml</text>
+        <text class="t-mono" x="400" y="268" text-anchor="middle">If-None-Match: "v42"</text>
+        <text class="t-mono" x="400" y="284" text-anchor="middle">If-Modified-Since: Sat, 07 Nov 2026 21:00:00 GMT</text>
+        <path class="wire-acc" d="M180 294 H618" marker-end="url(#ingestion-a2acc)"/>
+
+        <text x="400" y="334" text-anchor="middle">304 Not Modified, no body</text>
+        <path class="wire-acc" d="M620 344 H182" marker-end="url(#ingestion-a2acc)"/>
+
+        <rect class="bx-ok" x="15" y="356" width="155" height="44" rx="6"/>
+        <text class="t-sm" x="92" y="374" text-anchor="middle">nothing to parse;</text>
+        <text class="t-sm" x="92" y="390" text-anchor="middle">validators kept</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 5.7</b> A conditional request. The first fetch stores the validators from a <code>200</code>. The next fetch sends them back, and an unchanged feed costs one response with headers and no body.</figcaption>
+  </figure>
+
+  <p>The rules the plan sets:</p>
+  <ul>
+    <li><b>Store exactly what was sent.</b> The <code>ETag</code> is kept with its <code>W/</code> prefix and quotes, and sent back as <code>If-None-Match</code>. <code>Last-Modified</code> goes back as <code>If-Modified-Since</code>.</li>
+    <li><b>Send both.</b> RFC 9110 says a server that gets both must ignore the date, but sending both helps with servers that only support dates.</li>
+    <li><b>Update validators only from a <code>200</code>.</b> They describe the version you have processed, and a body-less <code>304</code> could hand you a validator for content you never saw.</li>
+    <li><b>Distrust an impossible <code>304</code>.</b> A <code>304</code> when you sent no validators means a broken server. The plan treats it as a <code>200</code> with an empty body and logs a warning.</li>
+  </ul>
+
+  <h4>The soft 304</h4>
+  <p>Many feeds ignore validators, or generate a new <code>ETag</code> on every response, so every fetch returns <code>200</code> and the full body. The plan keeps <code>last_body_sha256</code>, and if a new body hashes to the same value it skips parsing and logs <code>unchanged_body</code>.</p>
+  <p>This <b>soft 304</b> saves CPU and LLM work but no bandwidth, so the case study reports it separately from real <code>304</code>s. One number measures the load you put on hosts, the other the work you avoid.</p>
+
+  <h3>Limits on the HTTP client</h3>
+  <p>Every request goes through one configured <code>httpx</code> client, whose limits protect your workers from slow, broken or hostile hosts.</p>
+  <ul>
+    <li><b>Timeouts.</b> 5 s to connect, 20 s to read. The read timeout applies to each wait for the next chunk, so a slow but steady host is bounded by the size cap instead.</li>
+    <li><b>Redirects.</b> At most 5, and the SSRF guard checks every hop.</li>
+    <li><b>Response size.</b> 5 MB, counted while streaming, because <code>Content-Length</code> can be missing or wrong. Counting decoded bytes (<code>iter_bytes()</code>) also catches a small compressed response that expands enormously.</li>
+
+    <li><b>User-Agent.</b> <code>briefing-engine/&lt;version&gt; (+https://github.com/simonoconnordev/briefing-engine)</code> names the software and gives operators a URL, with no personal email address to attract spam. A library's default User-Agent looks like an anonymous scraper and is more likely to be blocked.</li>
+  </ul>
+
+  <h3>How this fixes the Horizon Reddit problem</h3>
+  <p>In Horizon, two subreddit feeds on <code>www.reddit.com</code> were fetched in the same minute, the burst got a <code>429</code>, and nothing slowed down in response. Figure 5.8 maps each part of that failure to a measure in the plan.</p>
+  <figure>
+    <div class="tbl"><table>
+      <thead><tr><th>What went wrong in Horizon</th><th>What the plan does</th></tr></thead>
+      <tbody>
+        <tr><td>Two feeds on one host were fetched together</td><td>The per-host limiter gives <code>www.reddit.com</code> a 10 s interval shared by every worker, meant to keep the two requests at least 10 s apart. The mechanism that guarantees it is still open (Q16)</td></tr>
+        <tr><td>The <code>429</code> was not acted on</td><td>It is classified as rate limited, <code>Retry-After</code> is honoured, and <code>blocked_until</code> pauses every Reddit source</td></tr>
+        <tr><td>Retries could arrive together</td><td>Full jitter on backoff, and jitter added on top of <code>Retry-After</code></td></tr>
+        <tr><td>A wait could hold up the run</td><td>Waits are deferred or rescheduled jobs, so fetches for other hosts carry on</td></tr>
+        <tr><td>Unchanged feeds were downloaded and processed in full</td><td>Conditional requests, the soft 304 and the adaptive interval</td></tr>
+        <tr><td>Reddit's HTML and JSON routes return <code>403</code></td><td>RSS is the only supported Reddit route</td></tr>
+      </tbody>
+    </table></div>
+    <figcaption><b>Figure 5.8</b> The Reddit 429 problem from Horizon, mapped onto plan §6.2 to §6.4. Any one of these measures would have reduced the problem, and together they make a repeat very unlikely.</figcaption>
+  </figure>
+
+  <div class="try">
+    <span class="label">Try it</span>
+    <ol>
+      <li>Pick a feed URL from your Horizon config and look at its validators:
+<pre><code>curl -sI https://example.com/feed.xml | grep -i -E "etag|last-modified"</code></pre></li>
+      <li>If you get an <code>ETag</code>, send it back exactly as shown, quotes included:
+<pre><code>curl -s -o /dev/null -w "%{http_code}\n" -H 'If-None-Match: "the-etag-value"' https://example.com/feed.xml</code></pre></li>
+      <li>In <code>psql</code>, build a small <code>hosts</code> table and take three tickets in quick succession by running the <code>UPDATE … RETURNING</code> above three times:
+<pre><code>CREATE TABLE hosts (host text PRIMARY KEY, min_interval_ms int NOT NULL,
+                    next_allowed_at timestamptz NOT NULL, blocked_until timestamptz);
+INSERT INTO hosts VALUES ('www.reddit.com', 10000, now(), NULL);</code></pre></li>
+      <li>Run <code>UPDATE hosts SET blocked_until = now() + interval '2 minutes';</code> and take one more ticket.</li>
+      <li>Open two <code>psql</code> sessions. In the first, run <code>BEGIN</code> and the ticket <code>UPDATE</code> without committing. Run the same <code>UPDATE</code> in the second.</li>
+      <li>Try the candidate dispatch-time claim. Reset the row with <code>UPDATE hosts SET next_allowed_at = now(), blocked_until = NULL;</code>, run the conditional <code>UPDATE … RETURNING 1</code> twice within 10 seconds, then once more after 10 seconds.</li>
+    </ol>
+    <p>What you should see, and why:</p>
+    <ul>
+      <li><b>Steps 1 and 2.</b> A <code>304</code> means the host supports conditional requests. If you get <code>200</code> every time, run step 1 twice and compare the ETags. A value that changes on every request, or no validators at all, means that feed will rely on the soft 304. Record which feeds are which, because that list belongs in your case study.</li>
+      <li><b>Step 3.</b> The three <code>my_slot</code> values are exactly 10 seconds apart, and the first is the current time. The slots are always spaced correctly. The flaw in Figure 5.5 appears only when the requests are sent.</li>
+      <li><b>Step 4.</b> The new slot is at or after the block's end, because <code>GREATEST</code> includes <code>blocked_until</code>.</li>
+      <li><b>Step 5.</b> The second session waits until you commit the first. That is the row lock, and it is why the ticket transaction must stay short.</li>
+      <li><b>Step 6.</b> The first claim returns one row and the second returns none (<code>UPDATE 0</code>), because the host is busy. After 10 seconds a claim succeeds again. No slot is handed out, so a job that gets no row has nothing to hold while it waits.</li>
+    </ul>
+  </div>
+
+  <div class="ask">
+    <span class="label">If an interviewer asks</span>
+    <p class="q">"How do you avoid getting blocked by sites you fetch from?"</p>
+    <p>"I only read published feeds, with an identifying User-Agent. A per-host rate limit in Postgres is shared by every worker. A job that finds the host busy is deferred instead of sleeping. My first design reserved a slot when the job was deferred, and a review showed that late jobs could then send together, so the current candidate claims the host with one conditional <code>UPDATE</code> just before sending, and it isn't settled until a test on recorded request start times passes. Conditional requests and a body-hash check make unchanged feeds almost free. Retryable errors get exponential backoff with full jitter, and <code>Retry-After</code> blocks the whole host. I built it after Reddit sent 429s to the tool I was using, because two of my feeds hit the same host in the same minute."</p>
+    <p class="q">"Why not just sleep in the worker until the rate limit allows the request?"</p>
+    <p>"A sleeping worker holds a task slot other hosts' jobs could use, and with many jobs for one host the sleeps add up to minutes. Deferring the job to its slot takes milliseconds and a crash loses nothing. The deferral doesn't use an attempt. In the candidate design the job reserves nothing while it waits, and simply tries the claim again when it comes back."</p>
+
+    <p class="q">"How would you prove the rate limiter works?"</p>
+    <p>"I'd test what the host actually sees. An integration test delays workers at chosen points and checks that the recorded request start times for one host are at least one interval apart. Checking the slot values isn't enough, because my first design handed out perfectly spaced slots and could still send three requests in the same second."</p>
+
+    <p class="q">"What if a host sends <code>Retry-After: 86400</code>?"</p>
+    <p>"The whole host is blocked for 24 hours, which is also the clamp, so a broken header can't block it for longer. Over 6 hours, this run gives up on the source, logs <code>rate_limited</code>, and its next scheduled fetch moves to after the block. Shorter waits reschedule the job for the end of the block plus up to 60 seconds of jitter."</p>
+  </div>
+  <label class="got"><input type="checkbox" id="got-ingestion" data-ch="ingestion"> I can explain this</label>
+</section>

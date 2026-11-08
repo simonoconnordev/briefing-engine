@@ -1,0 +1,468 @@
+<!-- ============================================================ -->
+<section class="ch" id="dedup">
+  <div class="ch-head"><span class="ch-num">Chapter 06</span><span class="plan-ref">plan §6.5, §7.6</span><h2>Deduplication</h2></div>
+
+  <p>The same article reaches the system many times: through several feeds, with tracking parameters, and as copies on other sites. Every duplicate that reaches the scorer is a paid LLM call, and a 12-item briefing that shows one story twice has wasted a twelfth of its space, which is why Horizon had a <code>topic_dedup</code> step. Re-fetching a feed must also update the rows it already has, never add new ones.</p>
+  <p>The plan's rule for this is deliberately strict. Two entries are the same article if their normalised URLs match, and one is a copy of the other if their normalised feed text matches. Anything looser is left to the write-up model, which groups articles about the same story when it writes the briefing.</p>
+
+  <h3>Why one article arrives under many URLs</h3>
+  <p>Many different strings can point at the same page, and feeds produce most of the variations you can think of:</p>
+  <ul>
+    <li><b>Tracking parameters.</b> Publishers add <code>utm_source</code>, <code>utm_medium</code> and similar parameters so their analytics can tell which channel a visit came from. The RSS feed, the newsletter and a social post each link to the same page with different parameters.</li>
+    <li><b>Spellings that mean nothing.</b> The scheme and host are case-insensitive (RFC 3986), so <code>HTTPS://Blog.Example.com</code> and <code>https://blog.example.com</code> are the same address. An explicit default port (<code>:443</code> for HTTPS) changes nothing. A fragment such as <code>#comments</code> is never sent to the server at all.</li>
+    <li><b>Aggregators.</b> A Hacker News item points at an article that may also arrive through the publisher's own feed.</li>
+    <li><b>Syndication and reissue.</b> A press release is published on five sites, each under its own URL, and some feeds republish an existing item under a new GUID.</li>
+  </ul>
+  <p>The first three produce different strings for one address, and URL normalisation handles them. The last produces genuinely different addresses for the same text, and only a content hash can recognise it.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 860 236" role="img" aria-label="Five URL variants for the same post, differing by tracking parameters, letter case, an explicit port 443 with a comments fragment, an fbclid parameter and a ref parameter, all flow into a normalise step and come out as one canonical URL, https://blog.example.com/post/, with one url_hash and one row.">
+        <defs>
+          <marker id="dedup-a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="20" y="24" width="400" height="28" rx="6"/><text class="t-mono" x="32" y="42">https://blog.example.com/post/?utm_source=rss</text>
+        <rect class="bx" x="20" y="64" width="400" height="28" rx="6"/><text class="t-mono" x="32" y="82">HTTPS://Blog.Example.com/post/</text>
+        <rect class="bx" x="20" y="104" width="400" height="28" rx="6"/><text class="t-mono" x="32" y="122">https://blog.example.com:443/post/#comments</text>
+        <rect class="bx" x="20" y="144" width="400" height="28" rx="6"/><text class="t-mono" x="32" y="162">https://blog.example.com/post/?fbclid=IwAR0x</text>
+        <rect class="bx" x="20" y="184" width="400" height="28" rx="6"/><text class="t-mono" x="32" y="202">https://blog.example.com/post/?ref=newsletter</text>
+        <path class="wire" d="M420 38 L478 106" marker-end="url(#dedup-a1)"/>
+        <path class="wire" d="M420 78 L478 113" marker-end="url(#dedup-a1)"/>
+        <path class="wire" d="M420 118 L478 118" marker-end="url(#dedup-a1)"/>
+        <path class="wire" d="M420 158 L478 124" marker-end="url(#dedup-a1)"/>
+        <path class="wire" d="M420 198 L478 131" marker-end="url(#dedup-a1)"/>
+        <rect class="bx-pg" x="480" y="93" width="120" height="50" rx="7"/><text class="t-head" x="540" y="123" text-anchor="middle">normalise</text>
+        <path class="wire" d="M600 118 L620 118" marker-end="url(#dedup-a1)"/>
+        <rect class="bx-ok" x="622" y="93" width="228" height="50" rx="7"/>
+        <text class="t-mono" x="736" y="114" text-anchor="middle">https://blog.example.com/post/</text>
+        <text class="t-sm" x="736" y="132" text-anchor="middle">one url_hash, one row</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 6.1</b> Five links a reader would recognise as the same page. Normalisation maps them all to one canonical string, so the unique index on its hash sees one article.</figcaption>
+  </figure>
+
+  <h3>Normalising URLs</h3>
+  <p>Normalising a URL maps every spelling of one address to a single canonical string. The plan makes it a <b>pure function</b> (no network, clock or database), so it is fast, easy to test and gives the same answer wherever it runs.</p>
+  <p>It runs when a user subscribes, giving <code>sources.url_normalised</code>, and when the fetcher reads an entry, giving <code>url_hash = sha256(normalised_url)</code>. The unique index is on the hash, which is always 32 bytes. A long URL could exceed the B-tree limit of about a third of an 8 kB page.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 860 450" role="img" aria-label="A URL passing through the normalisation steps. Input: uppercase scheme and host, port 80, dot segments, utm_source, b, a and ref parameters and a comments fragment. Step 1 lowercases and drops the port and fragment. Step 2 upgrades to https because the host is on the allowlist. Step 3 removes utm_source and ref. Step 4 sorts the remaining parameters to a=1 and b=2. Step 5 resolves the dot segments to /a/post/ and keeps the trailing slash. Finally url_hash is the SHA-256 of the result, beginning aa55e3979cd4fdec.">
+        <defs>
+          <marker id="dedup-a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="20" y="20" width="220" height="44" rx="7"/><text class="t-head" x="32" y="39">Input</text><text class="t-sm" x="32" y="55">raw feed URL</text>
+        <text class="t-mono" x="260" y="39">HTTP://Blog.Example.COM:80/a/./b/../post/?utm_source=rss&amp;b=2&amp;a=1&amp;ref=hn#comments</text>
+        <text class="t-sm" x="260" y="55">as it arrived in a feed entry</text>
+        <path class="wire" d="M130 64 L130 80" marker-end="url(#dedup-a2)"/>
+
+        <rect class="bx" x="20" y="82" width="220" height="44" rx="7"/><text class="t-head" x="32" y="101">1. Parse and clean</text><text class="t-sm" x="32" y="117">case, IDNA, port, fragment</text>
+        <text class="t-mono" x="260" y="101">http://blog.example.com/a/./b/../post/?utm_source=rss&amp;b=2&amp;a=1&amp;ref=hn</text>
+        <text class="t-sm" x="260" y="117">scheme and host lowercased; :80 and #comments dropped</text>
+        <path class="wire" d="M130 126 L130 142" marker-end="url(#dedup-a2)"/>
+
+        <rect class="bx" x="20" y="144" width="220" height="44" rx="7"/><text class="t-head" x="32" y="163">2. HTTPS upgrade</text><text class="t-sm" x="32" y="179">allowlisted hosts only</text>
+        <text class="t-mono" x="260" y="163">https://blog.example.com/a/./b/../post/?utm_source=rss&amp;b=2&amp;a=1&amp;ref=hn</text>
+        <text class="t-sm" x="260" y="179">blog.example.com is assumed to be on the allowlist</text>
+        <path class="wire" d="M130 188 L130 204" marker-end="url(#dedup-a2)"/>
+
+        <rect class="bx" x="20" y="206" width="220" height="44" rx="7"/><text class="t-head" x="32" y="225">3. Tracking parameters</text><text class="t-sm" x="32" y="241">list kept in config</text>
+        <text class="t-mono" x="260" y="225">https://blog.example.com/a/./b/../post/?b=2&amp;a=1</text>
+        <text class="t-sm" x="260" y="241">utm_source and ref removed</text>
+        <path class="wire" d="M130 250 L130 266" marker-end="url(#dedup-a2)"/>
+
+        <rect class="bx" x="20" y="268" width="220" height="44" rx="7"/><text class="t-head" x="32" y="287">4. Sort parameters</text><text class="t-sm" x="32" y="303">empty values kept</text>
+        <text class="t-mono" x="260" y="287">https://blog.example.com/a/./b/../post/?a=1&amp;b=2</text>
+        <text class="t-sm" x="260" y="303">remaining parameters sorted by name</text>
+        <path class="wire" d="M130 312 L130 328" marker-end="url(#dedup-a2)"/>
+
+        <rect class="bx" x="20" y="330" width="220" height="44" rx="7"/><text class="t-head" x="32" y="349">5. Dot-segments</text><text class="t-sm" x="32" y="365">trailing slash kept</text>
+        <text class="t-mono" x="260" y="349">https://blog.example.com/a/post/?a=1&amp;b=2</text>
+        <text class="t-sm" x="260" y="365">./ and b/../ resolved; the final slash stays</text>
+        <path class="wire" d="M130 374 L130 390" marker-end="url(#dedup-a2)"/>
+
+        <rect class="bx-pg" x="20" y="392" width="220" height="44" rx="7"/><text class="t-head" x="32" y="411">url_hash</text><text class="t-sm" x="32" y="427">sha256(normalised URL)</text>
+        <text class="t-mono" x="260" y="411">aa55e3979cd4fdec…</text>
+        <text class="t-sm" x="260" y="427">SHA-256 of the final string, first 8 bytes shown</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 6.2</b> An untidy URL through the plan's steps, showing the string after each one. Step 6 (Hacker News items) doesn't apply to this URL. The hash prefix is the real SHA-256 of the final string.</figcaption>
+  </figure>
+
+  <p>Three steps need care when you build them:</p>
+  <ul>
+    <li><b>Step 1 needs a real parser.</b> Use <code>urllib.parse.urlsplit</code>, not a regular expression. IDNA conversion makes <code>bücher.example</code> and <code>xn--bcher-kva.example</code> hash the same. Python's built-in <code>idna</code> codec follows IDNA 2003 and the <code>idna</code> package IDNA 2008, so pick one and use it everywhere.</li>
+    <li><b>Step 5 is a published algorithm.</b> It is the dot-segment removal from RFC 3986 §5.2.4.</li>
+    <li><b>Step 6 treats Hacker News specially.</b> The article is the page an HN item links to, and the discussion URL is stored as <code>hn_comments_url</code>. An Ask HN post has no target, so its item URL is the article.</li>
+  </ul>
+
+  <h3>What normalisation leaves alone on purpose</h3>
+  <p>The plan stops adding rules early, because the two possible mistakes cost very different amounts.</p>
+  <ul>
+    <li><b>A missed duplicate is cheap.</b> Two URLs for one article give two rows. If the text matches, the content hash still catches it, the copy points at the original, and the copy is never scored. The cost is one extra row.</li>
+    <li><b>A false merge loses data.</b> If two different articles get one <code>url_hash</code>, the upsert overwrites <code>title</code> and the hashes on every fetch, so the two articles take turns in one row. The row is re-scored each time its content flips, one of the articles never appears in any briefing, and nothing raises an error.</li>
+  </ul>
+
+  <div class="note principle"><span class="label">Key principle</span><p>When a normalisation rule might merge two different things, leave it out. A missed duplicate costs a little storage and is usually caught by the next layer. A false merge loses data silently and can't be detected afterwards.</p></div>
+
+  <div class="tbl"><table>
+    <thead><tr><th>Left as it is</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>http</code> on hosts outside the allowlist</td><td>A site may serve different content over HTTPS, or nothing at all. In the plan's words, upgrading blindly can merge different resources.</td></tr>
+      <tr><td>A trailing slash, except on the root path</td><td><code>/post</code> and <code>/post/</code> can be different resources. <code>https://example.com</code> and <code>https://example.com/</code> are equivalent by definition, so the root case is safe.</td></tr>
+      <tr><td>The case of the path</td><td>RFC 3986 makes the path case-sensitive, so <code>/Post</code> and <code>/post</code> can be different pages.</td></tr>
+      <tr><td>A <code>www.</code> prefix</td><td><code>www.example.com</code> and <code>example.com</code> are different hosts, usually the same site but not always.</td></tr>
+      <tr><td>Parameters not on the tracking list, including empty values</td><td><code>?id=7</code> or <code>?page=2</code> select content. Sorting them is safe in practice; removing or rewriting them is not.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Sorting is itself a small assumption, since a server may treat parameter order as meaningful. Almost none do, and the plan accepts that risk. The tracking list (<code>utm_*</code>, <code>fbclid</code>, <code>gclid</code>, <code>mc_cid</code>, <code>mc_eid</code>, <code>ref</code>, <code>ref_src</code>, <code>igshid</code>, <code>si</code>, and Substack's <code>r</code> and <code>s</code>) lives in config, so a parameter that turns out to matter on some site can be handled without a code change.</p>
+
+  <h3>Testing the normaliser with properties</h3>
+  <p>The plan tests normalisation two ways. <b>Table tests</b> list inputs with expected outputs, which documents each rule. <b>Property-based tests</b>, written with <code>hypothesis</code>, check a statement for many generated inputs. You describe how to build inputs (a <b>strategy</b>), and when one fails, <code>hypothesis</code> shrinks it to the smallest failing example and saves it for the next run.</p>
+  <p>The property the plan names is <b>idempotence</b>: <code>normalise(normalise(x)) == normalise(x)</code>. Stored URLs are compared with freshly normalised ones, so if a second pass changed the string, one article could end up with two hashes.</p>
+<pre><code>from urllib.parse import urlencode
+from hypothesis import given, strategies as st
+
+from briefing_engine.ingest.urls import normalise   <span class="c"># module name illustrative</span>
+
+hosts = st.lists(st.from_regex(r"[A-Za-z0-9]{1,8}", fullmatch=True),
+                 min_size=2, max_size=3).map(".".join)
+segments = st.lists(st.sampled_from(["a", "B", ".", "..", "post", ""]), max_size=5)
+params = st.lists(st.tuples(st.sampled_from(["id", "page", "utm_source", "ref", "fbclid"]),
+                            st.sampled_from(["", "1", "x y", "%41"])), max_size=4)
+
+@st.composite
+def urls(draw):
+    scheme = draw(st.sampled_from(["http", "https", "HTTPS"]))
+    port = draw(st.sampled_from(["", ":80", ":443", ":8080"]))
+    path = "/" + "/".join(draw(segments))
+    query = urlencode(draw(params))
+    fragment = draw(st.sampled_from(["", "#comments"]))
+    return f"{scheme}://{draw(hosts)}{port}{path}{'?' + query if query else ''}{fragment}"
+
+@given(urls())
+def <span class="hl">test_normalise_is_idempotent</span>(url):
+    once = normalise(url)
+    assert normalise(once) == once</code></pre>
+  <p>Each piece of the strategy exercises a rule. Once it exists, other properties are cheap to add, such as "the output never contains a fragment or a tracking parameter".</p>
+  <div class="note pitfall"><span class="label">Common mistake</span><p>Decoding percent-escapes on every pass. The plan doesn't list percent-decoding as a step, but it is a common addition. <code>urlencode</code> turns the value <code>%41</code> into <code>%2541</code>, because <code>%25</code> is the escape for a literal <code>%</code>. A normaliser that decodes once per call turns <code>%2541</code> into <code>%41</code> on the first pass and into <code>A</code> on the second. It isn't idempotent, and it has changed what the URL means. A table test only catches this if you thought of the case; the idempotence property finds it without being told.</p></div>
+
+  <h3>Two hashes for two questions</h3>
+  <p>Each article carries two text hashes, because the system asks two different questions about its text (ADR-005).</p>
+  <ul>
+    <li><b><code>content_hash</code> answers "is this the same story?"</b> It is the dedup identity, built from feed fields only (title and summary), so it is known at parse time and never changes afterwards.</li>
+    <li><b><code>input_hash</code> answers "have we already scored exactly this input?"</b> It is the score cache key, built from exactly what the scorer reads, including extracted full text.</li>
+  </ul>
+  <div class="split">
+    <div class="no"><h4>One hash for both jobs</h4><p>If the hash includes extracted text, dedup breaks whenever extraction finishes, because the original's hash changes and copies stop matching it. If it ignores extracted text, the cache hands a summary-based score to a full-text input, or the reverse.</p></div>
+    <div class="yes"><h4>Two hashes</h4><p><code>content_hash</code> is fixed at fetch time, so dedup is stable and every copy matches. <code>input_hash</code> follows the text the model reads, so a cached score is only reused for the identical input.</p></div>
+  </div>
+
+  <h4>Canonicalising the text</h4>
+  <p>Copies of one story differ in markup, entities, capitals and spacing. The plan removes those differences with two pure functions that run at different times.</p>
+  <p>The first, <code>to_plain_text</code>, runs once when the feed is parsed, and only its output is stored in <code>title</code> and <code>summary_text</code>:</p>
+  <ol class="steps">
+    <li><b><code>strip_html</code></b> drops tags, scripts and styles, since each site wraps the text in its own markup.</li>
+    <li><b><code>html.unescape</code></b> decodes entities such as <code>&amp;nbsp;</code> exactly once. Feeds often double-encode, but decoding twice would corrupt literal text such as <code>&amp;amp;</code> in a title about HTML.</li>
+  </ol>
+  <p>The second, <code>canon_text</code>, works on that stored plain text whenever a hash is needed:</p>
+  <ol class="steps">
+    <li><b>Unicode NFKC</b> folds compatibility forms into their ordinary equivalents. The ligature <code>ﬁ</code> becomes <code>fi</code>, full-width letters become ASCII, a non-breaking space becomes a space, and <code>ℌ</code> becomes <code>H</code>.</li>
+    <li><b><code>str.casefold()</code></b> removes differences in headline style. It runs after NFKC, so capitals that NFKC creates are folded too, and it also folds <code>ß</code> to <code>ss</code>, which <code>lower()</code> doesn't.</li>
+    <li><b>Collapse whitespace</b> turns every run of spaces, tabs and line breaks into one space, and trims the ends.</li>
+  </ol>
+  <p>Keeping the two apart means nothing downstream ever strips or decodes a second time. An earlier version of the plan put all five steps inside <code>canon_text</code> and ran it on text that had already been decoded at parse time, which is exactly the double decode the second step warns against.</p>
+<pre><code>content_hash = sha256(canon_text(title) + "\n" + canon_text(summary_text))</code></pre>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 860 420" role="img" aria-label="Two copies of an article pass through the canon_text steps side by side. Copy A from site 1 has title Acme ships X1 and an HTML summary with a paragraph tag, a non-breaking space entity and a bold tag. Copy B from site 2 has title Acme Ships X1 and a plain summary with an fi ligature. strip_html removes copy A's tags; html.unescape turns the entity into a non-breaking space; NFKC turns that into a space and copy B's ligature into f i; casefold lowercases both titles; collapsing whitespace removes copy A's double space. Both end as acme ships x1, newline, the first model, and both content hashes begin 42bd42b2d62bbe08.">
+        <text class="t-head" x="370" y="30" text-anchor="middle">Copy A, site 1</text>
+        <text class="t-head" x="690" y="30" text-anchor="middle">Copy B, site 2</text>
+
+        <text class="t-head" x="20" y="62">Feed fields</text><text class="t-sm" x="20" y="78">title, then summary</text>
+        <rect class="bx" x="215" y="44" width="310" height="40" rx="6"/><text class="t-mono" x="225" y="60">Acme ships X1</text><text class="t-mono" x="225" y="76">&lt;p&gt;The &amp;nbsp;&lt;b&gt;first&lt;/b&gt; model.&lt;/p&gt;</text>
+        <rect class="bx" x="535" y="44" width="310" height="40" rx="6"/><text class="t-mono" x="545" y="60">Acme Ships X1</text><text class="t-mono" x="545" y="76">The ﬁrst model.</text>
+
+        <text class="t-head" x="20" y="112">strip_html</text><text class="t-sm" x="20" y="128">at parse time</text>
+        <rect class="bx-pg" x="215" y="94" width="310" height="40" rx="6"/><text class="t-mono" x="225" y="110">Acme ships X1</text><text class="t-mono" x="225" y="126">The &amp;nbsp;first model.</text>
+        <rect class="bx" x="535" y="94" width="310" height="40" rx="6"/><text class="t-mono" x="545" y="110">Acme Ships X1</text><text class="t-mono" x="545" y="126">The ﬁrst model.</text>
+
+        <text class="t-head" x="20" y="162">html.unescape</text><text class="t-sm" x="20" y="178">at parse time, once</text>
+        <rect class="bx-pg" x="215" y="144" width="310" height="40" rx="6"/><text class="t-mono" x="225" y="160">Acme ships X1</text><text class="t-mono" x="225" y="176">The [NBSP]first model.</text>
+        <rect class="bx" x="535" y="144" width="310" height="40" rx="6"/><text class="t-mono" x="545" y="160">Acme Ships X1</text><text class="t-mono" x="545" y="176">The ﬁrst model.</text>
+
+        <text class="t-head" x="20" y="212">NFKC</text><text class="t-sm" x="20" y="228">compatibility forms</text>
+        <rect class="bx-pg" x="215" y="194" width="310" height="40" rx="6"/><text class="t-mono" x="225" y="210">Acme ships X1</text><text class="t-mono" x="225" y="226">The [sp][sp]first model.</text>
+        <rect class="bx-pg" x="535" y="194" width="310" height="40" rx="6"/><text class="t-mono" x="545" y="210">Acme Ships X1</text><text class="t-mono" x="545" y="226">The first model.</text>
+
+        <text class="t-head" x="20" y="262">casefold</text><text class="t-sm" x="20" y="278">headline style removed</text>
+        <rect class="bx-pg" x="215" y="244" width="310" height="40" rx="6"/><text class="t-mono" x="225" y="260">acme ships x1</text><text class="t-mono" x="225" y="276">the [sp][sp]first model.</text>
+        <rect class="bx-pg" x="535" y="244" width="310" height="40" rx="6"/><text class="t-mono" x="545" y="260">acme ships x1</text><text class="t-mono" x="545" y="276">the first model.</text>
+
+        <text class="t-head" x="20" y="312">collapse</text><text class="t-sm" x="20" y="328">runs become one space</text>
+        <rect class="bx-pg" x="215" y="294" width="310" height="40" rx="6"/><text class="t-mono" x="225" y="310">acme ships x1</text><text class="t-mono" x="225" y="326">the first model.</text>
+        <rect class="bx" x="535" y="294" width="310" height="40" rx="6"/><text class="t-mono" x="545" y="310">acme ships x1</text><text class="t-mono" x="545" y="326">the first model.</text>
+
+        <text class="t-head" x="20" y="362">content_hash</text><text class="t-sm" x="20" y="378">sha256, first 8 bytes</text>
+        <rect class="bx-ok" x="215" y="344" width="310" height="40" rx="6"/><text class="t-mono" x="225" y="360">acme ships x1\nthe first model.</text><text class="t-mono" x="225" y="376">42bd42b2d62bbe08…</text>
+        <rect class="bx-ok" x="535" y="344" width="310" height="40" rx="6"/><text class="t-mono" x="545" y="360">acme ships x1\nthe first model.</text><text class="t-mono" x="545" y="376">42bd42b2d62bbe08…</text>
+
+        <text class="t-sm" x="430" y="406" text-anchor="middle">Highlighted cells are where a step changed the text. [NBSP] is a non-breaking space; [sp] is an ordinary space.</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 6.3</b> Two copies of one short article from feed fields to content hash. The first two steps are <code>to_plain_text</code>, run once at parse time, and the next three are <code>canon_text</code>. The title and summary are canonicalised separately and joined with a newline. The hash prefix is the real SHA-256 of the joined string.</figcaption>
+  </figure>
+
+  <p>The order of the first two <code>canon_text</code> steps matters for a few characters. NFKC turns some symbols into capitals, so <code>ℌ</code> becomes <code>H</code>, and casefolding afterwards gives <code>h</code>. Lowercasing first would leave <code>ℌ</code> untouched, and NFKC would then produce a capital <code>H</code> that no following step folds. A unit test should pin the order.</p>
+  <div class="note pitfall"><span class="label">Common mistake</span><p>Decoding entities twice. If any function after the parser decodes again, a literal <code>&amp;amp;</code> in a title about HTML becomes <code>&amp;</code> in the hash, and two copies that should match no longer do. The plan avoids this by decoding in exactly one place, <code>to_plain_text</code>, and storing only its output. A test with an <code>&amp;amp;amp;</code> fixture pins that rule.</p></div>
+
+  <h4>The input hash</h4>
+  <p>The score cache key hashes exactly what the scorer is sent. One function, <code>scoring_input(article)</code>, returns those fields, and both the request and the key are built from its output:</p>
+<pre><code>def scoring_input(article):
+    return {"title": article.title, "text": article.scoring_text}
+<span class="c"># scoring_text: first 6,000 characters of body_text if present, else of summary_text</span>
+<span class="c"># (already plain text), with no case folding</span>
+
+input_hash = sha256(canonical_json(scoring_input(article)))   <span class="c"># sorted keys, UTF-8</span></code></pre>
+  <p>There is no case folding because the model reads the real text, and a capital letter is part of what it sees. Building the request and the key from one function means they can't drift apart: adding a field to the request means adding it to <code>scoring_input</code>, which changes the hash. An earlier version of the plan sent <code>published_at</code> to the scorer without including it in the key, so a corrected date changed the request but not the key.</p>
+  <p>The two copies in Figure 6.3 share a <code>content_hash</code> but have different input hashes (<code>718ee3e2c122e8c7…</code> and <code>faf22fcb282823cd…</code>), because their titles differ in case and one has a ligature. That costs nothing. The second copy is marked as a duplicate and is never scored, so its input hash is never looked up.</p>
+
+  <h4>What extraction changes</h4>
+  <p>For sources with <code>extract_full_text</code> set, a new original isn't scored straight away. The fetcher enqueues <code>extract(article_id)</code> instead, and the extract job stores <code>body_text</code>, recomputes <code>input_hash</code> and then enqueues the scoring. So an article is never scored on its summary and again on its full text. If extraction ends up <code>dead</code>, its failure hook enqueues scoring on the summary, so the article is still scored. Throughout all of this, <code>content_hash</code> never changes.</p>
+
+  <h3>The four rules</h3>
+  <p>With a URL hash and a content hash for every entry, four rules decide what happens to it (plan §4.2):</p>
+  <ol class="steps">
+    <li><b>Same normalised URL means the same article.</b> <code>UNIQUE(url_hash)</code> guarantees a single row, and the upsert sets <code>last_seen_at = now()</code>.</li>
+    <li><b>Same content hash at a different URL means a syndicated copy.</b> The new row is kept for provenance, with <code>duplicate_of</code> pointing at the earliest <b>original</b> (an article whose own <code>duplicate_of</code> is null) with that hash first seen in the last 14 days. A copy is never scored and never appears twice. If the only match is older, the new row is an original, because the story is news again.</li>
+    <li><b>Same URL with new feed content means an edited article.</b> <code>content_hash</code> and <code>input_hash</code> are updated in place, so the old score stops matching, and the article is re-scored only if it is still inside the briefing window.</li>
+    <li><b>Extraction never changes <code>content_hash</code>.</b> It changes only <code>input_hash</code>, because it changes what the scorer reads.</li>
+  </ol>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 860 490" role="img" aria-label="Decision flow. A new entry with a normalised URL: is url_hash already stored? If yes, rule 1, same article, the upsert sets last_seen_at. Then, did the feed content change? Yes gives rule 3, edited article, content_hash and input_hash updated in place and re-scored if in the window. No means nothing more to do. If url_hash is not stored, a new row is inserted. Then, is there an original with the same content_hash first seen in the last 14 days? Yes gives rule 2, a copy whose duplicate_of points at that original, never scored separately. No gives a new original, scored as usual, after extraction if the source uses it. Every path ends by inserting into article_sources with ON CONFLICT DO NOTHING.">
+        <defs>
+          <marker id="dedup-a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="320" y="16" width="220" height="40" rx="7"/><text x="430" y="41" text-anchor="middle">New entry, URL normalised</text>
+        <path class="wire" d="M430 56 L430 84" marker-end="url(#dedup-a3)"/>
+        <rect class="bx-pg" x="290" y="86" width="280" height="44" rx="7"/><text x="430" y="113" text-anchor="middle">Is url_hash already stored?</text>
+        <path class="wire" d="M290 108 L150 108 L150 166" marker-end="url(#dedup-a3)"/><text class="t-sm" x="220" y="101" text-anchor="middle">yes</text>
+        <path class="wire" d="M570 108 L710 108 L710 166" marker-end="url(#dedup-a3)"/><text class="t-sm" x="640" y="101" text-anchor="middle">no</text>
+
+        <rect class="bx" x="30" y="168" width="240" height="50" rx="7"/><text class="t-head" x="150" y="188" text-anchor="middle">Rule 1: same article</text><text class="t-sm" x="150" y="206" text-anchor="middle">upsert sets last_seen_at = now()</text>
+        <rect class="bx" x="590" y="168" width="240" height="50" rx="7"/><text class="t-head" x="710" y="188" text-anchor="middle">Insert a new row</text><text class="t-sm" x="710" y="206" text-anchor="middle">RETURNING inserted = true</text>
+        <path class="wire" d="M150 218 L150 246" marker-end="url(#dedup-a3)"/>
+        <path class="wire" d="M710 218 L710 246" marker-end="url(#dedup-a3)"/>
+
+        <rect class="bx-pg" x="20" y="248" width="260" height="44" rx="7"/><text x="150" y="275" text-anchor="middle">Did the feed content change?</text>
+        <rect class="bx-pg" x="560" y="248" width="280" height="52" rx="7"/><text x="700" y="268" text-anchor="middle">Original with same content_hash,</text><text x="700" y="290" text-anchor="middle">first seen in the last 14 days?</text>
+        <path class="wire" d="M115 292 L115 328" marker-end="url(#dedup-a3)"/><text class="t-sm" x="123" y="314">yes</text>
+        <path class="wire" d="M240 292 L320 328" marker-end="url(#dedup-a3)"/><text class="t-sm" x="292" y="304">no</text>
+        <path class="wire" d="M620 300 L540 328" marker-end="url(#dedup-a3)"/><text class="t-sm" x="566" y="308" text-anchor="end">no</text>
+        <path class="wire" d="M745 300 L745 328" marker-end="url(#dedup-a3)"/><text class="t-sm" x="753" y="318">yes</text>
+
+        <rect class="bx" x="20" y="330" width="190" height="76" rx="7"/><text class="t-head" x="115" y="352" text-anchor="middle">Rule 3: edited</text><text class="t-sm" x="115" y="370" text-anchor="middle">content_hash and</text><text class="t-sm" x="115" y="385" text-anchor="middle">input_hash updated</text><text class="t-sm" x="115" y="400" text-anchor="middle">re-scored if in window</text>
+        <rect class="bx" x="225" y="330" width="190" height="76" rx="7"/><text class="t-head" x="320" y="352" text-anchor="middle">Unchanged</text><text class="t-sm" x="320" y="370" text-anchor="middle">nothing more to do</text>
+        <rect class="bx-ok" x="445" y="330" width="190" height="76" rx="7"/><text class="t-head" x="540" y="352" text-anchor="middle">New original</text><text class="t-sm" x="540" y="370" text-anchor="middle">duplicate_of stays NULL</text><text class="t-sm" x="540" y="385" text-anchor="middle">scored as usual</text><text class="t-sm" x="540" y="400" text-anchor="middle">(after extraction if set)</text>
+        <rect class="bx" x="650" y="330" width="190" height="76" rx="7"/><text class="t-head" x="745" y="352" text-anchor="middle">Rule 2: copy</text><text class="t-sm" x="745" y="370" text-anchor="middle">duplicate_of points at it</text><text class="t-sm" x="745" y="385" text-anchor="middle">never scored separately</text><text class="t-sm" x="745" y="400" text-anchor="middle">never placed twice</text>
+
+        <path class="wire" d="M115 406 L115 432" marker-end="url(#dedup-a3)"/>
+        <path class="wire" d="M320 406 L320 432" marker-end="url(#dedup-a3)"/>
+        <path class="wire" d="M540 406 L540 432" marker-end="url(#dedup-a3)"/>
+        <path class="wire" d="M745 406 L745 432" marker-end="url(#dedup-a3)"/>
+        <rect class="bx" x="20" y="434" width="820" height="40" rx="7"/><text x="430" y="459" text-anchor="middle">Every path: INSERT INTO article_sources … ON CONFLICT DO NOTHING</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 6.4</b> Rules 1 to 3 as a decision flow. The left branch is decided by the upsert itself, and the right branch by the follow-up <code>UPDATE</code>. Rule 4 is the absence of a box: no path through extraction touches <code>content_hash</code>.</figcaption>
+  </figure>
+
+  <h3>The SQL, line by line</h3>
+  <p>All the rules run in one transaction per feed, which also enqueues the scoring or extract jobs, so a feed's articles and their jobs commit together or not at all.</p>
+<pre><code>INSERT INTO articles (url_hash, url_canonical, content_hash, input_hash, title, …)
+VALUES (…)
+<span class="hl">ON CONFLICT (url_hash) DO UPDATE</span>
+   SET last_seen_at = now(),
+       content_hash = EXCLUDED.content_hash,          <span class="c">-- edited article</span>
+       input_hash   = CASE WHEN articles.body_text IS NULL
+                           THEN EXCLUDED.input_hash ELSE articles.input_hash END,
+       title        = EXCLUDED.title
+RETURNING id, <span class="hl">(xmax = 0) AS inserted</span>, content_hash;</code></pre>
+  <ol class="steps">
+    <li><b><code>INSERT … VALUES (…)</code></b> tries to insert the entry as a new article.</li>
+    <li><b><code>ON CONFLICT (url_hash)</code></b> names the unique index. If the hash exists, Postgres takes the <code>DO UPDATE</code> branch instead of raising an error. It is atomic, so a second transaction inserting the same URL waits on the index until the first commits, then takes the update branch. A <code>SELECT</code> then <code>INSERT</code> has no such guarantee.</li>
+    <li><b><code>last_seen_at = now()</code></b> is rule 1.</li>
+    <li><b><code>content_hash = EXCLUDED.content_hash</code></b> is rule 3. <code>EXCLUDED</code> is the row you tried to insert, so the fresh hash replaces the stored one. <code>title</code> is refreshed the same way.</li>
+    <li><b>The <code>CASE</code> on <code>input_hash</code></b> keeps the stored value once the article has <code>body_text</code>, because the scorer then reads the body and a changed summary doesn't change its input.</li>
+    <li><b><code>(xmax = 0) AS inserted</code></b> reports which branch ran. The hidden system column <code>xmax</code> is zero on a freshly inserted row version and non-zero on one written by the update branch. It is a well-known idiom but an internal detail, so comment it and cover it with an integration test.</li>
+  </ol>
+  <p>One case is still open in the plan (Q17). <code>input_hash</code> includes the title, so an edited title on an extracted article should change it, and the <code>CASE</code> as written keeps the old value. It only matters once extraction exists, so the plan settles it at checkpoint 1.3. The likely fix is to store <code>scoring_text</code> and recompute <code>input_hash</code> from the stored title and <code>scoring_text</code> in the same statement that changes either.</p>
+  <p>For rows where <code>inserted</code> is true, a second statement applies rule 2:</p>
+<pre><code>UPDATE articles SET duplicate_of = (
+    SELECT o.id FROM articles o
+    WHERE o.content_hash = $h AND o.id &lt;&gt; $id
+      AND <span class="hl">o.duplicate_of IS NULL</span>                    <span class="c">-- only point at originals</span>
+      AND o.first_seen_at &gt; now() - interval '14 days'
+    ORDER BY o.id LIMIT 1)
+WHERE id = $id;</code></pre>
+  <ul>
+    <li><b>Only originals can be pointed at.</b> <code>o.duplicate_of IS NULL</code> means a copy can never point at another copy, so there are no chains to follow.</li>
+    <li><b><code>ORDER BY o.id LIMIT 1</code> picks the earliest.</b> Identity ids grow with each insert, so the lowest id is the first original seen. <code>INDEX(content_hash)</code> makes the lookup cheap.</li>
+    <li><b>No match leaves an original.</b> If nothing qualifies, the subquery returns <code>NULL</code>. The 14-day limit matches the age after which articles aren't scored again.</li>
+  </ul>
+  <p>Finally, <code>INSERT INTO article_sources … ON CONFLICT DO NOTHING</code> records that this source carried this article, and leaves the original <code>first_seen_at</code> alone if the pair is already known.</p>
+
+  <h3>The race the unique index can't catch</h3>
+  <p>Two feeds can deliver the same text at different URLs at the same moment, and then both rows stay originals.</p>
+  <p>The same-URL race is safe, because the unique index serialises it. The same-text race isn't. Under <code>READ COMMITTED</code>, each transaction's duplicate lookup sees only committed rows, so neither sees the other.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 860 280" role="img" aria-label="Timeline of two overlapping transactions. Feed A's transaction inserts url_a, looks for an original with the same content hash and finds none, then commits. Feed B's transaction inserts url_b slightly afterwards, also finds no original because feed A has not committed, then commits. Both rows stay originals with the same content_hash. Two downstream layers handle it: the builder skips a content_hash it has already placed, and the nightly repair_duplicates job points the newer row at the older.">
+        <defs>
+          <marker id="dedup-a5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <path class="axis" d="M160 32 L838 32" marker-end="url(#dedup-a5)"/><text class="t-sm" x="160" y="22">time</text>
+
+        <text class="t-head" x="20" y="72">Feed A</text><text class="t-sm" x="20" y="88">transaction 1</text>
+        <path class="wire" d="M150 76 L840 76"/>
+        <rect class="bx" x="160" y="59" width="110" height="34" rx="6"/><text class="t-mono" x="215" y="81" text-anchor="middle">INSERT url_a</text>
+        <rect class="bx" x="400" y="59" width="170" height="34" rx="6"/><text class="t-mono" x="485" y="81" text-anchor="middle">lookup: no original</text>
+        <rect class="bx-pg" x="660" y="59" width="90" height="34" rx="6"/><text class="t-mono" x="705" y="81" text-anchor="middle">COMMIT</text>
+
+        <text class="t-head" x="20" y="152">Feed B</text><text class="t-sm" x="20" y="168">transaction 2</text>
+        <path class="wire" d="M150 156 L840 156"/>
+        <rect class="bx" x="240" y="139" width="110" height="34" rx="6"/><text class="t-mono" x="295" y="161" text-anchor="middle">INSERT url_b</text>
+        <rect class="bx" x="480" y="139" width="170" height="34" rx="6"/><text class="t-mono" x="565" y="161" text-anchor="middle">lookup: no original</text>
+        <rect class="bx-pg" x="740" y="139" width="90" height="34" rx="6"/><text class="t-mono" x="785" y="161" text-anchor="middle">COMMIT</text>
+
+        <text class="t-sm" x="430" y="202" text-anchor="middle">Each lookup sees only committed rows, so both rows stay originals with the same content_hash.</text>
+        <rect class="bx-ok" x="20" y="220" width="400" height="40" rx="7"/><text class="t-sm" x="220" y="244" text-anchor="middle">Builder skips a content_hash it has already placed</text>
+        <rect class="bx-ok" x="440" y="220" width="400" height="40" rx="7"/><text class="t-sm" x="640" y="244" text-anchor="middle">Nightly repair_duplicates points the newer row at the older</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 6.5</b> Two feed transactions overlap, and neither duplicate lookup can see the other's uncommitted row. The two layers at the bottom handle the result after the fact.</figcaption>
+  </figure>
+
+  <p>The plan could close the gap by locking on the content hash before inserting. It chooses not to, because that adds lock ordering and a deadlock risk to the hottest write path, for an event that is rare and harmless. Instead there are two layers downstream:</p>
+  <ul>
+    <li><b>The briefing builder skips any <code>content_hash</code> it has already placed.</b> The reader never sees the same story twice, whatever the table says.</li>
+    <li><b>A nightly <code>maintenance:repair_duplicates</code> job</b> finds content hashes with more than one original in the last 14 days. It keeps the lowest id, points the others and their copies at it, and logs how many it fixed. That count is a case-study metric, and it should be close to zero.</li>
+  </ul>
+  <p>At worst the race costs one extra scoring call. Both rows usually have the same <code>input_hash</code>, so the second lookup hits the cache.</p>
+
+  <h3>Counting sources for ranking</h3>
+  <p><code>article_sources</code> has one row per (article, source) pair, with <code>PRIMARY KEY(article_id, source_id)</code>, and it records which feeds carried an article. That answer is used three ways:</p>
+  <ul>
+    <li><b>Provenance.</b> You can show where an item came from.</li>
+    <li><b>Metrics.</b> It feeds the dedup rate in plan §13.</li>
+    <li><b>Ranking.</b> When several independent feeds carry a story, that is evidence it matters.</li>
+  </ul>
+  <p>The write-up ranks candidates by <code>rank_value = score × w × (1 + ln n)</code>, computed for one user only (§7.6):</p>
+  <ul>
+    <li><b><code>n</code></b> is the number of distinct sources <b>this user subscribes to</b> that carried the article or any of its duplicates. Copies count towards their original, which is the point of tracking them. Other users' subscriptions don't count, so they can't change this user's ranking. With <code>n = 1</code> the multiplier is 1.</li>
+    <li><b><code>w</code></b> is the highest subscription weight among those sources. A feed you've weighted up always helps, and adding a low-weight feed that carries the same story never hurts it.</li>
+    <li><b>Ties</b> go to the newer <code>published_at</code>, then the lower <code>id</code>.</li>
+  </ul>
+  <p>Only originals with a raw <code>score</code> at or above the profile threshold are candidates. The threshold applies to the score, never to the ranking value. One way to get <code>n</code> and <code>w</code> in SQL:</p>
+<pre><code>SELECT count(DISTINCT s.source_id) AS n, max(sub.weight) AS w
+  FROM articles a
+  JOIN article_sources s ON s.article_id = a.id
+  JOIN subscriptions sub ON sub.source_id = s.source_id AND sub.user_id = $user
+ WHERE a.id = $orig OR <span class="hl">a.duplicate_of = $orig</span>;</code></pre>
+
+  <div class="note example"><span class="label">Worked example</span>
+    <p>Your <code>ai-news</code> profile has threshold 6, and all your subscriptions have weight 1.0.</p>
+    <ol>
+      <li><b>Article A</b> scored 7 and reached one of your feeds: <code>7 × 1.0 × (1 + ln 1) = 7.00</code>.</li>
+      <li><b>Article B</b> scored 6. Two of your feeds carried it directly and two more carried copies, so <code>n = 4</code>: <code>6 × 1.0 × (1 + 1.386) = 14.32</code>. B outranks A, although the scorer rated it lower.</li>
+      <li><b>Article C</b> scored 5 and eight of your feeds carried it. Its value would be <code>5 × (1 + ln 8) = 15.40</code>, but its score is below the threshold, so it is never a candidate.</li>
+    </ol>
+    <p>The logarithm makes the effect shrink. Going from 1 to 2 sources multiplies the factor by 1.69, while going from 4 to 8 multiplies it by only 1.29, so wide syndication alone can't dominate a briefing.</p>
+  </div>
+  <p>Placement then walks down the ranked list, skipping any <code>content_hash</code> already placed, until <code>max_items</code> (12 by default) are placed. That skip is the same guard that covers the insert race.</p>
+
+  <h3>Where exact dedup stops: near-duplicates and <code>group_key</code></h3>
+  <p>Both hashes are exact equality tests, so the same story in different words gets through as two originals.</p>
+  <p>Two reporters writing about one model launch produce different text, different hashes and two originals. Recognising them is <b>near-duplicate detection</b>, which needs fuzzy techniques such as SimHash fingerprints, MinHash over word shingles, or embeddings compared by cosine similarity. All of them need a similarity threshold, and a threshold brings back the false-merge risk that URL normalisation works so hard to avoid.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 860 240" role="img" aria-label="Three levels of sameness, from easiest to hardest to detect. Same page with many links, caught by the url_hash unique index before scoring. Same text on many sites, caught by content_hash and duplicate_of before scoring. Same story in other words, not caught at ingest; group_key in the write-up groups such items only among the top items.">
+        <defs>
+          <marker id="dedup-a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx-ok" x="20" y="24" width="260" height="156" rx="8"/>
+        <text class="t-head" x="150" y="50" text-anchor="middle">Same page, many links</text>
+        <text class="t-mono" x="150" y="76" text-anchor="middle">…/post/?utm_source=rss</text>
+        <text class="t-mono" x="150" y="94" text-anchor="middle">…/post/#comments</text>
+        <text class="t-sm" x="150" y="128" text-anchor="middle">Caught by</text>
+        <text class="t-mono" x="150" y="148" text-anchor="middle">UNIQUE(url_hash)</text>
+        <text class="t-sm" x="150" y="166" text-anchor="middle">exact, before any scoring</text>
+
+        <rect class="bx-ok" x="300" y="24" width="260" height="156" rx="8"/>
+        <text class="t-head" x="430" y="50" text-anchor="middle">Same text, many sites</text>
+        <text class="t-sm" x="430" y="76" text-anchor="middle">a press release on five sites</text>
+        <text class="t-sm" x="430" y="94" text-anchor="middle">a feed reissuing a new GUID</text>
+        <text class="t-sm" x="430" y="128" text-anchor="middle">Caught by</text>
+        <text class="t-mono" x="430" y="148" text-anchor="middle">content_hash, duplicate_of</text>
+        <text class="t-sm" x="430" y="166" text-anchor="middle">exact, before any scoring</text>
+
+        <rect class="bx-ghost" x="580" y="24" width="260" height="156" rx="8"/>
+        <text class="t-head" x="710" y="50" text-anchor="middle">Same story, other words</text>
+        <text class="t-sm" x="710" y="76" text-anchor="middle">two reporters, one launch</text>
+        <text class="t-sm" x="710" y="94" text-anchor="middle">different text, different hash</text>
+        <text class="t-sm" x="710" y="128" text-anchor="middle">Not caught at ingest; grouped by</text>
+        <text class="t-mono" x="710" y="148" text-anchor="middle">group_key in the write-up</text>
+        <text class="t-sm" x="710" y="166" text-anchor="middle">only among the top items</text>
+
+        <path class="wire" d="M20 206 L838 206" marker-end="url(#dedup-a4)"/>
+        <text class="t-sm" x="430" y="226" text-anchor="middle">harder to detect, and more expensive to detect, from left to right</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 6.6</b> Three kinds of sameness. The plan handles the first two exactly at ingest and treats the third as a presentation problem for the write-up model.</figcaption>
+  </figure>
+
+  <p>The plan lists near-duplicate detection as a non-goal. Instead, the Sonnet write-up may give related items among the top <code>max_items</code> the same <code>group_key</code>, and the renderer puts them under one heading. That brings back the useful part of Horizon's <code>topic_dedup</code> with no similarity machinery.</p>
+  <div class="split">
+    <div class="no"><h4>Clustering at ingest (not in the plan)</h4><p>Would save scoring cost on near-duplicates and catch them everywhere, but needs a similarity index, a tuned threshold and a policy for wrong merges. It is the bigger project, which is why the plan records it as future work.</p></div>
+    <div class="yes"><h4><code>group_key</code> in the write-up</h4><p>No new infrastructure, and a model is good at judging whether two items describe the same event. Near-duplicates are still scored separately, and grouping only happens among the items that reach the write-up.</p></div>
+  </div>
+  <p>Exact deduplication is cheap, certain and safe. Fuzzy deduplication is none of those, so the plan does the first in the database and leaves the second to a step whose mistakes only affect layout.</p>
+
+  <div class="try">
+    <span class="label">Try it: normalise and hash</span>
+    <ol>
+      <li>Write a table test with the URLs from Figures 6.1 and 6.2 and their expected outputs, then implement <code>normalise</code> until it passes.</li>
+      <li>Add the <code>hypothesis</code> idempotence test. If you add percent-decoding, watch it find <code>%2541</code> and read the shrunk example it prints.</li>
+      <li>Implement <code>canon_text</code> and <code>content_hash</code>, and hash the two copies in Figure 6.3.</li>
+      <li>Change one word in one copy and hash it again.</li>
+      <li>Run <code>canon_text("ℌ")</code>, then swap the NFKC and casefold steps and run it again.</li>
+    </ol>
+    <p>Both copies should give <code>42bd42b2d62bbe08</code> as the first 8 bytes, and the one-word change should give a completely different hash, which is the limit of exact dedup in one line. With the plan's order <code>ℌ</code> becomes <code>h</code>; with the steps swapped it stays a capital <code>H</code>.</p>
+  </div>
+
+  <div class="try">
+    <span class="label">Try it: the upsert and the race</span>
+    <ol>
+      <li>In a scratch database, create a cut-down <code>articles</code> table with <code>UNIQUE(url_hash)</code> and run the upsert twice with the same <code>url_hash</code>. Look at <code>inserted</code> each time.</li>
+      <li>Open two <code>psql</code> sessions and run <code>BEGIN</code> in both.</li>
+      <li>In session 1, insert a row for <code>url_a</code> with content hash <code>h</code>. In session 2, insert one for <code>url_b</code> with the same <code>h</code>.</li>
+      <li>In each session, run the duplicate lookup for its own row, then <code>COMMIT</code> both.</li>
+    </ol>
+    <p>The first upsert returns <code>true</code> and the second <code>false</code>, with one row in the table. In the race, both lookups find nothing and both rows stay originals, which is the case the builder's skip and the nightly repair exist for.</p>
+  </div>
+
+  <div class="ask">
+    <span class="label">If an interviewer asks</span>
+    <p class="q">"How do you know two articles are the same?"</p>
+    <p>"Two levels. A normalised URL catches the same page under different links, and a unique index on its hash makes the upsert idempotent. A content hash over the canonicalised feed title and summary catches copies of the same text on different sites. The copy is kept but points at the original, and it's never scored. Near-duplicates, the same story in other words, are out of scope; the write-up model groups those."</p>
+    <p class="q">"Why two text hashes?"</p>
+    <p>"They answer different questions. The content hash decides whether two entries are the same story, so it has to be known at fetch time and must not change when full-text extraction finishes. The input hash is the score cache key, so it has to change whenever the model reads different text. One hash would either break dedup after extraction or reuse a summary-based score for a full-text input."</p>
+    <p class="q">"What happens if two feeds deliver the same article at the same moment?"</p>
+    <p>"Same URL, the unique index serialises them and there's one row. Same text at different URLs, neither transaction sees the other, so both stay originals. I don't lock on the content hash, because that adds deadlock risk to the hottest write path for a rare event. Instead the builder skips a content hash it has already placed, and a nightly job repairs the rows and counts how often it happened."</p>
+  </div>
+  <label class="got"><input type="checkbox" id="got-dedup" data-ch="dedup"> I can explain this</label>
+</section>

@@ -1,0 +1,619 @@
+<!-- ============================================================ -->
+<section class="ch" id="testing">
+  <div class="ch-head"><span class="ch-num">Chapter 12</span><span class="plan-ref">plan §10, §13</span><h2>Testing the hard parts</h2></div>
+
+  <p>The guarantees that matter most in briefing-engine are the hardest to see. Two workers never claim the same job, a budget holds when twenty calls race for it, and an email is escaped exactly once. Several of these fail only under timing that rarely happens on a laptop.</p>
+  <p>ADR-003 names subtle lease and retry bugs as the risk of writing the queue yourself, and gives the concurrency tests as the mitigation. The test plan has to make those bugs show up on demand. It does so by giving pure logic fast unit tests and by testing anything that involves concurrency or constraints against a real Postgres, because a mock can only repeat your own assumptions.</p>
+
+  <h3>Each kind of test catches one kind of failure</h3>
+  <p>A URL normaliser fails because its logic is wrong for some input, so a test that tries many inputs in a millisecond suits it. A job queue fails because two transactions interleave in an unlucky order, which no single function call reveals. The plan gives each risk the cheapest test that can still observe it.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 760 376" role="img" aria-label="Layered diagram of test types, cheapest at the bottom. Unit and property tests address logic errors in pure functions and need no I/O. HTTP mocks with respx address wrong reactions to a status or header. LLM fakes address bad model output and wrong request shape. Golden files address escaping or layout drift. Integration tests need Postgres 17 and address races, locks and constraints. API tests need Postgres 17 and address the auth, errors and pagination contract. End-to-end tests need docker compose and address parts not fitting together. The live smoke test needs its own API key and a 10 cent cap and addresses changes in the real model API. Load tests run on AWS, started by hand, and address slowness at the target rate. The live smoke and load layers are dashed because they do not run on pull requests.">
+        <text class="t-sm" x="180" y="24" text-anchor="middle">Layer</text>
+        <text class="t-sm" x="360" y="24">Risk it addresses</text>
+        <text class="t-sm" x="740" y="24" text-anchor="end">Needs</text>
+
+        <rect class="bx-ghost" x="76" y="40" width="208" height="28" rx="5"/>
+        <text x="180" y="59" text-anchor="middle">Load (k6)</text>
+        <text class="t-sm" x="360" y="58">too slow at the target rate</text>
+        <text class="t-mono" x="740" y="58" text-anchor="end">AWS, run by hand</text>
+
+        <rect class="bx-ghost" x="69" y="74" width="222" height="28" rx="5"/>
+        <text x="180" y="93" text-anchor="middle">Live smoke</text>
+        <text class="t-sm" x="360" y="92">the real model API has changed</text>
+        <text class="t-mono" x="740" y="92" text-anchor="end">own API key, $0.10 cap</text>
+
+        <rect class="bx" x="62" y="108" width="236" height="28" rx="5"/>
+        <text x="180" y="127" text-anchor="middle">End to end</text>
+        <text class="t-sm" x="360" y="126">the parts do not fit together</text>
+        <text class="t-mono" x="740" y="126" text-anchor="end">docker compose</text>
+
+        <rect class="bx" x="55" y="142" width="250" height="28" rx="5"/>
+        <text x="180" y="161" text-anchor="middle">API</text>
+        <text class="t-sm" x="360" y="160">auth, errors and pagination contract</text>
+        <text class="t-mono" x="740" y="160" text-anchor="end">Postgres 17</text>
+
+        <rect class="bx-pg" x="48" y="176" width="264" height="28" rx="5"/>
+        <text x="180" y="195" text-anchor="middle">Integration (Postgres)</text>
+        <text class="t-sm" x="360" y="194">races, locks and constraints</text>
+        <text class="t-mono" x="740" y="194" text-anchor="end">Postgres 17</text>
+
+        <rect class="bx" x="41" y="210" width="278" height="28" rx="5"/>
+        <text x="180" y="229" text-anchor="middle">Golden files</text>
+        <text class="t-sm" x="360" y="228">escaping or layout drifts</text>
+        <text class="t-mono" x="740" y="228" text-anchor="end">no I/O</text>
+
+        <rect class="bx" x="34" y="244" width="292" height="28" rx="5"/>
+        <text x="180" y="263" text-anchor="middle">LLM fakes</text>
+        <text class="t-sm" x="360" y="262">bad model output, wrong request shape</text>
+        <text class="t-mono" x="740" y="262" text-anchor="end">no I/O</text>
+
+        <rect class="bx" x="27" y="278" width="306" height="28" rx="5"/>
+        <text x="180" y="297" text-anchor="middle">HTTP mocks (respx)</text>
+        <text class="t-sm" x="360" y="296">wrong reaction to a status or header</text>
+        <text class="t-mono" x="740" y="296" text-anchor="end">no network</text>
+
+        <rect class="bx" x="20" y="312" width="320" height="28" rx="5"/>
+        <text x="180" y="331" text-anchor="middle">Unit and property</text>
+        <text class="t-sm" x="360" y="330">logic errors in pure functions</text>
+        <text class="t-mono" x="740" y="330" text-anchor="end">no I/O</text>
+
+        <text class="t-sm" x="20" y="364">Lower layers are numerous, fast and need no services. Higher layers are few, slow and closer to production.</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 12.1</b> The test layers in plan §10, cheapest at the bottom. The two dashed layers don't run on pull requests. The live smoke test runs nightly, and the load test is started by hand in stage 3.</figcaption>
+  </figure>
+  <div class="note principle"><span class="label">Key principle</span><p>A test can only prove properties of what it actually runs. If the property lives in your Python logic, a unit test can prove it. If it lives in Postgres locks, constraints and transaction rules, only a test that runs Postgres can.</p></div>
+
+  <h3>Unit tests for pure functions</h3>
+  <p>A <b>pure function</b> returns the same output for the same input and has no side effects: no network, no database, no clock, no randomness. The plan pushes as much logic as it can into pure functions, because they're the cheapest code to test:</p>
+  <ul>
+    <li><b>Ingestion.</b> URL normalisation, content hashing, <code>Retry-After</code> parsing, backoff bounds and the HTTP classification table.</li>
+    <li><b>Signing.</b> HMAC signatures against fixed test vectors, and cursor encoding with tamper detection.</li>
+    <li><b>LLM and money.</b> Rubric hashing, cost arithmetic in micro-dollars, and budget estimates that must be upper bounds.</li>
+  </ul>
+  <p>The trick is to pass in anything that varies. <code>Retry-After</code> can be an HTTP date, so its meaning depends on the current time. A parser that calls <code>datetime.now()</code> inside can't be tested reliably, and one that takes <code>now</code> as an argument can:</p>
+<pre><code>NOW = datetime(2026, 10, 21, 7, 27, tzinfo=UTC)
+
+@pytest.mark.parametrize("header, expected", [
+    ("120", 120),                                  <span class="c"># delta-seconds form</span>
+    ("Wed, 21 Oct 2026 07:28:00 GMT", 60),         <span class="c"># HTTP-date form, one minute ahead</span>
+    ("0", 1),                                      <span class="c"># clamped up to 1 s</span>
+    ("172800", 86400),                             <span class="c"># 48 h, clamped to 24 h</span>
+    ("Wed, 21 Oct 2026 07:00:00 GMT", None),       <span class="c"># in the past: normal backoff</span>
+    ("-5", None),                                  <span class="c"># negative</span>
+    ("soon", None),                                <span class="c"># unparsable</span>
+])
+def test_parse_retry_after(header, expected):
+    assert parse_retry_after(header, <span class="hl">now=NOW</span>) == expected</code></pre>
+  <p>Each row is one case of the rule, written as data, so a missing case is easy to spot and adding one costs a line.</p>
+  <p>HMAC signing is tested the same way against <b>test vectors</b>: a fixed secret, id, timestamp and body, with the expected signature written out. A change that alters the signed bytes fails the vector, which protects every consumer who has already written a verifier.</p>
+
+  <h4>Property-based testing with hypothesis</h4>
+  <p>A table tests the cases you thought of. <b>Property-based testing</b> states a rule that must hold for every input, and the library <code>hypothesis</code> generates hundreds of inputs, including awkward ones such as empty strings and Unicode. When it finds a failure it <b>shrinks</b> the input, simplifying it while the test still fails, and reports the smallest failing example.</p>
+  <p>The plan names two properties:</p>
+  <ul>
+    <li><b>URL normalisation is idempotent.</b> Normalising an already-normalised URL changes nothing. Otherwise one article could get two <code>url_hash</code> values depending on how often it had been processed.</li>
+    <li><b>Rubric hashing ignores key order.</b> Otherwise two users with identical rubrics would miss the shared score cache.</li>
+  </ul>
+<pre><code>from urllib.parse import urlencode
+from hypothesis import given, strategies as st
+
+urls = st.builds(
+    lambda scheme, host, path, query: f"{scheme}://{host}/{path}?{urlencode(query)}",
+    st.sampled_from(["http", "https", "HTTPS"]),
+    st.sampled_from(["Example.com", "example.com:443", "news.example.org"]),
+    st.lists(st.sampled_from(["a", "b", ".", ".."]), max_size=4).map("/".join),
+    st.dictionaries(st.sampled_from(["utm_source", "id", "ref", "q"]), st.text(max_size=3)),
+)
+
+@given(urls)
+def test_normalise_is_idempotent(url):
+    once = normalise(url)
+    assert <span class="hl">normalise(once) == once</span>
+
+@given(st.dictionaries(st.text(), st.integers()))
+def test_rubric_hash_ignores_key_order(rubric):
+    reordered = dict(reversed(list(rubric.items())))
+    assert rubric_hash(rubric) == rubric_hash(reordered)</code></pre>
+  <p>The URL strategy is built from parts known to be tricky (mixed-case schemes, default ports, dot segments, tracking parameters), so the generated inputs land where bugs are likely.</p>
+
+  <h3>Faking the outside world</h3>
+  <p>Feed servers, the Anthropic API and email are outside your control, so most tests replace them with something that misbehaves on demand. The code under test runs unchanged.</p>
+  <ul>
+    <li><b><code>respx</code> for feed fetches.</b> It intercepts requests made with <code>httpx</code> and returns responses you define: a <code>304</code>, a <code>429</code> with <code>Retry-After</code>, a redirect chain, a body over 5 MB.</li>
+    <li><b>An in-process fake LLM</b> for unit and integration tests. It implements the <code>Scorer</code> and <code>Writer</code> interfaces, and each test sets what comes back, such as a refusal, a truncated <code>max_tokens</code> response or a batch with one ref missing. Recorded real responses serve as fixtures.</li>
+    <li><b>A fake Anthropic server</b> for end-to-end tests, the outage drills and the pipeline load test. It's a small FastAPI app in its own container serving <code>POST /v1/messages</code>, reached through <code>ANTHROPIC_BASE_URL</code>, so the real SDK wrapper, error classification and retry path all run. It can return <code>529</code>, <code>429</code> with <code>retry-after</code>, refusals or truncated output.</li>
+    <li><b>Golden files</b> for email. They render hostile fixtures and compare the output with a reviewed file, catching double escaping, unsafe <code>href</code> schemes and drift in the plain-text part.</li>
+  </ul>
+<pre><code>@respx.mock
+async def test_429_blocks_the_whole_host(db, fetcher):
+    route = respx.get("https://www.reddit.com/r/example/.rss").mock(
+        return_value=httpx.Response(429, headers={<span class="hl">"Retry-After": "120"</span>}))
+    await fetcher.fetch(reddit_source_id)
+    host = await db.get_host("www.reddit.com")
+    assert host.blocked_until &gt;= NOW + timedelta(seconds=120)
+    assert route.call_count == 1                      <span class="c"># no retry inside the run</span></code></pre>
+  <p>The same tool covers validators being updated only on a <code>200</code>, the 5 MB cap and the SSRF guard. A mocked response redirects to <code>169.254.169.254</code>, and the test asserts that the second request is never made.</p>
+
+  <h3>Why concurrency and constraints need a real Postgres</h3>
+  <p>The queue, the host limiter and the budget rely on database behaviour: <code>FOR UPDATE SKIP LOCKED</code>, row locks, partial unique indexes, advisory locks, and the way Postgres re-checks a <code>WHERE</code> clause after waiting for a lock. That behaviour is the guarantee, so a test that mocks it away proves nothing about it.</p>
+  <div class="split">
+    <div class="no"><h4>Mocked database</h4><p>The mock's claim returns the next job from a Python list. It never runs two claims at once, never blocks on a lock and never enforces a unique index. A queue missing <code>SKIP LOCKED</code>, or a budget update missing its condition, passes every test.</p></div>
+    <div class="yes"><h4>Real Postgres 17</h4><p>The production SQL runs on separate connections with real interleaving, so a claim that hands one job to two workers can be caught. CI runs Postgres 17 as a GitHub Actions service container, and local runs use <code>docker compose</code>.</p></div>
+  </div>
+  <p>Figure 12.2 shows one mechanism no mock reproduces. Under the default <code>READ COMMITTED</code> isolation, when two transactions update the same row, the second waits for the first. When the first commits, Postgres re-evaluates the second update's <code>WHERE</code> clause against the new row version.</p>
+  <p>So the conditional <code>UPDATE … WHERE spent_micros + reserved_micros + $est &lt;= limit_micros</code> always checks the limit against the latest committed total, and a reservation that would cross it returns no row.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 760 330" role="img" aria-label="Two tasks reserving budget on the same usage_periods row, which starts with 900,000 of a 1,000,000 limit used. Task A sends a conditional UPDATE to reserve 100,000; the row is locked by A and the total is now 1,000,000. Task B sends the same UPDATE and blocks on A's row lock. Task A commits. B's WHERE clause is re-checked on the new row: 1,000,000 plus 100,000 exceeds the limit, so B gets zero rows, meaning the budget is exhausted.">
+        <defs>
+          <marker id="testing-m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+          <marker id="testing-m3acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="40" y="20" width="140" height="36" rx="7"/>
+        <text class="t-head" x="110" y="43" text-anchor="middle">Task A</text>
+        <rect class="bx-pg" x="290" y="20" width="180" height="36" rx="7"/>
+        <text class="t-head" x="380" y="43" text-anchor="middle">usage_periods row</text>
+        <rect class="bx" x="580" y="20" width="140" height="36" rx="7"/>
+        <text class="t-head" x="650" y="43" text-anchor="middle">Task B</text>
+        <line class="wire-dash" x1="110" y1="56" x2="110" y2="315"/>
+        <line class="wire-dash" x1="380" y1="56" x2="380" y2="315"/>
+        <line class="wire-dash" x1="650" y1="56" x2="650" y2="315"/>
+
+        <path class="wire-acc" d="M110 96 L378 96" marker-end="url(#testing-m3acc)"/>
+        <text class="t-sm" x="245" y="88" text-anchor="middle">reserve 100,000 (conditional UPDATE)</text>
+        <rect class="bx-pg" x="280" y="106" width="200" height="40" rx="7"/>
+        <text class="t-sm" x="380" y="122" text-anchor="middle">row locked by A</text>
+        <text class="t-mono" x="380" y="138" text-anchor="middle">total now 1,000,000</text>
+
+        <path class="wire-acc" d="M650 172 L382 172" marker-end="url(#testing-m3acc)"/>
+        <text class="t-sm" x="515" y="164" text-anchor="middle">reserve 100,000</text>
+        <text class="t-sm" x="515" y="190" text-anchor="middle">blocks on A's row lock</text>
+
+        <path class="wire" d="M110 214 L378 214" marker-end="url(#testing-m3)"/>
+        <text class="t-sm" x="245" y="206" text-anchor="middle">COMMIT</text>
+        <rect class="bx-pg" x="270" y="226" width="220" height="40" rx="7"/>
+        <text class="t-sm" x="380" y="242" text-anchor="middle">B re-checks WHERE on the new row</text>
+        <text class="t-mono" x="380" y="258" text-anchor="middle">1,000,000 + 100,000 &gt; limit</text>
+
+        <path class="wire" d="M382 292 L648 292" marker-end="url(#testing-m3)"/>
+        <text class="t-sm" x="515" y="284" text-anchor="middle">0 rows: budget exhausted</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 12.2</b> Why the budget holds under concurrency. The row lock serialises the two updates, and the re-check after the wait sees A's committed reservation. A mock has neither.</figcaption>
+  </figure>
+
+  <h4>The queue concurrency test</h4>
+  <p>The queue promises that concurrent workers never claim the same job and never leave one behind. The test commits 1,000 jobs, releases 4 workers at the same moment, each on its own connection, and lets them drain the queue as fast as they can. Each job's handler records that it ran by inserting a row into a <code>runs</code> table.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 760 400" role="img" aria-label="Design of the queue concurrency test. A jobs table holds 1,000 queued rows, committed before the start. Four workers, each on its own connection and started together, claim jobs with FOR UPDATE SKIP LOCKED. Each execution writes a row of job_id and worker_id into a runs table. After all workers stop, the assertions are that count of runs and count of distinct job ids are both 1,000, and that no job is still queued or running.">
+        <defs>
+          <marker id="testing-m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+          <marker id="testing-m2acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <text class="t-sm" x="370" y="24" text-anchor="middle">started together, each on its own connection</text>
+        <text class="t-mono" x="110" y="98" text-anchor="middle">FOR UPDATE SKIP LOCKED</text>
+        <rect class="bx-pg" x="20" y="110" width="180" height="116" rx="8"/>
+        <text class="t-head" x="110" y="140" text-anchor="middle">jobs</text>
+        <text class="t-sm" x="110" y="162" text-anchor="middle">1,000 rows, queued</text>
+        <text class="t-sm" x="110" y="180" text-anchor="middle">committed before start</text>
+
+        <rect class="bx" x="290" y="40" width="160" height="46" rx="7"/>
+        <text class="t-head" x="370" y="60" text-anchor="middle">Worker 1</text>
+        <text class="t-sm" x="370" y="77" text-anchor="middle">own connection</text>
+        <rect class="bx" x="290" y="108" width="160" height="46" rx="7"/>
+        <text class="t-head" x="370" y="128" text-anchor="middle">Worker 2</text>
+        <text class="t-sm" x="370" y="145" text-anchor="middle">own connection</text>
+        <rect class="bx" x="290" y="176" width="160" height="46" rx="7"/>
+        <text class="t-head" x="370" y="196" text-anchor="middle">Worker 3</text>
+        <text class="t-sm" x="370" y="213" text-anchor="middle">own connection</text>
+        <rect class="bx" x="290" y="244" width="160" height="46" rx="7"/>
+        <text class="t-head" x="370" y="264" text-anchor="middle">Worker 4</text>
+        <text class="t-sm" x="370" y="281" text-anchor="middle">own connection</text>
+
+        <path class="wire-acc" d="M200 150 L288 63" marker-end="url(#testing-m2acc)"/>
+        <path class="wire-acc" d="M200 160 L288 131" marker-end="url(#testing-m2acc)"/>
+        <path class="wire-acc" d="M200 176 L288 199" marker-end="url(#testing-m2acc)"/>
+        <path class="wire-acc" d="M200 190 L288 267" marker-end="url(#testing-m2acc)"/>
+
+        <rect class="bx" x="540" y="110" width="200" height="116" rx="8"/>
+        <text class="t-head" x="640" y="140" text-anchor="middle">runs</text>
+        <text class="t-sm" x="640" y="162" text-anchor="middle">one row per execution</text>
+        <text class="t-mono" x="640" y="182" text-anchor="middle">(job_id, worker_id)</text>
+        <path class="wire" d="M450 63 L538 150" marker-end="url(#testing-m2)"/>
+        <path class="wire" d="M450 131 L538 160" marker-end="url(#testing-m2)"/>
+        <path class="wire" d="M450 199 L538 176" marker-end="url(#testing-m2)"/>
+        <path class="wire" d="M450 267 L538 190" marker-end="url(#testing-m2)"/>
+
+        <path class="wire-dash" d="M640 226 L640 314" marker-end="url(#testing-m2)"/>
+        <rect class="bx-ok" x="20" y="316" width="720" height="70" rx="8"/>
+        <text class="t-head" x="380" y="340" text-anchor="middle">Assertions after every worker has stopped</text>
+        <text class="t-mono" x="380" y="361" text-anchor="middle">SELECT count(*), count(DISTINCT job_id) FROM runs  →  1000, 1000</text>
+        <text class="t-sm" x="380" y="378" text-anchor="middle">and no row in jobs is still queued or running</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 12.3</b> The queue concurrency test. <code>runs</code> deliberately has no unique constraint, so a double claim shows up as a duplicate row instead of being hidden by an error.</figcaption>
+  </figure>
+<pre><code>async def test_each_job_runs_exactly_once(dsn):
+    await seed_jobs(dsn, count=1000)                     <span class="c"># committed before any worker starts</span>
+    start = asyncio.Event()
+
+    async def worker(name):
+        async with await psycopg.AsyncConnection.connect(dsn) as conn:   <span class="c"># own connection</span>
+            await start.wait()
+            while jobs := await claim(conn, worker_id=name, batch=10):
+                for job in jobs:
+                    await record_run(conn, job.id, name)
+                    await complete(conn, job.id)
+
+    tasks = [asyncio.create_task(worker(f"w{i}")) for i in range(4)]
+    start.set()                                          <span class="c"># release all four at once</span>
+    await asyncio.gather(*tasks)
+
+    total, distinct = await fetch_one(dsn, "SELECT count(*), count(DISTINCT job_id) FROM runs")
+    assert <span class="hl">(total, distinct) == (1000, 1000)</span></code></pre>
+  <ul>
+    <li><b><code>count(*)</code> above 1,000</b> means some job ran twice, so two workers claimed it. A claim with no row locking fails here.</li>
+    <li><b><code>count(DISTINCT job_id)</code> below 1,000</b> means a job was skipped.</li>
+  </ul>
+  <p>A claim with <code>FOR UPDATE</code> but without <code>SKIP LOCKED</code> passes, because workers queue behind each other's locks instead of colliding. That defect shows up only as slowness, which is why the load test measures claim latency too.</p>
+
+  <h4>Lease recovery and leader handover</h4>
+  <p>The <b>lease-recovery test</b> imitates a dead worker. Worker A claims a job (<code>attempts = 1</code>) and stops without heartbeating or finishing.</p>
+  <ol>
+    <li>The test moves <code>lease_expires_at</code> into the past with a direct <code>UPDATE</code>, instead of sleeping for the 60-second lease.</li>
+    <li>It runs the reaper. The job goes back to <code>queued</code> with a backoff <code>run_at</code>, and <code>attempts</code> stays at 1, because the crashed run counts.</li>
+    <li>It moves <code>run_at</code> to now, and worker B claims the same job with <code>attempts = 2</code>.</li>
+    <li>Worker A tries to finish. Its <code>UPDATE … WHERE locked_by = $me AND state = 'running'</code> matches no row, so A discards its result.</li>
+  </ol>
+  <p>Two variants complete it. A reaper run while the lease is valid reclaims nothing, and a job already at <code>max_attempts</code> goes to <code>dead</code> with a <code>dead_letters</code> row.</p>
+  <p>The <b>leader-handover test</b> checks the scheduler's advisory lock. Connection A's <code>pg_try_advisory_lock(k)</code> returns <code>true</code> and B's returns <code>false</code>. The test closes A, or kills it with <code>pg_terminate_backend</code>, and asserts that B's next attempt returns <code>true</code>, because a session-level lock is released when its session ends.</p>
+
+  <h4>The 20-task budget test</h4>
+  <p>Stage 3's definition of done names this test. Spend must never exceed the limit with 20 parallel jobs, each on its own connection, reserving at the same moment.</p>
+  <div class="note example"><span class="label">Worked example</span>
+    <p>The user's <code>monthly_budget_micros</code> is 1,000,000 ($1.00), and this month has no <code>usage_periods</code> row yet. Each task reserves 100,000 ($0.10) and, if it wins, settles for exactly that.</p>
+    <ol>
+      <li>All 20 run <code>INSERT … ON CONFLICT DO NOTHING</code>. One creates the month's row, and the others wait for its commit and then do nothing.</li>
+      <li>All 20 conditional <code>UPDATE</code>s arrive together, and the row lock lets one through at a time.</li>
+      <li>The first ten see totals of 0 up to 900,000, so each fits, gets a row back and inserts its <code>budget_reservations</code> row.</li>
+      <li>The eleventh sees 1,000,000, its <code>WHERE</code> is false, and so is every later one.</li>
+      <li>The test asserts 10 winners, <code>spent_micros</code> = 1,000,000, <code>reserved_micros</code> = 0 and 10 settled reservations.</li>
+    </ol>
+    <p>Settling for exactly the estimate keeps the winner count independent of timing, so the assertion is exact.</p>
+  </div>
+  <p>A version that reads the total in Python and then writes would let several tasks read 900,000 at once and all decide they fit. Against a mock that passes. Against Postgres it fails, which is the point.</p>
+
+  <h3>Keeping tests isolated with a rolled-back transaction</h3>
+  <p>Most integration tests run inside a <b>transaction-rollback fixture</b>, a pytest fixture that opens a connection, begins a transaction, hands it to the test and rolls it back afterwards. Nothing is committed, so every test starts from the same clean database, and a rollback is far faster than deleting rows.</p>
+<pre><code>@pytest.fixture
+async def conn(engine):                       <span class="c"># needs an async pytest plugin, such as pytest-asyncio</span>
+    async with engine.connect() as conn:
+        trans = await conn.begin()
+        yield conn                            <span class="c"># the test runs inside this transaction</span>
+        await <span class="hl">trans.rollback()</span></code></pre>
+  <p>If the code under test calls <code>commit()</code>, the fixture turns those commits into savepoints, which SQLAlchemy supports directly.</p>
+  <p>The concurrency tests can't use the fixture. Uncommitted rows are invisible to other connections, so four workers would find an empty queue, and the budget test depends on one transaction committing while another waits. These tests use separate connections, commit for real and truncate their tables afterwards.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 760 300" role="img" aria-label="Two panels. Left, the rollback fixture used by most tests: BEGIN, the test runs on one connection, then ROLLBACK, so nothing is committed and each test starts clean. Right, concurrency tests with real commits: setup inserts jobs and commits, four connections each work and commit, then cleanup truncates the tables and commits. A note explains that rows inside an open transaction are invisible to other connections and the code under test must commit its claims.">
+        <defs>
+          <marker id="testing-m4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <text class="t-head" x="190" y="24" text-anchor="middle">Rollback fixture: most tests</text>
+        <rect class="bx" x="40" y="44" width="300" height="36" rx="7"/>
+        <text x="190" y="67" text-anchor="middle">BEGIN (fixture)</text>
+        <rect class="bx" x="40" y="96" width="300" height="36" rx="7"/>
+        <text x="190" y="119" text-anchor="middle">test runs on this one connection</text>
+        <rect class="bx-ok" x="40" y="148" width="300" height="36" rx="7"/>
+        <text x="190" y="171" text-anchor="middle">ROLLBACK (fixture)</text>
+        <path class="wire" d="M190 80 L190 94" marker-end="url(#testing-m4)"/>
+        <path class="wire" d="M190 132 L190 146" marker-end="url(#testing-m4)"/>
+        <text class="t-sm" x="190" y="206" text-anchor="middle">Nothing is committed, so every test</text>
+        <text class="t-sm" x="190" y="222" text-anchor="middle">starts from the same clean state.</text>
+
+        <text class="t-head" x="570" y="24" text-anchor="middle">Concurrency tests: real commits</text>
+        <rect class="bx" x="420" y="44" width="300" height="36" rx="7"/>
+        <text x="570" y="67" text-anchor="middle">setup: insert jobs, COMMIT</text>
+        <rect class="bx-pg" x="420" y="96" width="66" height="36" rx="7"/>
+        <text class="t-sm" x="453" y="118" text-anchor="middle">conn 1</text>
+        <rect class="bx-pg" x="498" y="96" width="66" height="36" rx="7"/>
+        <text class="t-sm" x="531" y="118" text-anchor="middle">conn 2</text>
+        <rect class="bx-pg" x="576" y="96" width="66" height="36" rx="7"/>
+        <text class="t-sm" x="609" y="118" text-anchor="middle">conn 3</text>
+        <rect class="bx-pg" x="654" y="96" width="66" height="36" rx="7"/>
+        <text class="t-sm" x="687" y="118" text-anchor="middle">conn 4</text>
+        <rect class="bx-ok" x="420" y="148" width="300" height="36" rx="7"/>
+        <text x="570" y="171" text-anchor="middle">clean up: TRUNCATE, COMMIT</text>
+        <path class="wire" d="M453 80 L453 94" marker-end="url(#testing-m4)"/>
+        <path class="wire" d="M531 80 L531 94" marker-end="url(#testing-m4)"/>
+        <path class="wire" d="M609 80 L609 94" marker-end="url(#testing-m4)"/>
+        <path class="wire" d="M687 80 L687 94" marker-end="url(#testing-m4)"/>
+        <path class="wire" d="M453 132 L453 146" marker-end="url(#testing-m4)"/>
+        <path class="wire" d="M531 132 L531 146" marker-end="url(#testing-m4)"/>
+        <path class="wire" d="M609 132 L609 146" marker-end="url(#testing-m4)"/>
+        <path class="wire" d="M687 132 L687 146" marker-end="url(#testing-m4)"/>
+        <text class="t-sm" x="570" y="206" text-anchor="middle">Each worker must see committed rows</text>
+        <text class="t-sm" x="570" y="222" text-anchor="middle">and commit its own claims.</text>
+
+        <rect class="bx-bad" x="40" y="240" width="680" height="48" rx="7"/>
+        <text class="t-sm" x="380" y="259" text-anchor="middle">Why not the fixture: rows inside an open transaction are invisible to other connections,</text>
+        <text class="t-sm" x="380" y="276" text-anchor="middle">and the code under test must COMMIT its claims for the queue to behave as it does in production.</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 12.4</b> The fixture buys speed and isolation by never committing. Concurrency tests need commits that other connections can see, so they give up the fixture and clean up explicitly.</figcaption>
+  </figure>
+  <p>The same integration layer also covers:</p>
+  <ul>
+    <li><b>Migrations.</b> Every migration runs against an empty database, and the schema Alembic produces must match the table definitions in code.</li>
+    <li><b>Races on unique keys.</b> Two enqueues with the same dedupe key, and the dedup constraints on articles.</li>
+    <li><b>The host limiter.</b> Concurrent slot requests to one host stay at least <code>min_interval</code> apart.</li>
+    <li><b>Safe re-runs.</b> <code>run-daily</code> twice for the same date, where the second run makes 0 LLM calls and sends 0 deliveries.</li>
+    <li><b>The delivery state machine.</b> Every allowed transition, and every one that the guarded <code>UPDATE</code> must refuse.</li>
+    <li><b>The articles query plan.</b> <code>EXPLAIN</code> of <code>GET /v1/articles</code> on the seeded load-test data must show no sequential scan on <code>articles</code>.</li>
+  </ul>
+
+  <h3>API tests check the contract</h3>
+  <p>API tests use <code>httpx.AsyncClient</code> connected straight to the FastAPI app, with no server process or network port, and a real Postgres behind it.</p>
+<pre><code>async def test_auth_failures_are_indistinguishable(app, revoked_key, expired_key):
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        cases = [{}, {"Authorization": "Bearer bek_not_a_real_key"},
+                 {"Authorization": f"Bearer {revoked_key}"},
+                 {"Authorization": f"Bearer {expired_key}"}]
+        responses = [await client.get("/v1/me", headers=h) for h in cases]
+    assert <span class="hl">{r.status_code for r in responses} == {401}</span>
+    assert len({(r.json()["type"], r.json()["detail"]) for r in responses}) == 1</code></pre>
+  <p>The second assertion matters as much as the first. If a revoked key got a different message from an unknown one, an attacker could learn which keys once existed. The other API tests follow the plan's status codes:</p>
+  <ul>
+    <li><b>Scopes.</b> A <code>read</code> key calling <code>POST /v1/briefings</code> gets <code>403 insufficient-scope</code> with a <code>WWW-Authenticate</code> header.</li>
+    <li><b>Pagination.</b> Pages stay stable while rows are inserted, and a tampered cursor, or one reused with a different <code>min_score</code>, gets <code>400 invalid-cursor</code>.</li>
+    <li><b>Idempotency.</b> A replay gets <code>Idempotent-Replayed: true</code>, a reused key with another body gets <code>422</code>, and of two concurrent requests one runs and one gets <code>409</code>.</li>
+    <li><b>SSRF.</b> An internal URL on <code>POST /v1/subscriptions</code> gets <code>422 url-not-allowed</code> without naming the address.</li>
+    <li><b>Isolation, in stage 2.</b> A second user shares fetches with you but sees none of your data.</li>
+  </ul>
+
+  <h3>End to end with docker compose</h3>
+  <p>The end-to-end test runs a whole day with every part wired together as in production, and no external services. <code>docker compose</code> starts the app and local stand-ins on a private network, and the test passes when feeds become scores, a briefing, an email in Mailpit and a verified webhook.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 840 320" role="img" aria-label="End-to-end test setup inside docker compose. The app, running api and worker from one image, fetches from a fake feed server that serves fixtures and can return 304, 429 or 500, calls a fake Anthropic server that serves POST /v1/messages, stores data in a real Postgres 17, sends email over SMTP to Mailpit, and sends signed webhooks to a receiver that verifies signatures. Outside the compose network, the pytest end-to-end test starts run-daily, reads the inbox through Mailpit's HTTP API and reads the events the webhook receiver recorded.">
+        <defs>
+          <marker id="testing-m5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+          <marker id="testing-m5acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <text class="t-sm" x="30" y="28">docker compose</text>
+        <rect class="bx-ghost" x="20" y="36" width="600" height="264" rx="10"/>
+
+        <rect class="bx" x="40" y="56" width="170" height="56" rx="7"/>
+        <text class="t-head" x="125" y="80" text-anchor="middle">Fake feed server</text>
+        <text class="t-sm" x="125" y="99" text-anchor="middle">fixtures; 304/429/500</text>
+        <rect class="bx" x="40" y="136" width="170" height="56" rx="7"/>
+        <text class="t-head" x="125" y="160" text-anchor="middle">Fake Anthropic</text>
+        <text class="t-mono" x="125" y="179" text-anchor="middle">POST /v1/messages</text>
+        <rect class="bx-pg" x="40" y="216" width="170" height="56" rx="7"/>
+        <text class="t-head" x="125" y="240" text-anchor="middle">Postgres 17</text>
+        <text class="t-sm" x="125" y="259" text-anchor="middle">real database</text>
+
+        <rect class="bx" x="250" y="126" width="150" height="76" rx="8"/>
+        <text class="t-head" x="325" y="156" text-anchor="middle">app</text>
+        <text class="t-sm" x="325" y="175" text-anchor="middle">api + worker</text>
+        <text class="t-mono" x="325" y="192" text-anchor="middle">one image</text>
+
+        <rect class="bx" x="430" y="56" width="170" height="56" rx="7"/>
+        <text class="t-head" x="515" y="80" text-anchor="middle">Mailpit</text>
+        <text class="t-sm" x="515" y="99" text-anchor="middle">SMTP in, HTTP API out</text>
+        <rect class="bx" x="430" y="136" width="170" height="56" rx="7"/>
+        <text class="t-head" x="515" y="160" text-anchor="middle">Webhook receiver</text>
+        <text class="t-sm" x="515" y="179" text-anchor="middle">verifies signatures</text>
+
+        <path class="wire" d="M250 140 L212 94" marker-end="url(#testing-m5)"/>
+        <path class="wire" d="M250 164 L212 164" marker-end="url(#testing-m5)"/>
+        <path class="wire" d="M250 190 L212 238" marker-end="url(#testing-m5)"/>
+        <path class="wire" d="M400 140 L428 94" marker-end="url(#testing-m5)"/>
+        <path class="wire" d="M400 164 L428 164" marker-end="url(#testing-m5)"/>
+
+        <rect class="bx-ok" x="700" y="56" width="120" height="216" rx="8"/>
+        <text class="t-head" x="760" y="150" text-anchor="middle">pytest</text>
+        <text class="t-sm" x="760" y="168" text-anchor="middle">e2e test</text>
+        <path class="wire-acc" d="M700 84 L602 84" marker-end="url(#testing-m5acc)"/>
+        <text class="t-sm" x="662" y="76" text-anchor="middle">reads inbox</text>
+        <path class="wire-acc" d="M700 164 L602 164" marker-end="url(#testing-m5acc)"/>
+        <text class="t-sm" x="662" y="156" text-anchor="middle">reads events</text>
+        <path class="wire-acc" d="M700 250 L325 250 L325 204" marker-end="url(#testing-m5acc)"/>
+        <text class="t-sm" x="520" y="242" text-anchor="middle">starts run-daily</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 12.5</b> The end-to-end environment. Every external dependency is local and controllable, and the app runs exactly as built. It reaches the fake Anthropic server through <code>ANTHROPIC_BASE_URL</code>.</figcaption>
+  </figure>
+  <ul>
+    <li><b>The fake feed server</b> serves fixture feeds and returns <code>304</code>, <code>429</code> or <code>500</code> on demand.</li>
+    <li><b>The fake Anthropic server</b> returns canned structured output, so the run is free and repeatable.</li>
+    <li><b>Mailpit</b> is a mail server built for testing. It accepts SMTP (port 1025 by default) and keeps every message, and the test reads both MIME parts back through its HTTP API (port 8025).</li>
+    <li><b>The webhook receiver</b> verifies each signature. Build it from the 15-line verifier in the docs, and the run also proves that verifier agrees with your signer.</li>
+  </ul>
+
+  <h3>The live smoke test and its $0.10 cap</h3>
+  <p>Every other test uses a fake Anthropic API, so something must notice when the real one changes, as it did in Horizon's first bug when the API began rejecting <code>temperature</code>. The <b>live smoke test</b> scores 5 real articles against the real API and checks that the output still matches the schema.</p>
+  <p>It runs nightly and by hand and never on pull requests, so CI stays free, deterministic and independent of Anthropic's availability. Its $0.10 cap is enforced twice:</p>
+  <ol>
+    <li><b>By Anthropic.</b> The test uses its own API key in a separate Anthropic Console workspace, with a workspace spend limit set by hand. That's the hard backstop, and it doesn't depend on your code being correct.</li>
+    <li><b>By your own budget code.</b> The test runs as the system user with <code>purpose = 'smoke'</code> and a dedicated budget of 100,000 µ$, through the normal reservation path. Every call is small (<code>max_tokens = 1024</code>).</li>
+  </ol>
+
+  <h3>Load tests with k6</h3>
+  <p>The stage 3 target is a p95 under 150 ms for <code>GET /v1/briefings/{id}</code> and <code>GET /v1/articles</code>, each, at a sustained 50 requests per second on a <code>db.t4g.micro</code>, with no dropped iterations. The seeded data set has 100 users, 200 sources and 500,000 articles. <code>k6</code> is a load-testing tool scripted in JavaScript.</p>
+<pre><code>import http from 'k6/http';
+import { check } from 'k6';
+
+const seed = JSON.parse(open('./seed.json'));   <span class="c">// API keys and briefing ids of the seeded users</span>
+
+export const options = {
+  scenarios: {
+    reads: {
+      executor: <span class="hl">'constant-arrival-rate'</span>,
+      rate: 50, timeUnit: '1s', duration: '10m',   <span class="c">// 50 new requests every second</span>
+      preAllocatedVUs: 50, maxVUs: 200,            <span class="c">// the pool k6 draws from, not the load</span>
+    },
+  },
+  thresholds: {
+    'http_req_duration{endpoint:articles}': ['p(95)&lt;150'],
+    'http_req_duration{endpoint:briefing}': ['p(95)&lt;150'],
+    dropped_iterations: ['count==0'],             <span class="c">// fail if k6 couldn't keep up the rate</span>
+  },
+};
+
+export default function () {
+  const user = seed.users[Math.floor(Math.random() * seed.users.length)];
+  const headers = { Authorization: `Bearer ${user.key}` };
+  const res = Math.random() &lt; 0.7                 <span class="c">// 70% articles, 30% one briefing</span>
+    ? http.get(`${__ENV.BASE_URL}/v1/articles?limit=50`, { headers, tags: { endpoint: 'articles' } })
+    : http.get(`${__ENV.BASE_URL}/v1/briefings/${user.briefing_id}`, { headers, tags: { endpoint: 'briefing' } });
+  check(res, { 'status is 200': (r) =&gt; r.status === 200 });
+}</code></pre>
+  <p>The executor is the important choice. In a closed-loop test, each virtual user waits for a response before sending again, so a slowing server receives fewer requests and looks faster than it is. This trap is called <b>coordinated omission</b>. <code>constant-arrival-rate</code> starts 50 requests a second whatever the response time, and <code>dropped_iterations</code> fails the run if k6 falls behind.</p>
+  <ul>
+    <li><b>k6 runs in AWS</b>, from an ECS task in the same region, so home-broadband latency isn't in the figures. Results are cross-checked against the ALB's <code>TargetResponseTime</code>.</li>
+    <li><b>The pipeline is tested separately.</b> A synthetic feed server and the fake Anthropic server drive the queue at 10 and 100 times the expected volume. A p95 claim time over 50 ms is the signal to move the <code>deliver</code> queue to SQS.</li>
+  </ul>
+
+  <h3>What runs when in CI</h3>
+  <p>GitHub Actions runs four kinds of workflow. Every check that can run without AWS or a paid API runs on every pull request, and all of them must pass to merge.</p>
+  <figure>
+    <div class="tbl"><table>
+      <thead><tr><th>Trigger</th><th>Jobs</th><th>Gate</th></tr></thead>
+      <tbody>
+        <tr><td>Every pull request</td><td><code>ruff</code> (lint and format), <code>mypy --strict</code> on <code>src/</code>, the <code>|safe</code> lint, <code>pip-audit</code>; unit, HTTP-mock, in-process LLM-fake and golden-file tests; integration and API tests against a Postgres 17 service container; a Docker build; end-to-end as a separate job</td><td>All required to merge</td></tr>
+        <tr><td>Push to <code>main</code></td><td>All of the above, then in stage 2 push the image to ECR and deploy through the <code>production</code> environment</td><td>The deploy waits for approval</td></tr>
+        <tr><td>Nightly (cron)</td><td>Live smoke test; <code>pip-audit</code> against fresh advisories</td><td>Alerts only</td></tr>
+        <tr><td>Manual (<code>workflow_dispatch</code>)</td><td>Load test and outage drills against AWS</td><td>Results committed as reports</td></tr>
+      </tbody>
+    </table></div>
+    <figcaption><b>Figure 12.6</b> The trigger table from plan §10.</figcaption>
+  </figure>
+  <p>Two checks are less obvious. The <b><code>|safe</code> lint</b> is a grep over <code>*.html</code> templates that keeps feed and model text escaped. <b><code>pip-audit</code></b> runs again nightly, because new advisories appear without any code change.</p>
+  <p>The end-to-end job adds about 4 minutes to each pull request, and on a private repo those minutes count against GitHub's free monthly allowance. The plan proposes keeping it on every pull request, with running it only on <code>main</code> and nightly as the alternative. That decision is still open (Q15).</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 860 336" role="img" aria-label="CI pipeline. On every pull request, and again on push to main, the checks are ruff check and format, mypy strict on src, the safe-filter lint, pip-audit, a Docker build, unit tests with mocks, fakes and golden files, integration and API tests against a Postgres 17 service container, and end-to-end tests as a separate job. On push to main in stage 2, after the same checks, the deploy job waits for approval in the production environment, which allows only the main branch. It then builds the image tagged with the git SHA and pushes it to ECR, runs briefing migrate as a one-off ECS task, rolls out the api and worker services with a circuit breaker, and finally checks readyz on the new tasks.">
+        <defs>
+          <marker id="testing-m6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+          <marker id="testing-m6acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="20" y="36" width="820" height="120" rx="8"/>
+        <text class="t-head" x="36" y="58">Every pull request, all required to merge (and again on push to main)</text>
+        <rect class="bx" x="36" y="70" width="145" height="26" rx="5"/>
+        <text class="t-mono" x="108" y="87" text-anchor="middle">ruff check + format</text>
+        <rect class="bx" x="193" y="70" width="140" height="26" rx="5"/>
+        <text class="t-mono" x="263" y="87" text-anchor="middle">mypy --strict src/</text>
+        <rect class="bx" x="345" y="70" width="90" height="26" rx="5"/>
+        <text class="t-mono" x="390" y="87" text-anchor="middle">|safe lint</text>
+        <rect class="bx" x="447" y="70" width="90" height="26" rx="5"/>
+        <text class="t-mono" x="492" y="87" text-anchor="middle">pip-audit</text>
+        <rect class="bx" x="549" y="70" width="105" height="26" rx="5"/>
+        <text class="t-mono" x="601" y="87" text-anchor="middle">docker build</text>
+        <rect class="bx" x="36" y="104" width="190" height="26" rx="5"/>
+        <text class="t-mono" x="131" y="121" text-anchor="middle">unit, mocks, fakes, golden</text>
+        <rect class="bx-pg" x="238" y="104" width="175" height="26" rx="5"/>
+        <text class="t-mono" x="325" y="121" text-anchor="middle">integration + API tests</text>
+        <rect class="bx" x="425" y="104" width="185" height="26" rx="5"/>
+        <text class="t-mono" x="517" y="121" text-anchor="middle">end-to-end (own job)</text>
+        <text class="t-sm" x="36" y="146">Integration and API tests use a Postgres 17 service container; end-to-end uses docker compose.</text>
+
+        <path class="wire-acc" d="M90 156 L90 206" marker-end="url(#testing-m6acc)"/>
+        <text class="t-head" x="110" y="188">On push to main, after the same checks (stage 2)</text>
+
+        <rect class="bx-pg" x="20" y="208" width="150" height="70" rx="7"/>
+        <text class="t-head" x="95" y="232" text-anchor="middle">Approval</text>
+        <text class="t-sm" x="95" y="252" text-anchor="middle">production environment</text>
+        <text class="t-sm" x="95" y="268" text-anchor="middle">main branch only</text>
+        <rect class="bx" x="187" y="208" width="150" height="70" rx="7"/>
+        <text class="t-head" x="262" y="232" text-anchor="middle">Build and push</text>
+        <text class="t-sm" x="262" y="252" text-anchor="middle">git SHA tag</text>
+        <text class="t-sm" x="262" y="268" text-anchor="middle">pushed to ECR</text>
+        <rect class="bx-pg" x="354" y="208" width="150" height="70" rx="7"/>
+        <text class="t-head" x="429" y="232" text-anchor="middle">Migrate</text>
+        <text class="t-mono" x="429" y="252" text-anchor="middle">briefing migrate</text>
+        <text class="t-sm" x="429" y="268" text-anchor="middle">one-off ECS task</text>
+        <rect class="bx" x="521" y="208" width="150" height="70" rx="7"/>
+        <text class="t-head" x="596" y="232" text-anchor="middle">Roll out</text>
+        <text class="t-sm" x="596" y="252" text-anchor="middle">api and worker</text>
+        <text class="t-sm" x="596" y="268" text-anchor="middle">circuit breaker</text>
+        <rect class="bx-ok" x="688" y="208" width="150" height="70" rx="7"/>
+        <text class="t-head" x="763" y="232" text-anchor="middle">Final gate</text>
+        <text class="t-mono" x="763" y="252" text-anchor="middle">/readyz</text>
+        <text class="t-sm" x="763" y="268" text-anchor="middle">on the new tasks</text>
+        <path class="wire" d="M170 243 L185 243" marker-end="url(#testing-m6)"/>
+        <path class="wire" d="M337 243 L352 243" marker-end="url(#testing-m6)"/>
+        <path class="wire" d="M504 243 L519 243" marker-end="url(#testing-m6)"/>
+        <path class="wire" d="M671 243 L686 243" marker-end="url(#testing-m6)"/>
+
+        <text class="t-sm" x="20" y="304">AWS credentials come from GitHub OIDC. The deploy role trusts only jobs in the production environment.</text>
+        <text class="t-sm" x="20" y="322">Nightly: live smoke test and pip-audit, alerts only. Manual: load test and outage drills.</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 12.7</b> The pull-request checks and the stage 2 deploy. Migrations run before new code starts and are backward-compatible by policy, so rolling the code back stays safe.</figcaption>
+  </figure>
+
+  <h3>Regression tests for the three Horizon bugs</h3>
+  <p>A <b>regression test</b> reproduces a bug that has already happened, so it can't come back unnoticed. Stage 1's definition of done requires one for each Horizon bug class, passing in CI, and each sits in the layer that can actually observe the failure.</p>
+  <figure>
+    <div class="tbl"><table>
+      <thead><tr><th>Horizon bug</th><th>What went wrong</th><th>Regression test</th><th>Layer</th></tr></thead>
+      <tbody>
+        <tr><td>#1 <code>temperature</code> rejected</td><td>The API rejected the parameter, and the fallback matched on message text and didn't recognise the error</td><td>Capture the outgoing request through the fake and assert it has no <code>temperature</code>, <code>top_p</code> or <code>top_k</code>. Errors are classified by SDK exception type and status code, never by message text.</td><td>LLM fake, unit</td></tr>
+        <tr><td>#2 Reddit <code>429</code> bursts</td><td>Two subreddit feeds hit the same host in the same minute</td><td>A <code>429</code> with <code>Retry-After</code> sets <code>hosts.blocked_until</code>, and no request goes out before it. Concurrent slot requests to one host stay at least <code>min_interval</code> apart.</td><td><code>respx</code>, integration</td></tr>
+        <tr><td>#3 Double escaping</td><td>Two layers escaped the same text, so apostrophes showed as <code>&amp;#x27;</code></td><td>Golden-file render of hostile fixtures, failing on <code>&amp;amp;amp;</code> and on a raw <code>&lt;script&gt;</code>. Both templates render one fixture, and <code>&amp;</code> must be <code>&amp;amp;</code> in HTML and <code>&amp;</code> in text.</td><td>Golden file</td></tr>
+      </tbody>
+    </table></div>
+    <figcaption><b>Figure 12.8</b> Each real failure becomes a permanent test, so you can say that the design came from real incidents and each one is guarded.</figcaption>
+  </figure>
+
+  <h3>Coverage is a gate on the core packages</h3>
+  <p><b>Coverage</b> measures which lines ran during the tests. The plan makes it a gate where the risky logic lives. <code>ingest/</code>, <code>llm/</code>, <code>queue/</code> and <code>delivery/</code> together must reach 85% line coverage, or the pull request fails.</p>
+<pre><code>coverage report --include='src/briefing_engine/{ingest,llm,queue,delivery}/*' --fail-under=85</code></pre>
+  <p>Project-wide coverage is reported but not enforced. A project-wide target invites tests written for the number, on CLI argument parsing or config loading, while the code that matters stays thin.</p>
+  <div class="note pitfall"><span class="label">Common mistake</span><p>Treating coverage as proof of correctness. Coverage records that a line ran, not that its behaviour was checked. The queue's claim is one SQL statement, so a single-worker test covers it fully, yet only the four-worker test shows it's correct under concurrency.</p></div>
+
+  <div class="try">
+    <span class="label">Try it: watch hypothesis find and shrink a bug</span>
+    <ol>
+      <li>Install <code>pytest</code> and <code>hypothesis</code>, and save this as <code>test_shrink.py</code>:
+<pre><code>from hypothesis import given, strategies as st
+
+def normalise(path: str) -&gt; str:
+    return path.replace("//", "/")            <span class="c"># looks idempotent, isn't</span>
+
+@given(st.text(alphabet="/a"))
+def test_idempotent(path):
+    assert normalise(normalise(path)) == normalise(path)</code></pre></li>
+      <li>Run <code>pytest test_shrink.py</code>.</li>
+    </ol>
+    <p>The test fails, and hypothesis reports a very short counterexample, typically <code>path='///'</code>. One pass turns three slashes into two and a second pass turns two into one, so the function changes its own output. Hypothesis found a longer failing string first and shrank it to this minimal case.</p>
+  </div>
+
+  <div class="try">
+    <span class="label">Try it: a leader handover by hand</span>
+    <ol>
+      <li>Start a throwaway Postgres: <code>docker run --rm -e POSTGRES_PASSWORD=dev -p 5432:5432 postgres:17</code>.</li>
+      <li>Open two <code>psql</code> windows. In the first, run <code>SELECT pg_try_advisory_lock(42);</code>.</li>
+      <li>Run the same query in the second window.</li>
+      <li>Quit the first window with <code>\q</code>, and run the query again in the second.</li>
+    </ol>
+    <p>The first window gets <code>t</code>, the second gets <code>f</code>, and after the first quits the second gets <code>t</code>. The lock belongs to a session and is released the moment the session ends, whether by a clean exit or a crash. The leader-handover test automates exactly this.</p>
+  </div>
+
+  <div class="ask">
+    <span class="label">If an interviewer asks</span>
+    <p class="q">"How do you know your queue never runs a job twice?"</p>
+    <p>"It can, by design. If a lease expires while a slow worker is still going, the job runs again, so the guarantee is at-least-once. Against a real Postgres I test that 1,000 jobs across 4 concurrent workers each run exactly once, using a results table with no unique constraint so a double claim shows as a duplicate row. Another test kills a worker and checks that the job is reclaimed and the old worker's late result discarded. Idempotent jobs make the rare duplicate harmless."</p>
+    <p class="q">"Why not mock the database to make the tests faster?"</p>
+    <p>"For pure logic I do. But <code>SKIP LOCKED</code>, unique indexes, the conditional budget update and advisory locks are Postgres behaviour, and a mock would only replay my assumptions. Those tests run against Postgres 17, most inside a rolled-back transaction, and the concurrency ones on separate connections with real commits."</p>
+    <p class="q">"Your product calls an LLM. How do you keep CI deterministic?"</p>
+    <p>"Pull requests never call the real API. Unit and integration tests use an in-process fake, and end-to-end runs a fake Anthropic server, so the real SDK wrapper and retry path still run. A nightly smoke test scores 5 real articles, capped at ten cents by a workspace spend limit and by my own budget code."</p>
+  </div>
+  <label class="got"><input type="checkbox" id="got-testing" data-ch="testing"> I can explain this</label>
+</section>

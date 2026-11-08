@@ -1,0 +1,108 @@
+<!-- ============================================================ -->
+<section class="ch" id="start">
+  <div class="ch-head"><span class="ch-num">Introduction</span><span class="plan-ref">plan §1, §2, §14</span><h2>The briefing engine</h2></div>
+  <p>Every morning at 06:30, an email arrives in your inbox with the day's most relevant AI and technology news, ranked and summarised. At the moment that email is produced by Horizon, an open-source news aggregator that runs on your own machine as a Windows scheduled task. The briefing engine is its replacement: a service written from scratch that does the same job for any number of users, and does it in a way that you can explain and defend line by line.</p>
+
+  <h3>Where the project comes from</h3>
+  <p>Horizon reads 14 RSS feeds and the Hacker News top stories with a score of at least 100. It asks <code>claude-sonnet-5-5</code> to score each item under two profiles, <code>ai-news</code> with a threshold of 6.0 and <code>tech-blog</code> with a threshold of 5.0, extracts the full text of some articles with trafilatura, and sends the result over SMTP. It works well, but it is mostly configuration, and getting it to run reliably exposed three bugs that you fixed upstream.</p>
+  <p>Each of those bugs revealed a design requirement that the briefing engine now takes as a starting point. Anthropic's API rejected the <code>temperature</code> parameter and Horizon's fallback did not recognise the error, which showed that the system should send only the parameters the API needs and should sort errors by kind instead of matching message text. Reddit's RSS endpoint returned <code>429 Too Many Requests</code> when requests arrived in bursts, which showed the need for per-host rate limits, respect for <code>Retry-After</code> and backoff with jitter. Finally, the email's HTML was escaped twice, so apostrophes appeared as <code>&amp;#x27;</code>, which showed that escaping must happen in exactly one place and be tested against known output.</p>
+
+  <h3>What the briefing engine does</h3>
+  <p>The service collects articles from a shared set of sources, judges each one against the interests of each user, and turns the best of them into a short written briefing. Figure 0.1 follows that journey from left to right.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 900 362" role="img" aria-label="Flow of a day's news through the briefing engine. Sources, made up of 14 RSS feeds and the Hacker News top stories, are shared by all users. The fetch stage sends conditional GET requests within per-host limits and removes duplicates by URL and content hash. The score stage uses Haiku 5.5 to score each article against each rubric and caches the result per rubric. The write-up stage ranks the best items and uses Sonnet 5.5 to write one summary per user per day. Each user supplies a rubric, a send time and a token budget, which feed into scoring and the write-up. The finished briefing is delivered by email by 06:30, by an HMAC-signed webhook, and through the REST API. Beneath every stage, PostgreSQL stores the articles, scores, briefings, job queue, rate limits and budgets, and every hand-off between stages is a row committed to it.">
+        <defs>
+          <marker id="start-a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+          <marker id="start-a1acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+
+        <!-- Per-user settings -->
+        <rect class="bx-ghost" x="380" y="20" width="330" height="44" rx="8"/>
+        <text class="t-head" x="396" y="47">Each user</text>
+        <text class="t-sm" x="482" y="47">rubric, send time, token budget</text>
+        <line class="wire" x1="455" y1="64" x2="455" y2="98" marker-end="url(#start-a1)"/>
+        <line class="wire" x1="635" y1="64" x2="635" y2="98" marker-end="url(#start-a1)"/>
+
+        <!-- Stages -->
+        <rect class="bx" x="20" y="100" width="150" height="100" rx="8"/>
+        <text class="t-head" x="95" y="128" text-anchor="middle">Sources</text>
+        <text class="t-sm" x="95" y="150" text-anchor="middle">14 RSS feeds</text>
+        <text class="t-sm" x="95" y="168" text-anchor="middle">HN top stories</text>
+        <text class="t-sm" x="95" y="186" text-anchor="middle">shared by all users</text>
+
+        <rect class="bx" x="200" y="100" width="150" height="100" rx="8"/>
+        <text class="t-head" x="275" y="128" text-anchor="middle">Fetch</text>
+        <text class="t-sm" x="275" y="150" text-anchor="middle">conditional GET</text>
+        <text class="t-sm" x="275" y="168" text-anchor="middle">per-host limits</text>
+        <text class="t-sm" x="275" y="186" text-anchor="middle">dedupe by URL, hash</text>
+
+        <rect class="bx" x="380" y="100" width="150" height="100" rx="8"/>
+        <text class="t-head" x="455" y="128" text-anchor="middle">Score</text>
+        <text class="t-sm" x="455" y="150" text-anchor="middle">Haiku 5.5</text>
+        <text class="t-sm" x="455" y="168" text-anchor="middle">against each rubric</text>
+        <text class="t-sm" x="455" y="186" text-anchor="middle">cached per rubric</text>
+
+        <rect class="bx" x="560" y="100" width="150" height="100" rx="8"/>
+        <text class="t-head" x="635" y="128" text-anchor="middle">Write up</text>
+        <text class="t-sm" x="635" y="150" text-anchor="middle">rank the best items</text>
+        <text class="t-sm" x="635" y="168" text-anchor="middle">Sonnet 5.5 summary</text>
+        <text class="t-sm" x="635" y="186" text-anchor="middle">per user, per day</text>
+
+        <line class="wire-acc" x1="170" y1="150" x2="198" y2="150" marker-end="url(#start-a1acc)"/>
+        <line class="wire-acc" x1="350" y1="150" x2="378" y2="150" marker-end="url(#start-a1acc)"/>
+        <line class="wire-acc" x1="530" y1="150" x2="558" y2="150" marker-end="url(#start-a1acc)"/>
+
+        <!-- Outputs -->
+        <rect class="bx-ok" x="745" y="78" width="135" height="56" rx="8"/>
+        <text class="t-head" x="812" y="101" text-anchor="middle">Email</text>
+        <text class="t-sm" x="812" y="119" text-anchor="middle">by 06:30</text>
+        <rect class="bx-ok" x="745" y="154" width="135" height="56" rx="8"/>
+        <text class="t-head" x="812" y="177" text-anchor="middle">Webhook</text>
+        <text class="t-sm" x="812" y="195" text-anchor="middle">HMAC signed</text>
+        <rect class="bx-ok" x="745" y="230" width="135" height="56" rx="8"/>
+        <text class="t-head" x="812" y="253" text-anchor="middle">REST API</text>
+        <text class="t-sm" x="812" y="271" text-anchor="middle">read at any time</text>
+        <path class="wire-acc" d="M710 140 L743 108" marker-end="url(#start-a1acc)"/>
+        <path class="wire-acc" d="M710 160 L743 182" marker-end="url(#start-a1acc)"/>
+        <path class="wire-acc" d="M710 190 L743 252" marker-end="url(#start-a1acc)"/>
+
+        <!-- Postgres band -->
+        <line class="wire-dash" x1="95" y1="200" x2="95" y2="260"/>
+        <line class="wire-dash" x1="275" y1="200" x2="275" y2="260"/>
+        <line class="wire-dash" x1="455" y1="200" x2="455" y2="260"/>
+        <line class="wire-dash" x1="635" y1="200" x2="635" y2="260"/>
+        <rect class="bx-pg" x="20" y="260" width="690" height="60" rx="8"/>
+        <text class="t-head" x="40" y="286">PostgreSQL</text>
+        <text class="t-sm" x="40" y="305">articles, scores, briefings, the job queue, rate limits and budgets</text>
+        <text class="t-sm" x="365" y="344" text-anchor="middle">Every hand-off between stages is a row committed to Postgres</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 0.1</b> How a day's news becomes a briefing. Sources and articles are shared between users, while rubrics, send times and budgets belong to each user.</figcaption>
+  </figure>
+
+  <p>The split between shared and personal data is what allows the service to grow. If two users follow the same feed, it is fetched once, and if they use the same rubric, each article is scored once. The cost of fetching and scoring therefore rises with the number of distinct sources and rubrics, and it stays roughly flat as more users subscribe to them.</p>
+  <p>The two models have different jobs. Claude Haiku 5.5 handles the high-volume work of scoring every new article, because that work needs to be fast and cheap. Claude Sonnet 5.5 writes the final summary, which happens only once per user each day and benefits from a stronger writer. Users interact with the service through a REST API and receive the result by email or, if they prefer, as a signed webhook that their own software can verify.</p>
+
+  <h3>What makes it a serious backend project</h3>
+  <p>A script that fetches feeds and calls a model would fill the inbox most mornings. The briefing engine is built to keep doing so when things go wrong, and that ambition shapes three ideas that run through the whole design.</p>
+  <p>The first idea is that PostgreSQL holds everything. The articles, scores and briefings live there, and so do the job queue, the rate-limit state and the budgets. Because all of this state shares one database, a step can record its result and schedule the next piece of work in a single transaction, so the system never ends up half updated after a crash.</p>
+  <p>The second idea is that every step is safe to repeat. Crashes, timeouts and retries mean that some work will inevitably run more than once, so each step is designed to produce the same result the second time. Re-running an entire day should send no duplicate email and cost close to nothing, because the expensive model calls are cached.</p>
+  <p>The third idea is that failure is planned for. Feeds go offline, hosts impose rate limits and models occasionally return output that cannot be used. The plan decides in advance how the system responds to each of these cases, and it keeps cost under control by recording every model call and, from stage 3, enforcing a budget for each user that concurrent jobs cannot overspend.</p>
+  <p>Some things are deliberately left out so that the project stays small enough to understand completely. There is no web interface, no self-service sign-up and no scraping of content that sites do not offer through their feeds. The service runs in a single AWS region without a high-availability guarantee, and the plan notes where a production system would differ.</p>
+
+  <h3>How it will be built</h3>
+  <p>The design is written down in <code>docs/plan.md</code> before any code exists. Two design reviews of an earlier revision found that it asked for too much before the first briefing could arrive, so the plan now follows one working rule: settle what the next step needs, and record later decisions without building them early.</p>
+  <p>The first stage, which replaces Horizon for your own briefing, is therefore built in four checkpoints. Each one ends in something you can run and inspect, so a problem can be traced to the layer just added.</p>
+  <ul>
+    <li><b>One complete briefing.</b> A single feed travels through the real job queue, is scored by Haiku with its cost recorded, and arrives as a simple email. You run it by hand.</li>
+    <li><b>Repeatable and recoverable.</b> The same narrow path learns to cache, deduplicate, retry and survive a worker being killed at chosen points, and re-running a day makes no model calls and sends nothing.</li>
+    <li><b>Your actual daily briefing.</b> All the feeds, both profiles, the Sonnet write-up and daily scheduling arrive, and the system handles your normal reading load for a week.</li>
+    <li><b>Horizon replacement.</b> The engine runs alongside Horizon for seven days. It is finished when the briefing has arrived by 06:30 on seven consecutive days at a quality you judge at least as good, and you switch Horizon off yourself.</li>
+  </ul>
+  <p>Reading quality is judged from the very first email. After each one you note what was useful, what was misleading or annoying, and one thing you would change, and those notes decide what to build next. Automated checks are added only when the notes show a problem that keeps recurring.</p>
+  <p>The second stage turns the engine into a multi-user service on AWS. Terraform creates the infrastructure from an empty account, a CI pipeline deploys it after your approval, and a second test user receives their own briefing while sharing fetches with you and seeing none of your data.</p>
+  <p>The third stage adds the features that make the design measurable: shared caching across users, enforced budgets, signed webhooks with retries, and a load test. It ends with a published case study that reports real numbers for cost per briefing, cache savings, API latency and recovery from deliberate outages.</p>
+  <p>All of this rests on a clear picture of how work moves through the system during a single day, which is where the explanation begins.</p>
+</section>

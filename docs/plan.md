@@ -1,8 +1,10 @@
 # briefing-engine: design plan
 
-**Status:** draft for review, revision 2. No code yet.
+**Status:** draft for review, revision 3. No code yet.
 **Author:** Simon O'Connor
-**Last updated:** 2026-11-08. Revision 2 settles 50 gaps found while writing the learning guide; see the [revision history](#17-revision-history).
+**Last updated:** 2026-11-08. Revision 3 splits stage 1 into four checkpoints, adds a reading-quality routine, and corrects the budget, rate-limit, score-input and subscription rules after two design reviews; see the [revision history](#17-revision-history).
+
+**Working rule (revision 3):** settle what the next checkpoint needs, and record later decisions without building them early. Mechanisms described in this plan for later checkpoints or stages are designs to be proved, not commitments for the first working version.
 
 This document comes before the code. Every section is a proposal: where a choice was made, the options and the reasoning are written down (see [Decision records](#15-decision-records)), and anything still undecided is listed under [Open questions](#16-open-questions).
 
@@ -54,7 +56,7 @@ Horizon is mostly configuration. This project is the replacement, written from s
 2. **Multi-user by design.** Sources and articles are shared. Rubrics, briefings, budgets and delivery settings belong to each user. Fetching and scoring scale with the number of distinct sources and rubrics, not with users × sources.
 3. **Be polite to upstream hosts.** Per-host rate limits, `Retry-After`, conditional requests, an identifying User-Agent.
 4. **Every step is idempotent.** Re-running any job, or a whole day, gives the same result, sends no duplicate email, and costs close to nothing.
-5. **Cost is a visible, controlled quantity.** Every LLM call is recorded with its token counts and cost. Each user has a budget that can't be exceeded, even under concurrency.
+5. **Cost is a visible, controlled quantity.** Every LLM call is recorded with its token counts and cost. Each user has a budget that concurrent jobs can't overspend, provided the per-call estimate is a true upper bound, which the ledger checks (§7.7). Spend whose outcome is unknown counts against the budget conservatively.
 6. **Measurable.** The system records the numbers the case study needs (§13) from day one.
 7. **Deployable from scratch** with one `terraform apply` and a CI pipeline, with no hand-configured AWS resources.
 
@@ -173,7 +175,7 @@ PostgreSQL 17. Ids are `bigint generated always as identity` for internal tables
 cost_micros = ceil_div(sum(tokens[t] * price_per_mtok_micros[t] for t in token_types), 1_000_000)
 ```
 
-A 451-token Haiku input costs 45.1 µ$ and is stored as 46. Rounding up keeps budgets conservative. Because it happens once per call, not once per token type, the bias is under 1 µ$ per call, roughly $0.0003 a day.
+A 451-token Haiku input costs 45.1 µ$ and is stored as 46. Rounding up keeps budgets conservative. Because it happens once per call, not once per token type, the bias is under 1 µ$ per call. At about 31 calls a day (30 score batches and one write-up) that is under $0.00004 a day.
 
 ### 4.1 Entity overview
 
@@ -214,7 +216,7 @@ erDiagram
 |---|---|---|
 | `hosts` | `host text PK`, `min_interval_ms int` (default 2000), `next_allowed_at timestamptz`, `blocked_until timestamptz` (from `Retry-After`), `notes` | One row per host. This is the shared state the per-host limiter works from (§6.2). |
 | `sources` | `id`, `kind` (`rss`, `atom`, `hn_top`), `url`, `url_normalised`, `host` FK, `extract_full_text bool`, `etag`, `last_modified`, `last_body_sha256`, `base_interval interval` (default 30 min), `fetch_interval interval`, `unchanged_count int`, `next_fetch_at`, `consecutive_failures int`, `status` (`active`, `paused`, `broken`) | `UNIQUE(url_normalised)`, so users who add the same feed share one source. Partial index `(next_fetch_at) WHERE status = 'active'`. |
-| `subscriptions` | `id uuid`, `user_id`, `source_id`, `profile_id`, `weight real default 1.0`, `created_at` | `UNIQUE(user_id, source_id)`; `INDEX(user_id, created_at, id)` for keyset pagination |
+| `subscriptions` | `id uuid`, `user_id`, `source_id`, `profile_id`, `weight real default 1.0`, `created_at` | `UNIQUE(profile_id, source_id)`, so one feed can feed several of a user's profiles but appears only once in each (revision 3; Horizon assigns each feed to one profile today, so the import is unaffected). Composite FK `(profile_id, user_id)` to `profiles(id, user_id)`, so a subscription can only point at its owner's profile. `INDEX(user_id, created_at, id)` for keyset pagination |
 | `fetch_log` | `id`, `source_id`, `started_at`, `attempt`, `status_code`, `conditional_sent bool`, `outcome` (`ok`, `not_modified`, `unchanged_body`, `retryable_error`, `fatal_error`, `rate_limited`), `retry_after_s`, `bytes`, `duration_ms`, `error` | `INDEX(source_id, started_at DESC)`; 30-day retention. Raw data for the metrics in §13. |
 
 **Articles and deduplication**
@@ -246,8 +248,8 @@ The deduplication rules (detail in §6.5):
 | `llm_writeups` | `cache_key bytea PK` (hash of the sorted input hashes, rubric hash, model and prompt version), `output jsonb`, `llm_call_id`, `created_at` | A write-up cache, so re-running a day is free. |
 | `llm_calls` | `id`, `user_id NOT NULL` (shared work is charged to the system user, never null), `reservation_id`, `purpose` (`score`, `writeup`, `enrich`, `eval`, `smoke`), `model`, `request_id`, `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`, `cost_micros`, `estimate_micros`, `latency_ms`, `outcome` (`ok`, `invalid_output`, `refusal`, `max_tokens`, `api_error`), `created_at` | `INDEX(user_id, created_at)`. One row per API call: the cost ledger. |
 | `llm_cache_hits` | `user_id`, `purpose`, `saved_cost_micros`, `created_at` | Append-only; can be rolled up by day. Records what each cache hit *would have* cost, which gives the "before caching" number in §13. |
-| `usage_periods` | `user_id`, `period_start date` (first of the month, in UTC), `limit_micros`, `reserved_micros`, `spent_micros` | `PRIMARY KEY(user_id, period_start)`; `CHECK (reserved_micros >= 0 AND spent_micros >= 0)`. The budget-enforcement row (§7.7). **Created lazily** by the first reservation of a month (`INSERT … ON CONFLICT DO NOTHING`, copying `limit_micros` from `users.monthly_budget_micros`). The CLI command `set-budget` updates both the user and the current month's row. |
-| `budget_reservations` | `id uuid`, `user_id`, `period_start`, `amount_micros`, `purpose`, `expires_at`, `settled_at NULL`, `released_at NULL` | Partial `INDEX(expires_at) WHERE settled_at IS NULL AND released_at IS NULL`. One row per reservation, so the reaper can release exactly the reservations that expired (§7.7). |
+| `usage_periods` | `user_id`, `period_start date` (first of the month, in UTC), `limit_micros`, `reserved_micros`, `spent_micros` (confirmed), `uncertain_micros` (estimated, outcome unknown; revision 3) | `PRIMARY KEY(user_id, period_start)`; `CHECK (reserved_micros >= 0 AND spent_micros >= 0 AND uncertain_micros >= 0)`. The budget-enforcement row (§7.7). **Created lazily** by the first reservation of a month (`INSERT … ON CONFLICT DO NOTHING`, copying `limit_micros` from `users.monthly_budget_micros`). The CLI command `set-budget` updates both the user and the current month's row. |
+| `budget_reservations` | `id uuid`, `user_id`, `period_start`, `amount_micros`, `purpose`, `expires_at`, `settled_at NULL`, `expired_at NULL` | Partial `INDEX(expires_at) WHERE settled_at IS NULL AND expired_at IS NULL`. One row per reservation, so the reaper can move exactly the reservations that expired into uncertain spend (§7.7). |
 
 **Briefings and delivery**
 
@@ -414,6 +416,12 @@ RETURNING next_allowed_at - make_interval(secs => min_interval_ms / 1000.0) AS m
 - If `my_slot <= now()`, fetch now.
 - If `my_slot` is in the future, **don't sleep while holding the job.** Store the slot in the job (`payload.host_slot = my_slot`), set `run_at = my_slot`, and release it as a **deferral** (§9.1: it uses up no attempt, and `deferrals` goes up by one). A worker never blocks on a slow host while other hosts are waiting.
 - **One ticket per request.** When a deferred job runs again and `now()` is within 30 s after its `host_slot`, it **uses that slot without running the `UPDATE` again**. Otherwise it would take a second slot, which is now later than the first because the first advanced `next_allowed_at`, and it would be deferred for ever. If the job is more than 30 s late (a worker backlog), the slot has gone and it takes a new ticket. A retry after a failed request is a new request, so it always takes a new ticket.
+
+> **Status (revision 3): open, Q16. Needed by checkpoint 1.2.** The ticket rule above can't guarantee the spacing it promises, because a slot is reserved when the job is deferred and the request is sent later. Two counterexamples from review: with a 10 s interval, jobs holding slots at 0, 10 and 20 s can all resume at 25 s inside the grace window and fire together; and even with the grace cut to the interval, a job with slot 0 starting at 9 s and a job with slot 10 starting at 10 s are one second apart. A shorter grace window reduces bunching but doesn't remove it.
+>
+> **Candidate fix:** claim at dispatch time, not at deferral time. Immediately before sending, a worker runs `UPDATE hosts SET next_allowed_at = now() + interval WHERE host = $1 AND next_allowed_at <= now() AND (blocked_until IS NULL OR blocked_until <= now()) RETURNING 1`. No row means the host is busy or blocked: the job defers to `next_allowed_at`, or to `blocked_until` if the host is blocked (plus a little jitter), without reserving anything, and tries again. Successful claims are then at least one interval apart, and no ticket is held while waiting. The trade-off is that waiting jobs lose their arrival order, so one job could in principle keep losing the race; at a few requests a minute per host that's unlikely, and the deferral count makes it visible.
+>
+> **Acceptance:** an integration test that delays workers at chosen points and asserts on the recorded **request start times** (from `fetch_log.started_at`), not on slot values. The mechanism stays open until it passes that test. Checkpoint 1.1 fetches one feed and needs no limiter.
 - Before taking a ticket, a worker also checks `blocked_until`. If the host is blocked, the job is deferred to `blocked_until` plus jitter (§6.3), again without using an attempt.
 - The row lock lasts as long as one `UPDATE`, so contention stays small.
 - Defaults: 2 s between requests per host. Overrides are seeded per host. `www.reddit.com` gets 10 s, because both Horizon subreddit feeds hit it in the same minute, and that was the 429 burst.
@@ -470,17 +478,26 @@ Trade-off: a Postgres round-trip per fetch costs about 1 ms. At hundreds of fetc
 
 `url_hash = sha256(normalised_url)`. Property tests check `normalise(normalise(x)) == normalise(x)`.
 
-**Text canonicalisation** (one pure function, `canon_text`), applied in this order:
+**Plain text at parse time** (one pure function, `to_plain_text`, revision 3): the feed parser turns feed HTML into plain text **once**, and only the plain text is stored in `title` and `summary_text`:
 
 1. `strip_html`: drop tags, scripts and styles.
 2. `html.unescape`: decode entities **once**. Feeds often double-encode, but decoding twice would corrupt literal text such as `&amp;` in a title about HTML.
-3. Unicode NFKC: fold compatibility forms (full-width letters, ligatures, `ℌ` → `H`).
-4. `str.casefold()`: done **after** NFKC, so characters that NFKC turns into capitals are folded too. Lowercasing first would leave `ℌ` as `H`. `casefold` rather than `lower` also folds `ß` to `ss`.
-5. Collapse whitespace runs to one space and trim.
+
+Nothing downstream strips or decodes again. Before revision 3, `canon_text` repeated both steps on text that was already decoded, which could change a literal `&amp;` or `<b>` in a title about HTML.
+
+**Text canonicalisation** (one pure function, `canon_text`), applied to the stored plain text in this order:
+
+1. Unicode NFKC: fold compatibility forms (full-width letters, ligatures, `ℌ` → `H`).
+2. `str.casefold()`: done **after** NFKC, so characters that NFKC turns into capitals are folded too. Lowercasing first would leave `ℌ` as `H`. `casefold` rather than `lower` also folds `ß` to `ss`.
+3. Collapse whitespace runs to one space and trim.
 
 **Content hash** (dedup identity): `sha256(canon_text(title) + "\n" + canon_text(summary_text))`. It uses **feed fields only**, so it's known when the feed is parsed, and extraction later never changes it. This catches syndicated copies (the same press release on five sites) and feeds that republish an item under a new GUID.
 
-**Input hash** (the score cache key, §7.5): `sha256(title + "\n" + scoring_text)`, where `scoring_text` is exactly what the scorer is sent: the first 6,000 characters of `body_text` if there is one, otherwise of `summary_text`, after `strip_html` and `html.unescape` but **without** case folding, since the model reads the real text. It's recomputed whenever `body_text` or `summary_text` changes.
+**Scoring input** (revision 3): one function, `scoring_input(article)` in `llm/scoring_input.py`, returns exactly the article fields the scorer is sent: `{title, text}`, where `text` is `scoring_text`, the first 6,000 characters of `body_text` if there is one, otherwise of `summary_text`. Both are already plain text (`to_plain_text` above, or the extractor's plain-text output), and `scoring_text` is **not** case-folded, since the model reads the real text. Both the request body (§7.3) and the cache key are built from this one function's output, so they can't drift apart. Adding a field to the request means adding it here, which changes the hash.
+
+**Input hash** (the score cache key, §7.5): `sha256` of the canonical JSON of `scoring_input(article)` (sorted keys, UTF-8, no extra whitespace). It's recomputed whenever any field it reads changes.
+
+> **Open until checkpoint 1.3 (extraction):** the upsert below keeps the old `input_hash` once `body_text` exists, so a title edited after extraction leaves a stale hash. Checkpoint 1.1 has no extraction, so this doesn't block it. The likely fix is to store `scoring_text` and recompute `input_hash` from the stored title and `scoring_text` in the same statement that changes either. It's settled and tested when extraction arrives.
 
 **Dedup on insert,** in one transaction per feed:
 
@@ -553,7 +570,7 @@ Measuring before committing: the stage 1 shadow week (§14) includes an evaluati
 
 **Haiku is accepted if** its mean top-10 overlap is no more than **1 item** below Sonnet's **and** its ρ is at least **90%** of Sonnet's. If it fails, the fallbacks are tried in order: Haiku at `effort: medium`, then Sonnet at `effort: low` for scoring. The first one that passes, against the same two thresholds, is used. The case study reports all the numbers either way. (The thresholds are a proposal. See Q14.)
 
-The evaluation calls are charged to the system user (`purpose = 'eval'`), not my own budget.
+The evaluation calls are recorded with `purpose = 'eval'`. In stage 1 they are charged to my own user, because the system user doesn't exist until stage 2 (ADR-013); the `purpose` column keeps them separate in cost reports.
 
 ### 7.2 Calling the API
 
@@ -586,7 +603,7 @@ The evaluation calls are charged to the system user (`purpose = 'eval'`), not my
 }
 ```
 
-**Request shape:** articles are scored **in batches of 10 per call**, all under the same rubric. The system prompt holds the instructions and the rubric, marked with `cache_control` so batches 2 onwards read the rubric from Anthropic's prompt cache. (Prompts below the model's minimum cacheable size simply aren't cached. The stage 1 measurements will show whether the rubric prefix is long enough.) Each article is sent as `{ref: "a3", title, published_at, text}`, where `text` is the `scoring_text` from §6.5: the first 6,000 characters, about 1,500 tokens. The **source name is deliberately left out**. Source preference is applied in ranking through subscription weights (§7.6), and leaving it out means copies of an article at different sources share one cache entry. A batch is formed when the worker claims up to 10 score jobs that share a `group_key`, which is the rubric hash (§9.1).
+**Request shape:** articles are scored **in batches of 10 per call**, all under the same rubric. The system prompt holds the instructions and the rubric, marked with `cache_control` so batches 2 onwards read the rubric from Anthropic's prompt cache. (Prompts below the model's minimum cacheable size simply aren't cached. The stage 1 measurements will show whether the rubric prefix is long enough.) Each article is sent as `{ref: "a3"}` plus the output of `scoring_input(article)` from §6.5, which is `{title, text}`: at most 6,000 characters of text, which is at most about 1,500 tokens and about 450 on average for feed summaries (the figure the cost estimate in §7.7 uses). `published_at` is **no longer sent** (revision 3): freshness is handled by the candidate window in §7.6, and leaving it out keeps the request and the cache key built from the same fields. The **source name is deliberately left out**. Source preference is applied in ranking through subscription weights (§7.6), and leaving it out means copies of an article at different sources share one cache entry. A batch is formed when the worker claims up to 10 score jobs that share a `group_key`, which is the rubric hash (§9.1).
 
 **Output schema**, enforced with `output_config.format` (JSON schema) and parsed into Pydantic with `client.messages.parse()`:
 
@@ -659,17 +676,18 @@ Partial success is kept: if 9 of 10 refs are valid, the 9 are stored and only th
   - **Score batches** are charged to the **billed user**, chosen when the job is enqueued: among the subscribers of the article's sources whose profile uses this rubric hash, the one whose matching profile version was created first. That's deterministic, and it means the user who brought this rubric to the system first pays for its misses. Later users who hit the cache are charged nothing, and their `llm_cache_hits` row records the saving. If the billed user's reservation fails, the job tries the other matching subscribers in the same order. If every one is out of budget, the job finishes as `succeeded`, logs `score.skipped_budget`, and those users' briefings degrade (below).
   - **Work that belongs to nobody** (preset rubrics, shared enrichment, evaluations, the nightly injection audit, the smoke test) is charged to the **system user** (ADR-013), which has its own monthly budget, so shared work is capped as well.
   - The alternative of splitting each cost across all subscribers is fairer, but harder to explain and audit. It stays open as Q7.
-- **Enforcement with reservations**, so concurrent jobs can't overspend. Each reservation is a row, so it can be released individually:
+- **When this is built (revision 3):** budget enforcement arrives in stage 3. Checkpoints 1.1 to 1.4 record every call in the ledger and show cost per briefing, but enforce nothing beyond the Anthropic workspace spend limit, which caps the account as a whole. They do compute and store `estimate_micros` on every call, without reserving it, so the `estimate_exceeded` check tests the upper-bound assumption with real calls long before enforcement depends on it. The `usage_periods` and `budget_reservations` tables are created by the migration that introduces enforcement, not in stage 1.
+- **Enforcement with reservations**, so concurrent jobs can't overspend. Each reservation is a row, so it can be settled or expired individually. **Every potentially billable attempt takes its own reservation**: a retry after an error, and each smaller call made by the split-and-retry fallback (§7.4), reserves again before it is sent.
 
   ```sql
   -- before the call, in one transaction
-  INSERT INTO usage_periods (user_id, period_start, limit_micros, reserved_micros, spent_micros)
-  SELECT id, $p, monthly_budget_micros, 0, 0 FROM users WHERE id = $u
+  INSERT INTO usage_periods (user_id, period_start, limit_micros, reserved_micros, spent_micros, uncertain_micros)
+  SELECT id, $p, monthly_budget_micros, 0, 0, 0 FROM users WHERE id = $u
   ON CONFLICT DO NOTHING;                         -- first call of the month creates the row
   UPDATE usage_periods
   SET reserved_micros = reserved_micros + $est
   WHERE user_id = $u AND period_start = $p
-    AND spent_micros + reserved_micros + $est <= limit_micros
+    AND spent_micros + uncertain_micros + reserved_micros + $est <= limit_micros
   RETURNING 1;                                    -- no row → budget exhausted, roll back
   INSERT INTO budget_reservations (id, user_id, period_start, amount_micros, purpose, expires_at)
   VALUES ($r, $u, $p, $est, $purpose, now() + $ttl);
@@ -677,18 +695,22 @@ Partial success is kept: if 9 of 10 refs are valid, the 9 are stored and only th
   -- after the call, in one transaction with the llm_calls insert
   UPDATE budget_reservations SET settled_at = now()
   WHERE id = $r AND settled_at IS NULL
-  RETURNING released_at;                          -- non-null → the reaper already released it
+  RETURNING expired_at;                           -- non-null → the reaper already moved it to uncertain
   UPDATE usage_periods
-  SET reserved_micros = reserved_micros - (CASE WHEN $released THEN 0 ELSE $est END),
-      spent_micros    = spent_micros + $actual
+  SET reserved_micros  = reserved_micros  - (CASE WHEN $expired THEN 0 ELSE $est END),
+      uncertain_micros = uncertain_micros - (CASE WHEN $expired THEN $est ELSE 0 END),
+      spent_micros     = spent_micros + $actual
   WHERE user_id = $u AND period_start = $p;
   ```
 
   - **Lifetime (`$ttl`):** 15 minutes for a normal call. For a Message Batches submission (§7.7, Q9) it's **25 hours**, because a batch can take up to 24 hours. A reservation can't be released while its call is still legitimately running.
-  - **The reaper** (part of the scheduler) releases only rows past `expires_at` that are neither settled nor released. In one transaction it marks them `released_at = now()` and subtracts exactly their amounts from `reserved_micros`. It never works out "old reservations" from the totals, which is why each reservation needs its own row.
-  - **A late settle** (the call finished after the reaper released it) adds the actual spend but doesn't subtract the reservation a second time. It's logged as `late_settle`, because it can take a user slightly over budget. It shouldn't happen with these lifetimes, and an alarm fires if it does.
-  - **The estimate** is an upper bound: `(UTF-8 bytes of the system prompt and messages + 1,000) × input price + max_tokens × output price`. Counting bytes rather than `chars ÷ 3.5` is what makes it a bound. With a byte-level tokenizer, every token covers at least one byte, so the token count can't exceed the byte count. Anthropic doesn't publish its tokenizer, so this is an assumption, and the ledger tests it: `estimate_micros` is stored next to `cost_micros`, any call where cost exceeds the estimate logs `estimate_exceeded`, and a nightly check fails if one appears. The bound is loose (about 4× on English text), but it only matters within a few cents of the limit, and the difference is returned when the call settles. The exact alternative, the `count_tokens` endpoint, costs an extra round-trip on every call.
-- **Degrading when the budget runs out**, in order: (1) skip the Sonnet write-up and send the ranked list with Haiku reasons; (2) score only the top 30 candidates by heuristic; (3) send a heuristic-only briefing. It never goes over budget and never sends nothing. `GET /v1/usage` and the email footer show the budget state.
+  - **The reaper** (part of the scheduler) handles only rows past `expires_at` that are neither settled nor expired. An expired reservation is a call whose outcome is unknown: the worker may have died before the request was sent, or after Anthropic charged for it but before the ledger row was written. So the reaper **doesn't release the money**. In one transaction it marks the row `expired_at = now()` and moves exactly its amount from `reserved_micros` to `uncertain_micros`, which still counts against the budget. It never works out "old reservations" from the totals, which is why each reservation needs its own row. (Before revision 3 the reaper released the amount, so another call could spend it and a late settlement could then take the user over budget.)
+  - **A late settle** (the call finished after the reaper expired its reservation) replaces the estimate with the real cost: it subtracts the reservation from `uncertain_micros` and adds the actual cost to `spent_micros`. It's logged as `late_settle`. Because the estimate is meant to be an upper bound, this returns money to the budget and never takes it over.
+  - **Confirmed and uncertain spend stay separate.** `spent_micros` is cost established from a response. `uncertain_micros` is allowance consumed conservatively because the outcome is unknown. Both count against the limit, and `GET /v1/usage` and the case-study reports show them separately.
+  - **What this costs, stated plainly.** A crashed call can use up more of a user's budget than was really spent, temporarily if the call later settles, or indefinitely if it never does. The design doesn't recover the missing usage data or establish what Anthropic actually charged. A manual reconciliation against Anthropic's usage reports could correct `uncertain_micros` later; it isn't planned.
+  - **The guarantee is conditional.** Concurrent jobs can't push confirmed plus uncertain spend past the limit, **provided the estimate really is an upper bound**. That is an assumption about tokenisation (next point), checked by the ledger, not a proven fact.
+  - **The estimate** is intended to be an upper bound: `(UTF-8 bytes of the system prompt and messages + 1,000) × input price + max_tokens × output price`. Counting bytes rather than `chars ÷ 3.5` is what makes it a bound. With a byte-level tokenizer, every token covers at least one byte, so the token count can't exceed the byte count. Anthropic doesn't publish its tokenizer, so this is an assumption, and the ledger tests it: `estimate_micros` is stored next to `cost_micros`, any call where cost exceeds the estimate logs `estimate_exceeded`, and a nightly check fails if one appears. The bound is loose (about 4× on English text), but it only matters within a few cents of the limit, and the difference is returned when the call settles. The exact alternative, the `count_tokens` endpoint, costs an extra round-trip on every call.
+- **Degrading when the budget runs out**, in order: (1) skip the Sonnet write-up and send the ranked list with Haiku reasons; (2) score only the top 30 candidates by heuristic; (3) send a heuristic-only briefing. It never sends nothing, and it stays within the budget as long as the estimate holds (above). `GET /v1/usage` and the email footer show the budget state.
 - **Expected cost** (to be checked in stage 1), assuming about 300 new articles a day across the 15 Horizon sources:
   - Scoring input: 300 articles × ~450 tokens = **135K** article tokens, plus 30 batches × ~1.2K instruction-and-rubric tokens = **36K**, so **171K** tokens are sent in total.
     - If the rubric prefix is cached: the first batch pays full price for its 1.2K, and the other 29 batches read 34.8K from the cache at 10% of the input price. (That 10% is the cache-read ratio on other current models, and needs checking for Haiku 5.5.) That's 135K + 1.2K + 3.5K ≈ **139.7K full-price-equivalent tokens ≈ $0.014**.
@@ -829,7 +851,7 @@ So `attempts` means "runs that actually started work". A job that keeps crashing
   - The build's `dedupe_key` and `UNIQUE(user_id, profile_id, briefing_date)` are both keyed on the local date, so even an overlap can't produce two briefings.
   - Unit tests cover both transitions for `Europe/Dublin` and `America/New_York`. My own 06:30 in Europe is never affected, because European clocks change at 01:00 UTC.
 - **Retention:** a maintenance job deletes `succeeded` jobs after **7 days**, and `dead` jobs and their `dead_letters` rows **30 days** after they died, or 7 days after a replay. Delivery dead letters are kept for **90 days**, because they hold what a user may want to replay after a long outage. The table and its indexes stay small.
-- **Size:** about 300–400 lines. I'm writing it myself because it's core to the project (ADR-003).
+- **Size:** the core is a few hundred lines, but line count understates the responsibility (ADR-003). The queue has to answer what happens when a worker dies after an external action, when a lease expires while the original worker is still alive, when a retry races newer work, and when a batch partly completes. Checkpoint 1.2 proves recovery on a narrow path before other features depend on the queue, and its capabilities grow as their uses arrive.
 
 ### 9.2 Postgres queue vs SQS
 
@@ -999,30 +1021,52 @@ Each metric has a definition, how it's measured, and the result I'm aiming for. 
 
 ### Stage 1: single-user rebuild (replaces Horizon for my daily briefing)
 
-**Deliverables**
-- Repo skeleton: `pyproject.toml` (Python 3.14, `uv`; see Q13), ruff, mypy, pytest, pre-commit; `docker compose` with Postgres 17, Mailpit, the fake feed server and the fake Anthropic server.
-- Alembic migrations for the stage 1 tables: `users`, `hosts`, `sources`, `subscriptions`, `fetch_log`, `articles`, `article_sources`, `profiles`, `profile_versions`, `llm_scores`, `llm_writeups`, `llm_calls`, `llm_cache_hits`, `usage_periods`, `budget_reservations`, `briefings`, `briefing_items`, `deliveries`, `delivery_attempts`, `dead_letters`, `jobs`, `workers`, `schema_meta`. Two `users` rows are seeded, me and the system user, so stage 2 doesn't need a schema change for multiple users.
-- `briefing import-horizon-config`: reads the Horizon `config.json` and profile files (read-only) into sources, profiles and a rubric.
-- Ingestion: RSS/Atom plus the HN top-stories adapter, conditional GET, soft 304, the Postgres host limiter, retries that honour `Retry-After`, URL and content normalisation, deduplication, and full-text extraction for the sources Horizon flags.
-- The Postgres job queue, a worker, and the scheduler, run as one process.
-- LLM: Haiku scorer with structured output, validation and the split-and-retry fallback; score cache; Sonnet write-up with its own cache; cost ledger; a budget row (the limit is set but there's only one user).
-- Email: Jinja2 templates with HTML and text parts, golden escaping tests, SMTP sender, the delivery state machine.
-- CLI: `run-daily`, `jobs list/replay`, `usage`.
-- CI: lint, types, unit and integration tests against Postgres 17.
-- Running it: on a schedule (where is Q2), in **shadow mode** next to Horizon for 7 days, plus the Haiku-vs-Sonnet scoring evaluation (§7.1).
+Stage 1 is delivered as **four checkpoints** (revision 3). Each one ends in something I can run and inspect, with its own tests, so a failure can be traced to the layer just added. Revision 2 made one finish line out of a queue, several ingestion paths, two model stages, two caches, cost accounting, delivery recovery and an evaluation. The destination is the same; the checkpoints make progress visible and keep different kinds of uncertainty apart.
 
-**Definition of done**
-- 7 days in a row with the briefing in my inbox by 06:30, at quality I judge equal to or better than Horizon's, recorded in a short daily note.
+**Foundations from checkpoint 1.1 onwards:**
+- Repo skeleton: `pyproject.toml` (Python version per Q13, `uv`), ruff, mypy, pytest, pre-commit; `docker compose` with Postgres 17 and Mailpit. The fake feed server and the fake Anthropic server are added when a checkpoint's tests need them.
+- Alembic migrations. **Tables are added by the checkpoint that needs them.** Owned rows carry `user_id` from the start, which is cheap, but revision 3 drops the rule that stage 2 must need no schema change: migrations exist so tables can arrive with their features.
+- CI: lint, types, unit and integration tests against a real Postgres 17.
+- Safe email rendering with the golden escaping test (§8.1), and the cost ledger (`llm_calls`), so every call's cost is visible from the first briefing.
+
+#### Checkpoint 1.1: one complete briefing
+
+- **Scope:** one feed, one profile with a rubric, the real Postgres `jobs` table with one worker, Haiku scoring with structured output and validation (§7.3), recorded cost, and a simple email listing the top-scored articles with the scorer's reasons. Run by hand with `briefing run-daily`; no scheduler.
+- **Tables:** roughly `users`, `sources`, `articles`, `profiles`, `llm_scores`, `llm_calls`, `briefings`, `briefing_items`, `jobs` and `schema_meta`.
+- **Evidence:** a real article travels through the whole system into an email I can read, and the first reading-log entry is written (see Reading quality below).
+- **Decisions it needs:** Q13 (Python version) and running locally in Docker. Q3 only if the email goes to my real inbox; reading it in Mailpit is enough for this checkpoint.
+
+#### Checkpoint 1.2: repeatable and recoverable
+
+- **Scope,** on the same narrow path: the score cache (§7.5), URL and content deduplication (§6.5), bounded retries with backoff (§6.3), leases and the reaper (§9.1), delivery state so an email is sent once (§8.3), and the per-host limiter once Q16 is resolved (§6.2).
+- **Evidence:**
+  - Re-running a day makes 0 LLM calls and sends 0 emails.
+  - Killing the worker at chosen points (after the claim, after the API call, after sending) leaves the jobs, the ledger and the deliveries in the expected state, checked by integration tests.
+  - The limiter's test asserts on recorded request start times, not slot values.
+
+#### Checkpoint 1.3: my actual daily briefing
+
+- **Scope:** the remaining feeds and the HN adapter, both profiles (Q4, Q5), conditional GET (§6.4), full-text extraction for flagged sources if the reading log shows it improves results, the Sonnet write-up and its cache (§7.6), and daily scheduling (Q2 is decided here). `briefing import-horizon-config` is optional: a small hand-written config is enough.
+- **Evidence:** it handles my normal reading load for a week, with a reading-log entry each day.
+
+#### Checkpoint 1.4: Horizon replacement
+
+- **Scope:** shadow mode next to Horizon for 7 days, the Haiku-vs-Sonnet scoring evaluation (§7.1, Q14), the cost comparison, and fixes for weaknesses the reading log has found.
+
+**Definition of done for stage 1** (checked at the end of checkpoint 1.4):
+- 7 days in a row with the briefing in my inbox by 06:30, at quality I judge equal to or better than Horizon's, recorded in the reading log.
 - `run-daily` re-run for the same date: 0 LLM calls, 0 emails sent (an automated test, and checked on the real data).
 - Regression tests exist for all three Horizon bug classes and pass in CI.
 - Cost per briefing is measured and compared with Horizon's.
 - README explains how to run it locally from a clean checkout in under 10 minutes.
 - I switch off the Horizon scheduled task myself. This is my decision, not an automated step.
 
+**Deferred until a checkpoint needs them:** `jobs replay` and other operational commands beyond `run-daily`, `jobs list` and `usage`; general scheduling machinery beyond the daily run; the extract queue (checkpoint 1.3); the system user and shared-work accounting (ADR-013, from stage 2 when there is shared work to charge); and budget reservations (§7.7, stage 3).
+
 ### Stage 2: multi-user API on AWS
 
 **Deliverables**
-- `api_keys`, `webhook_endpoints` and `idempotency_keys` tables. Admin CLI: `create-user`, `create-key`, `set-budget`.
+- `api_keys`, `webhook_endpoints` and `idempotency_keys` tables, and the system user (ADR-013) once there is shared work to charge, each added by migration. Admin CLI: `create-user`, `create-key`, `set-budget`.
 - The full REST API in §5 apart from rate limiting: auth, scopes, problem+json, signed keyset cursors, Idempotency-Key (including concurrent requests), SSRF guard, OpenAPI docs.
 - Per-user timezones and send times in the scheduler, including the DST rules in §9.1. The API and worker run as separate processes (`briefing api` / `briefing worker`).
 - SES email sending, with one-click unsubscribe (§8.1).
@@ -1040,7 +1084,7 @@ Each metric has a definition, how it's measured, and the result I'm aiming for. 
 
 **Deliverables**
 - Shared caching: score reuse across users by rubric hash, made visible through `GET /v1/usage` savings and a preset rubric to test it; article enrichment shared across users if the metrics justify it.
-- Budget enforcement with reservations and the degradation ladder (§7.7). `GET /v1/usage`.
+- Budget enforcement with reservations, uncertain spend and the degradation ladder (§7.7), with the migration that adds `usage_periods` and `budget_reservations`. `GET /v1/usage`.
 - Webhooks: endpoints, Standard Webhooks signing, secret rotation, the retry schedule, dead letters, replay, auto-disable, plus a sample consumer and verifier in `examples/`.
 - API rate limiting per key.
 - Optional, depending on Q9: Message Batches API for non-urgent scoring.
@@ -1053,6 +1097,17 @@ Each metric has a definition, how it's measured, and the result I'm aiming for. 
 - The load-test report is committed, with p95 and throughput figures and the queue-contention measurements behind the SQS decision in §9.2.
 - All five outage drills run, with results recorded (target: 0 jobs lost).
 - The case study is published with real numbers for every row in §13.
+
+
+### Reading quality (from checkpoint 1.1)
+
+The briefing exists to be read, so reading it is the first test of every checkpoint. The routine starts small and grows only when a recurring problem justifies it, so that evaluation doesn't become another large prerequisite.
+
+- **The reading log** (from checkpoint 1.1). After reading each email, I add a dated entry to `docs/reading-log.md` answering three questions: what was useful, what was misleading or annoying, and one thing I would change. An optional score from 1 to 5 can go with it, but the explanation is what decides the next piece of work.
+- **Automated checks, added when the log shows a recurring problem.** Code can check that every item in the write-up refers to an article that exists, measure length and reading time, and find stories repeated on consecutive days. Repeats are reported, not forbidden: a genuine update on an ongoing story is useful, so the check separates a new development (a new article, or changed content) from the same item shown again.
+- **Judgements that need a person.** A valid source reference doesn't show that a summary represents its source faithfully, and missed stories can only be found against an independent reference. Both stay with me: a weekly spot-check of a few summaries against their articles, and a note of important stories I saw elsewhere that the briefing left out.
+- **The shadow-week comparison** (checkpoint 1.4). Each morning I compare the two emails and record which I preferred and why. Hiding the sender won't fully hide which system produced which email, because the layouts differ, so the recorded reasons matter more than the tally.
+- **What early evidence can show.** A one-feed email at checkpoint 1.1 says something about readability and usefulness on that sample only. Coverage across all feeds and the quality of the Sonnet write-up are judged again at checkpoints 1.3 and 1.4.
 
 ---
 
@@ -1071,7 +1126,7 @@ Short ADRs. Each will move to `docs/adr/NNN-*.md` once accepted.
 - *Why:* the worker is long-running with leases and `LISTEN`; the same image runs locally and in AWS; normal connection pooling; no cold starts skewing the p95 metric. App Runner is simpler but hides too much to be a useful portfolio piece. A single EC2 instance would be cheaper but means managing a server.
 
 **ADR-003: write the queue myself (not a library)**
-- *Options:* my own ~400 lines; `procrastinate` (a mature Postgres queue for Python); Celery with a Postgres broker.
+- *Options:* my own (a few hundred lines of core, with a larger testing responsibility; see §9.1); `procrastinate` (a mature Postgres queue for Python); Celery with a Postgres broker.
 - *Choice:* my own.
 - *Why:* the queue is a central part of what the project demonstrates, and it's small enough to test exhaustively. *Risk:* subtle bugs in lease and retry handling. *Mitigation:* the concurrency integration tests in §10. If they turn out unexpectedly hard to get green, switching to procrastinate stays open, because everything goes through a `Queue` interface.
 
@@ -1124,6 +1179,7 @@ Short ADRs. Each will move to `docs/adr/NNN-*.md` once accepted.
 - *Options:* `llm_calls.user_id NULL` for shared work; spread every shared call across its beneficiaries; one reserved system user.
 - *Choice:* a system user (`users.is_system`, exactly one row).
 - *Why:* every call has an owner with a budget, so shared work (presets, enrichment, evaluations, audits, the smoke test) is capped by the same reservation code as everything else, with no separate "unowned spend" path that could run away. Queries never need `IS NULL` special cases. *Cost:* one special row, which `GET /v1/me`, login and email have to exclude. That's enforced by having no API keys and `email_enabled = false`.
+- *When (revision 3):* the system user is created by a stage 2 migration, when there is shared work to charge. In stage 1 there is one user, so shared-work calls such as the evaluation and the injection audit are charged to me and told apart by `llm_calls.purpose`.
 
 **ADR-014: liveness for orchestration, readiness for gates and alarms**
 - *Options:* ALB and ECS health checks on `/readyz`, which includes the database; on `/healthz`, the process only; a mix.
@@ -1139,25 +1195,55 @@ Short ADRs. Each will move to `docs/adr/NNN-*.md` once accepted.
 
 ## 16. Open questions
 
-1. **Postgres in stage 1?** I recommend Postgres from day one (ADR-010) instead of the SQLite-then-Postgres path. OK?
-2. **Where does stage 1 run?** Options: your Windows PC (Docker Desktop plus Task Scheduler, the way Horizon runs now, but it misses days when the PC is asleep at 06:00), or a small always-on host earlier than planned. Which do you prefer?
-3. **Email in stage 1:** reuse Horizon's SMTP account and app password (moved into this repo's `.env`, never committed), or go straight to SES, which needs a domain you control for DKIM?
-4. **Sources:** port Horizon's 14 RSS feeds plus HN (score ≥ 100) as they are? Anything to add (arXiv cs.CL/cs.LG, GitHub releases for SDKs you track) or drop?
-5. **Rubric and profiles:** keep Horizon's two profiles (`ai-news` at 6.0, `tech-blog` at 5.0) as two briefings, or merge them into one briefing with two sections? And is the 0–10 scale in §7.3 right?
-6. **AWS budget:** is about $50/month always-on acceptable from stage 2, or should the stack be torn down between demos (cheaper, but no continuous uptime for the case study)? Is the no-NAT layout in §11.2 acceptable?
-7. **Shared-cache billing:** the plan now charges each score batch to the "billed user" (the subscriber who brought the rubric first, falling back to the next if they're out of budget) and charges unowned work to the system user (§7.7, ADR-013). Is that acceptable, or should shared LLM cost be split across all subscribers?
-8. **Terraform or CDK (Python)?** I lean towards Terraform for job-market reasons (ADR-009).
-9. **Message Batches API** for non-urgent scoring (50% cheaper, slower turnaround): worth trying in stage 3?
-10. **Domain name** for the API and SES (for example a subdomain of endpoint51.com)? This affects TLS, SES DKIM and the webhook HTTPS requirement.
-11. **Real second users** in stage 2 (friends or readers of the book), or synthetic test users only? Real users raise privacy and data deletion (a `DELETE /v1/me` endpoint, a retention policy).
-12. **Repo visibility and licence:** private while in development (as proposed), then public for the case study? MIT licence?
-13. **Python 3.14 and `uv`**: revision 2 moves to 3.14 for the standard library's `uuid.uuid7()` (ADR-015). Fine, or stay on 3.13 with the `uuid6` package, or match what the book uses?
-14. **Scorer evaluation thresholds** (§7.1): accept Haiku if its top-10 overlap is within 1 item of Sonnet's and its ρ is at least 90% of Sonnet's. These are proposals. Tighter or looser? They also depend on you labelling 200 articles during the shadow week (roughly an hour's work).
-15. **CI minutes on a private repo:** running end-to-end tests on every PR adds about 4 minutes per run. On a private repo that counts against GitHub's free monthly allowance (public repos are free). Keep end-to-end on every PR (proposed), or run it only on `main` and nightly while the repo is private?
+Revision 3 adds, for each question, the checkpoint or stage that needs its answer. Following the working rule, only questions needed by the next checkpoint have to be settled before building it.
+
+1. **Postgres in stage 1?** I recommend Postgres from day one (ADR-010) instead of the SQLite-then-Postgres path. OK? *Needed by: checkpoint 1.1.*
+2. **Where does stage 1 run?** Options: your Windows PC (Docker Desktop plus Task Scheduler, the way Horizon runs now, but it misses days when the PC is asleep at 06:00), or a small always-on host earlier than planned. Which do you prefer? *Needed by: checkpoint 1.3 (checkpoint 1.1 runs by hand).*
+3. **Email in stage 1:** reuse Horizon's SMTP account and app password (moved into this repo's `.env`, never committed), or go straight to SES, which needs a domain you control for DKIM? *Needed by: checkpoint 1.1 if the first email goes to my real inbox; otherwise checkpoint 1.3.*
+4. **Sources:** port Horizon's 14 RSS feeds plus HN (score ≥ 100) as they are? Anything to add (arXiv cs.CL/cs.LG, GitHub releases for SDKs you track) or drop? *Needed by: checkpoint 1.3 (checkpoint 1.1 uses one feed).*
+5. **Rubric and profiles:** keep Horizon's two profiles (`ai-news` at 6.0, `tech-blog` at 5.0) as two briefings, or merge them into one briefing with two sections? And is the 0–10 scale in §7.3 right? *Needed by: checkpoint 1.3.*
+6. **AWS budget:** is about $50/month always-on acceptable from stage 2, or should the stack be torn down between demos (cheaper, but no continuous uptime for the case study)? Is the no-NAT layout in §11.2 acceptable? *Needed by: stage 2.*
+7. **Shared-cache billing:** the plan now charges each score batch to the "billed user" (the subscriber who brought the rubric first, falling back to the next if they're out of budget) and charges unowned work to the system user (§7.7, ADR-013). Is that acceptable, or should shared LLM cost be split across all subscribers? *Needed by: stage 3.*
+8. **Terraform or CDK (Python)?** I lean towards Terraform for job-market reasons (ADR-009). *Needed by: stage 2.*
+9. **Message Batches API** for non-urgent scoring (50% cheaper, slower turnaround): worth trying in stage 3? *Needed by: stage 3.*
+10. **Domain name** for the API and SES (for example a subdomain of endpoint51.com)? This affects TLS, SES DKIM and the webhook HTTPS requirement. *Needed by: stage 2.*
+11. **Real second users** in stage 2 (friends or readers of the book), or synthetic test users only? Real users raise privacy and data deletion (a `DELETE /v1/me` endpoint, a retention policy). *Needed by: stage 2.*
+12. **Repo visibility and licence:** private while in development (as proposed), then public for the case study? MIT licence? *Needed by: before the repo goes public.*
+13. **Python 3.14 and `uv`**: revision 2 moves to 3.14 for the standard library's `uuid.uuid7()` (ADR-015). Fine, or stay on 3.13 with the `uuid6` package, or match what the book uses? *Needed by: checkpoint 1.1.*
+14. **Scorer evaluation thresholds** (§7.1): accept Haiku if its top-10 overlap is within 1 item of Sonnet's and its ρ is at least 90% of Sonnet's. These are proposals. Tighter or looser? They also depend on you labelling 200 articles during the shadow week (roughly an hour's work). *Needed by: checkpoint 1.4.*
+15. **CI minutes on a private repo:** running end-to-end tests on every PR adds about 4 minutes per run. On a private repo that counts against GitHub's free monthly allowance (public repos are free). Keep end-to-end on every PR (proposed), or run it only on `main` and nightly while the repo is private? *Needed by: checkpoint 1.1 (when CI is set up).*
+16. **Host rate-limit spacing** (§6.2): the deferred-ticket rule can't guarantee the minimum interval between request starts. The candidate fix claims the host at dispatch time with a conditional `UPDATE`, at the cost of arrival order. Stays open until a test asserting on recorded request start times passes. *Needed by: checkpoint 1.2.*
+17. **Score input after extraction** (§6.5): the upsert keeps the old `input_hash` once `body_text` exists, so a title edited after extraction leaves a stale cache key. Likely fix: store `scoring_text` and recompute `input_hash` in the statement that changes it. *Needed by: checkpoint 1.3.*
 
 ---
 
 ## 17. Revision history
+
+**Revision 3 (2026-11-08).** Made after two design reviews, one by Codex and one by Claude, which agreed on the main finding: revision 2 closed each gap found while writing the learning guide by adding machinery, so every decision looked reasonable while the project as a whole became hard to start. Revision 3 adopts a working rule (top of this plan): settle what the next checkpoint needs, and record later decisions without building them early.
+
+| # | Change | Where |
+|---|---|---|
+| 1 | Stage 1 split into four checkpoints, each with scope, evidence and the decisions it needs | §14 |
+| 2 | The real Postgres queue is used from checkpoint 1.1 on a narrow path; its capabilities grow as their uses arrive | §9.1, §14 |
+| 3 | Dropped the rule that stage 2 must need no schema change; tables arrive with the checkpoint or stage that needs them | §14 |
+| 4 | Reading-quality routine: a daily reading log from checkpoint 1.1, automated checks only when a recurring problem justifies them, human judgement for faithfulness and missed stories | §14 (Reading quality) |
+| 5 | Expired budget reservations become uncertain spend instead of being released; confirmed and uncertain spend reported separately; every billable attempt reserves; the guarantee stated as conditional on the estimate; enforcement moved explicitly to stage 3 | §2, §4.2, §7.7 |
+| 6 | Host rate limiting: the deferred-ticket rule shown not to guarantee spacing; candidate fix (claim at dispatch time) recorded; open until a start-time test passes | §6.2, Q16 |
+| 7 | One `scoring_input()` function builds both the scoring request and the cache key; `published_at` no longer sent | §6.5, §7.3 |
+| 8 | Entities decoded once at parse time (`to_plain_text`); `canon_text` no longer strips or decodes again | §6.5, §8.1 |
+| 9 | Subscriptions unique per `(profile_id, source_id)`, so one feed can feed several profiles; composite FK to the owner's profile | §4.2 |
+| 10 | Queue size stated with its real responsibility (worker death after an external action, live worker with an expired lease, racing retries, partial batches) | §9.1, ADR-003 |
+| 11 | System user created in stage 2; stage 1 evaluation and audit calls are charged to me and told apart by `purpose` | §7.1, ADR-013 |
+| 12 | Corrected figures: rounding bias (about 31 calls a day, not 300) and tokens per article (at most about 1,500, about 450 on average) | §4, §7.3 |
+| 13 | Each open question notes the checkpoint or stage that needs it; Q16 and Q17 added | §16 |
+
+**Recorded, not yet settled.** These inconsistencies were found while writing the learning guide. Following the working rule, each is settled when its checkpoint or stage arrives:
+
+- **Checkpoint 1.1:** where the random boundary token for injection defence goes, given that the system prompt is cached (§7.2).
+- **Checkpoint 1.2:** a worker whose lease expires after a paid call may discard that `llm_calls` row (§7.7, §9.1); the transaction for picking a score group and claiming its batch, and SQL for the heartbeat and the reaper (§9.1); solo batches for flagged articles versus `group_key` (§7.2, §9.1); and whether the 7-day retention after replay applies beyond `dead_letters` (§9.1).
+- **Checkpoint 1.3:** extraction is missing from the §3 diagram, the §9.3 worker slots and the code layout; "changed" is not defined for adaptive polling (§6.1); what happens to a fetch job after its fourth attempt and to `next_fetch_at` after a failed cycle, the derivation of the 6-hour give-up rule, a 429 on the fourth attempt, and the jitter size while a host is blocked (§6.1, §6.3); a fatal 404 creating a dead letter every cycle (§6.3).
+- **Stage 2:** the 409 path for handlers that can't share a transaction (§5.1); the §5.4 cursor example is in the old format and the filter-hash form is undefined; problem types for 401, 409, 429 and 503 are unnamed (§5.1); `PATCH /v1/me` `email_enabled` is missing from the §5.2 table; `unsubscribe_key` is missing from Secrets Manager (§11.2); how the `/readyz` deploy gate reaches new tasks and where the synthetic check runs, the ADR-014 wording, and the order of approval and the ECR push (§11.2, §12.3).
+- **Stage 3:** the smoke test's dedicated budget row conflicts with the `usage_periods` key and needs reservations (§10); the estimate prices all input at the full input rate, ignoring cache reads and writes (§7.7); the nightly audit's re-score conflicts with `ON CONFLICT DO NOTHING` (§7.2); whether `outcome_unknown` counts towards the 7 webhook attempts (§8.3); and the §8.2 example event id decodes to a 2024 timestamp.
 
 **Revision 2 (2026-11-08).** Settled the 50 gaps found while writing the learning guide. Each item and where it is now decided:
 
@@ -1177,7 +1263,7 @@ Short ADRs. Each will move to `docs/adr/NNN-*.md` once accepted.
 | 12 | Dedupe keys for build and score | §6.6, §9.1 (key table) |
 | 13 | `extract` queue | §4.2, §6.1, §9.1 |
 | 14 | Whether backoff counts attempts from 0 or 1 | §6.3 (from 1) |
-| 15 | A rescheduled job taking a second host ticket | §6.2 (reuses its stored slot for 30 s) |
+| 15 | A rescheduled job taking a second host ticket | §6.2 (reuses its stored slot for 30 s; reopened in revision 3 as Q16) |
 | 16 | Jitter on `Retry-After` | §6.3 (0 to 10% of the wait, at least 1 s, at most 60 s) |
 | 17 | `blocked_until` with a long `Retry-After` | §6.3 (always set, clamped to 24 h; give up the run if over 6 h) |
 | 18 | Adaptive polling counter | §4.2, §6.1 (`unchanged_count` rules) |

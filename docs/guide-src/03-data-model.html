@@ -1,0 +1,530 @@
+<!-- ============================================================ -->
+<section class="ch" id="data-model">
+  <div class="ch-head"><span class="ch-num">Chapter 03</span><span class="plan-ref">plan §4</span><h2>The data model</h2></div>
+
+  <p>A multi-user service has to decide who owns each row. Your plan shares what is true for everyone, so cost grows with distinct feeds and rubrics instead of with users. It puts the rules that must never break (one briefing a day, one delivery per destination) into constraints Postgres checks on every write.</p>
+
+  <h3>What is shared and what belongs to one user</h3>
+  <p>A fact that is true for everyone is stored once. A fact about one person is stored in a personal row that points at the shared one.</p>
+  <p>Horizon served one person, so it never had to choose. The obvious multi-user design gives each user a private copy of every feed, article and score. Then one new post on a feed with 100 subscribers becomes 100 fetches, 100 rows and 100 LLM calls for the same text, which Goal 2 of the plan rules out.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 860 272" role="img" aria-label="Two panels. Left, per-user copies: users A, B and C each have their own feed copy, their own article and their own LLM call, giving three fetches, three article rows and three LLM calls. Right, shared rows as in the plan: users A, B and C all connect through subscriptions to one source, which produces one article and one LLM call per distinct rubric.">
+        <defs>
+          <marker id="data-model-a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+          <marker id="data-model-a1acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <text class="t-head" x="215" y="32" text-anchor="middle">Per-user copies</text>
+        <text class="t-head" x="645" y="32" text-anchor="middle">Shared rows (your plan)</text>
+        <line class="axis" x1="430" y1="18" x2="430" y2="258"/>
+
+        <rect class="bx" x="25" y="60" width="70" height="34" rx="6"/><text x="60" y="82" text-anchor="middle">user A</text>
+        <rect class="bx-bad" x="119" y="60" width="92" height="34" rx="6"/><text x="165" y="82" text-anchor="middle">feed copy</text>
+        <rect class="bx-bad" x="235" y="60" width="80" height="34" rx="6"/><text x="275" y="82" text-anchor="middle">article</text>
+        <rect class="bx-bad" x="339" y="60" width="80" height="34" rx="6"/><text x="379" y="82" text-anchor="middle">LLM call</text>
+        <path class="wire" d="M95 77 L117 77" marker-end="url(#data-model-a1)"/>
+        <path class="wire" d="M211 77 L233 77" marker-end="url(#data-model-a1)"/>
+        <path class="wire" d="M315 77 L337 77" marker-end="url(#data-model-a1)"/>
+
+        <rect class="bx" x="25" y="110" width="70" height="34" rx="6"/><text x="60" y="132" text-anchor="middle">user B</text>
+        <rect class="bx-bad" x="119" y="110" width="92" height="34" rx="6"/><text x="165" y="132" text-anchor="middle">feed copy</text>
+        <rect class="bx-bad" x="235" y="110" width="80" height="34" rx="6"/><text x="275" y="132" text-anchor="middle">article</text>
+        <rect class="bx-bad" x="339" y="110" width="80" height="34" rx="6"/><text x="379" y="132" text-anchor="middle">LLM call</text>
+        <path class="wire" d="M95 127 L117 127" marker-end="url(#data-model-a1)"/>
+        <path class="wire" d="M211 127 L233 127" marker-end="url(#data-model-a1)"/>
+        <path class="wire" d="M315 127 L337 127" marker-end="url(#data-model-a1)"/>
+
+        <rect class="bx" x="25" y="160" width="70" height="34" rx="6"/><text x="60" y="182" text-anchor="middle">user C</text>
+        <rect class="bx-bad" x="119" y="160" width="92" height="34" rx="6"/><text x="165" y="182" text-anchor="middle">feed copy</text>
+        <rect class="bx-bad" x="235" y="160" width="80" height="34" rx="6"/><text x="275" y="182" text-anchor="middle">article</text>
+        <rect class="bx-bad" x="339" y="160" width="80" height="34" rx="6"/><text x="379" y="182" text-anchor="middle">LLM call</text>
+        <path class="wire" d="M95 177 L117 177" marker-end="url(#data-model-a1)"/>
+        <path class="wire" d="M211 177 L233 177" marker-end="url(#data-model-a1)"/>
+        <path class="wire" d="M315 177 L337 177" marker-end="url(#data-model-a1)"/>
+
+        <text class="t-sm" x="215" y="238" text-anchor="middle">3 fetches, 3 article rows, 3 LLM calls</text>
+        <text class="t-sm" x="215" y="256" text-anchor="middle">Cost grows with users × feeds</text>
+
+        <rect class="bx" x="445" y="60" width="70" height="34" rx="6"/><text x="480" y="82" text-anchor="middle">user A</text>
+        <rect class="bx" x="445" y="110" width="70" height="34" rx="6"/><text x="480" y="132" text-anchor="middle">user B</text>
+        <rect class="bx" x="445" y="160" width="70" height="34" rx="6"/><text x="480" y="182" text-anchor="middle">user C</text>
+        <path class="wire-acc" d="M515 77 L563 119" marker-end="url(#data-model-a1acc)"/>
+        <path class="wire-acc" d="M515 127 L563 127" marker-end="url(#data-model-a1acc)"/>
+        <path class="wire-acc" d="M515 177 L563 135" marker-end="url(#data-model-a1acc)"/>
+        <rect class="bx-pg" x="565" y="110" width="80" height="34" rx="6"/><text x="605" y="132" text-anchor="middle">source</text>
+        <rect class="bx-ok" x="669" y="110" width="76" height="34" rx="6"/><text x="707" y="132" text-anchor="middle">article</text>
+        <rect class="bx-ok" x="769" y="110" width="76" height="34" rx="6"/><text x="807" y="132" text-anchor="middle">LLM call</text>
+        <path class="wire" d="M645 127 L667 127" marker-end="url(#data-model-a1)"/>
+        <path class="wire" d="M745 127 L767 127" marker-end="url(#data-model-a1)"/>
+        <text class="t-mono" x="540" y="212" text-anchor="middle">via subscriptions</text>
+
+        <text class="t-sm" x="645" y="238" text-anchor="middle">1 fetch, 1 article row, 1 LLM call per distinct rubric</text>
+        <text class="t-sm" x="645" y="256" text-anchor="middle">Cost grows with distinct feeds and rubrics</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 3.1</b> Three users following the same feed. With per-user copies every subscriber multiplies the work. With shared rows the subscribers point at one source, and an article is scored once per distinct rubric, however many users hold that rubric.</figcaption>
+  </figure>
+
+  <p>So the plan splits the tables into three groups:</p>
+  <ul>
+    <li><b>Shared.</b> <code>hosts</code>, <code>sources</code>, <code>articles</code>, <code>article_sources</code>, <code>llm_scores</code> and <code>llm_writeups</code> hold facts about the world, such as "this text scored 7 under this rubric".</li>
+    <li><b>Personal.</b> <code>users</code>, <code>api_keys</code>, <code>subscriptions</code>, <code>profiles</code>, <code>profile_versions</code>, <code>briefings</code>, <code>briefing_items</code>, <code>deliveries</code>, <code>webhook_endpoints</code>, <code>llm_calls</code>, <code>usage_periods</code>, <code>budget_reservations</code> and <code>idempotency_keys</code> hold what one person follows, how they judge it, what they received and what they spent.</li>
+    <li><b>Operational.</b> <code>jobs</code>, <code>workers</code>, <code>fetch_log</code>, <code>delivery_attempts</code>, <code>dead_letters</code> and <code>schema_meta</code> record how the system is running.</li>
+  </ul>
+  <p>The score cache is the subtle case. A score belongs to a text and a rubric, and neither is a user. <code>llm_scores</code> is keyed by <code>input_hash</code> (a hash of exactly what the scorer reads) and <code>rubric_hash</code>, so users with identical rubrics share scores, and only the score and reason are ever reused.</p>
+
+  <h4>Who owns work that belongs to nobody</h4>
+  <p>Preset rubrics, shared enrichment, model evaluations, the nightly injection audit and the smoke test belong to the <b>system user</b>, a single <code>users</code> row with <code>is_system = true</code> (ADR-013).</p>
+  <ul>
+    <li><b>Every call has an owner.</b> <code>llm_calls.user_id</code> is <code>NOT NULL</code>, so shared work goes through the same budget and reservation code as everyone else's, and queries need no <code>IS NULL</code> special cases.</li>
+    <li><b>It can't log in or receive mail.</b> It has no API keys and <code>email_enabled = false</code>.</li>
+    <li><b>It arrives in stage 2.</b> The plan creates it with a stage 2 migration, when there is shared work to charge. In stage 1 you are the only user, so evaluation and audit calls are charged to you and told apart by <code>llm_calls.purpose</code>.</li>
+  </ul>
+
+  <div class="note principle"><span class="label">Key principle</span><p>Store each fact once, at the level where it is true. A fact about the world belongs in a shared table, and a fact about a person belongs in a personal table that points at it. Copying world facts per user multiplies cost and creates copies that can disagree.</p></div>
+
+  <h3>How the core tables connect</h3>
+  <p>Personal rows reach the shared ones through <code>subscriptions</code>, and scores are found by hash. In Figure 3.2 a solid line is a foreign key, and the dot marks the many side: one user has many profiles, one profile has many versions. The dashed lines are matches by hash value. <code>llm_scores</code> has no foreign keys at all, which is what lets one score serve identical texts under identical rubrics.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 860 500" role="img" aria-label="Entity diagram. Personal zone: users connects to briefings, profiles and subscriptions; briefings connects to deliveries and briefing_items; profiles connects to profile_versions and subscriptions. Shared zone: hosts connects to sources; sources connects to subscriptions and article_sources; articles connects to article_sources and briefing_items. llm_scores is matched to articles by input_hash and to profile_versions by rubric_hash, shown as dashed lines.">
+        <rect class="bx-ghost" x="12" y="26" width="836" height="216" rx="10"/>
+        <text class="t-sm" x="24" y="44">Personal: rows belong to one user</text>
+        <rect class="bx-ghost" x="12" y="272" width="836" height="216" rx="10"/>
+        <text class="t-sm" x="24" y="290">Shared: stored once, used by everyone</text>
+
+        <path class="wire" d="M205 87 L235 87"/><circle class="ah" cx="205" cy="87" r="3.5"/>
+        <path class="wire" d="M415 87 L445 87"/><circle class="ah" cx="415" cy="87" r="3.5"/>
+        <path class="wire" d="M625 87 L655 87"/><circle class="ah" cx="655" cy="87" r="3.5"/>
+        <path class="wire" d="M745 114 L745 170"/><circle class="ah" cx="745" cy="170" r="3.5"/>
+        <path class="wire" d="M325 114 L325 170"/><circle class="ah" cx="325" cy="170" r="3.5"/>
+        <path class="wire" d="M535 114 L535 170"/><circle class="ah" cx="535" cy="170" r="3.5"/>
+        <path class="wire" d="M625 190 L690 114"/><circle class="ah" cx="625" cy="190" r="3.5"/>
+        <path class="wire" d="M490 224 L370 310"/><circle class="ah" cx="490" cy="224" r="3.5"/>
+        <path class="wire" d="M370 224 L490 310"/><circle class="ah" cx="370" cy="224" r="3.5"/>
+        <path class="wire" d="M205 337 L235 337"/><circle class="ah" cx="235" cy="337" r="3.5"/>
+        <path class="wire" d="M325 364 L385 420"/><circle class="ah" cx="385" cy="420" r="3.5"/>
+        <path class="wire" d="M535 364 L475 420"/><circle class="ah" cx="475" cy="420" r="3.5"/>
+        <path class="wire-dash" d="M625 337 L700 337 L700 420"/>
+        <text class="t-mono" x="694" y="402" text-anchor="end">input_hash</text>
+        <path class="wire-dash" d="M790 224 L790 420"/>
+        <text class="t-mono" x="782" y="300" text-anchor="end">rubric_hash</text>
+
+        <rect class="bx" x="25" y="60" width="180" height="54" rx="7"/><text class="t-head" x="115" y="82" text-anchor="middle">deliveries</text><text class="t-mono" x="115" y="100" text-anchor="middle">one per destination</text>
+        <rect class="bx" x="235" y="60" width="180" height="54" rx="7"/><text class="t-head" x="325" y="82" text-anchor="middle">briefings</text><text class="t-mono" x="325" y="100" text-anchor="middle">one per profile per day</text>
+        <rect class="bx-pg" x="445" y="60" width="180" height="54" rx="7"/><text class="t-head" x="535" y="82" text-anchor="middle">users</text><text class="t-mono" x="535" y="100" text-anchor="middle">id uuid, UNIQUE(email)</text>
+        <rect class="bx" x="655" y="60" width="180" height="54" rx="7"/><text class="t-head" x="745" y="82" text-anchor="middle">profiles</text><text class="t-mono" x="745" y="100" text-anchor="middle">UNIQUE(user_id, name)</text>
+
+        <rect class="bx" x="235" y="170" width="180" height="54" rx="7"/><text class="t-head" x="325" y="192" text-anchor="middle">briefing_items</text><text class="t-mono" x="325" y="210" text-anchor="middle">PK(briefing, article)</text>
+        <rect class="bx-pg" x="445" y="170" width="180" height="54" rx="7"/><text class="t-head" x="535" y="192" text-anchor="middle">subscriptions</text><text class="t-mono" x="535" y="210" text-anchor="middle">UNIQUE(profile, source)</text>
+        <rect class="bx" x="655" y="170" width="180" height="54" rx="7"/><text class="t-head" x="745" y="192" text-anchor="middle">profile_versions</text><text class="t-mono" x="745" y="210" text-anchor="middle">PK(profile_id, version)</text>
+
+        <rect class="bx" x="25" y="310" width="180" height="54" rx="7"/><text class="t-head" x="115" y="332" text-anchor="middle">hosts</text><text class="t-mono" x="115" y="350" text-anchor="middle">limiter state per host</text>
+        <rect class="bx" x="235" y="310" width="180" height="54" rx="7"/><text class="t-head" x="325" y="332" text-anchor="middle">sources</text><text class="t-mono" x="325" y="350" text-anchor="middle">UNIQUE(url_normalised)</text>
+        <rect class="bx" x="445" y="310" width="180" height="54" rx="7"/><text class="t-head" x="535" y="332" text-anchor="middle">articles</text><text class="t-mono" x="535" y="350" text-anchor="middle">UNIQUE(url_hash)</text>
+
+        <path class="wire" d="M25 434 L55 434"/><text class="t-sm" x="63" y="438">foreign key, dot = many side</text>
+        <path class="wire-dash" d="M25 458 L55 458"/><text class="t-sm" x="63" y="462">matched by hash value</text>
+        <rect class="bx" x="340" y="420" width="180" height="54" rx="7"/><text class="t-head" x="430" y="442" text-anchor="middle">article_sources</text><text class="t-mono" x="430" y="460" text-anchor="middle">PK(article, source)</text>
+        <rect class="bx-ok" x="655" y="420" width="180" height="54" rx="7"/><text class="t-head" x="745" y="442" text-anchor="middle">llm_scores</text><text class="t-mono" x="745" y="460" text-anchor="middle">the score cache</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 3.2</b> The core tables, with <code>subscriptions</code> as the bridge from the personal zone to the shared one. Left out for space: <code>api_keys</code>, <code>webhook_endpoints</code>, <code>usage_periods</code>, <code>budget_reservations</code>, <code>llm_calls</code>, <code>llm_cache_hits</code>, <code>llm_writeups</code>, <code>idempotency_keys</code>, <code>fetch_log</code>, <code>delivery_attempts</code>, <code>dead_letters</code>, <code>jobs</code>, <code>workers</code> and <code>schema_meta</code>.</figcaption>
+  </figure>
+
+  <p>Follow one article through it:</p>
+  <ol class="steps">
+    <li><b>Subscribe.</b> The API finds or creates the shared <code>sources</code> row by normalised URL, then inserts a <code>subscriptions</code> row with the user, source, profile and weight.</li>
+    <li><b>Fetch.</b> The fetcher only sees sources. It upserts each entry into <code>articles</code> and links it through <code>article_sources</code>.</li>
+    <li><b>Score.</b> For each subscriber rubric, the worker looks up <code>(input_hash, rubric_hash, model, prompt_version)</code> in <code>llm_scores</code>. Only misses reach the API.</li>
+    <li><b>Build.</b> The builder walks from the user to their subscriptions and articles, and writes the personal <code>briefings</code>, <code>briefing_items</code> and <code>deliveries</code> rows.</li>
+  </ol>
+
+  <h3>Two kinds of id: <code>bigint</code> inside, UUID v7 outside</h3>
+  <p>Internal tables such as <code>articles</code> and <code>jobs</code> use <code>bigint generated always as identity</code>, the SQL-standard auto-incrementing integer. Tables whose ids appear in the API (<code>users</code>, <code>api_keys</code>, <code>subscriptions</code>, <code>profiles</code>, <code>briefings</code>, <code>webhook_endpoints</code>, <code>deliveries</code>) use a version 7 <code>uuid</code>.</p>
+
+  <h4>Why sequential ids stay out of URLs</h4>
+  <p>A sequential id leaks information. If your briefing is <code>/v1/briefings/1042</code> today and <code>/v1/briefings/1101</code> tomorrow, anyone can work out that about 59 briefings were built in a day. Guessable ids also turn any missed ownership check into a data leak. A UUID has 122 random bits (v4) or 74 (v7), so guessing one is impractical.</p>
+  <p>Inside the database, size matters more. A <code>bigint</code> is 8 bytes and a <code>uuid</code> 16, and every index and foreign key carries that size, which adds up on <code>articles</code> and the tables that reference it.</p>
+
+  <h4>What a UUID v7 looks like</h4>
+  <p>A UUID is 128 bits, written as 32 hex digits grouped 8-4-4-4-12. Version 4 fills almost all of them with random data. Version 7 (RFC 9562) puts the Unix time in milliseconds in the top 48 bits, then the version number, then random bits.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 860 280" role="img" aria-label="Bit layout of a UUID v7, 01a1beff-de10-73c2-9e4f-1a07b55d2c86. The first 12 hex digits are a 48-bit Unix timestamp in milliseconds, decoding to 2026-11-09 06:30:02 UTC. The 13th digit is the version, 7. Then 12 bits of rand_a, a 2-bit variant field, and 62 bits of rand_b. Below, a UUID v4 has the same version and variant positions but every other bit is random.">
+        <text class="t-head" x="30" y="24">UUID v7</text>
+        <text class="t-mono" x="110" y="24">01a1beff-de10-73c2-9e4f-1a07b55d2c86</text>
+        <text class="t-mono" x="42.5" y="54" text-anchor="middle">0</text><text class="t-mono" x="67.5" y="54" text-anchor="middle">1</text><text class="t-mono" x="92.5" y="54" text-anchor="middle">a</text><text class="t-mono" x="117.5" y="54" text-anchor="middle">1</text><text class="t-mono" x="142.5" y="54" text-anchor="middle">b</text><text class="t-mono" x="167.5" y="54" text-anchor="middle">e</text><text class="t-mono" x="192.5" y="54" text-anchor="middle">f</text><text class="t-mono" x="217.5" y="54" text-anchor="middle">f</text><text class="t-mono" x="242.5" y="54" text-anchor="middle">d</text><text class="t-mono" x="267.5" y="54" text-anchor="middle">e</text><text class="t-mono" x="292.5" y="54" text-anchor="middle">1</text><text class="t-mono" x="317.5" y="54" text-anchor="middle">0</text><text class="t-mono" x="342.5" y="54" text-anchor="middle">7</text><text class="t-mono" x="367.5" y="54" text-anchor="middle">3</text><text class="t-mono" x="392.5" y="54" text-anchor="middle">c</text><text class="t-mono" x="417.5" y="54" text-anchor="middle">2</text><text class="t-mono" x="442.5" y="54" text-anchor="middle">9</text><text class="t-mono" x="467.5" y="54" text-anchor="middle">e</text><text class="t-mono" x="492.5" y="54" text-anchor="middle">4</text><text class="t-mono" x="517.5" y="54" text-anchor="middle">f</text><text class="t-mono" x="542.5" y="54" text-anchor="middle">1</text><text class="t-mono" x="567.5" y="54" text-anchor="middle">a</text><text class="t-mono" x="592.5" y="54" text-anchor="middle">0</text><text class="t-mono" x="617.5" y="54" text-anchor="middle">7</text><text class="t-mono" x="642.5" y="54" text-anchor="middle">b</text><text class="t-mono" x="667.5" y="54" text-anchor="middle">5</text><text class="t-mono" x="692.5" y="54" text-anchor="middle">5</text><text class="t-mono" x="717.5" y="54" text-anchor="middle">d</text><text class="t-mono" x="742.5" y="54" text-anchor="middle">2</text><text class="t-mono" x="767.5" y="54" text-anchor="middle">c</text><text class="t-mono" x="792.5" y="54" text-anchor="middle">8</text><text class="t-mono" x="817.5" y="54" text-anchor="middle">6</text>
+        <rect class="bx-pg" x="30" y="62" width="300" height="30"/><text class="t-sm" x="180" y="81" text-anchor="middle">unix_ts_ms: 48 bits</text>
+        <rect class="bx-ok" x="330" y="62" width="25" height="30"/>
+        <rect class="bx" x="355" y="62" width="75" height="30"/><text class="t-sm" x="392.5" y="81" text-anchor="middle">rand_a</text>
+        <rect class="bx-ok" x="430" y="62" width="12.5" height="30"/>
+        <rect class="bx" x="442.5" y="62" width="387.5" height="30"/><text class="t-sm" x="636" y="81" text-anchor="middle">rand_b: 62 random bits</text>
+        <path class="wire" d="M342.5 92 L342.5 110"/><text class="t-sm" x="342.5" y="122" text-anchor="middle">version 7 (4 bits)</text>
+        <path class="wire" d="M436 92 L436 132"/><text class="t-sm" x="436" y="144" text-anchor="middle">variant 10 (2 bits)</text>
+        <text class="t-mono" x="30" y="170">01a1beffde10 (hex) = 1,794,205,802,000 ms after 1970-01-01 = 2026-11-09 06:30:02 UTC</text>
+
+        <text class="t-head" x="30" y="204">UUID v4</text>
+        <rect class="bx" x="30" y="214" width="300" height="30"/><text class="t-sm" x="180" y="233" text-anchor="middle">random: 48 bits</text>
+        <rect class="bx-ok" x="330" y="214" width="25" height="30"/>
+        <rect class="bx" x="355" y="214" width="75" height="30"/><text class="t-sm" x="392.5" y="233" text-anchor="middle">random</text>
+        <rect class="bx-ok" x="430" y="214" width="12.5" height="30"/>
+        <rect class="bx" x="442.5" y="214" width="387.5" height="30"/><text class="t-sm" x="636" y="233" text-anchor="middle">random: 62 bits</text>
+        <text class="t-sm" x="430" y="268" text-anchor="middle">Same size and text format. In v7 the leading bits are a clock, so ids created afterwards compare as larger.</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 3.3</b> A UUID v7 broken into its fields, drawn to scale (one hex digit is four bits). Its timestamp is the <code>created_at</code> of the example webhook event in plan §8.2. The green cells are the version and variant bits, which sit in the same place in every UUID version.</figcaption>
+  </figure>
+
+  <h4>Why v7 is kind to the index and v4 is not</h4>
+  <p>A Postgres primary key is a B-tree index, which keeps keys sorted across 8 kB pages, and an insert goes to the leaf page where its key belongs. Random v4 keys land on pages all over the index, so inserts read scattered pages and split them, leaving pages half empty. A v7 key is larger than every existing one, so every insert lands on the rightmost leaf, which stays cached.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 860 270" role="img" aria-label="Two B-tree indexes, each with a root page and five leaf pages. Left, random UUID v4: three new ids land on the first, second and fourth leaf pages, which are highlighted as modified. Right, UUID v7 or bigint: three new ids all land on the rightmost leaf page.">
+        <defs>
+          <marker id="data-model-a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+          <marker id="data-model-a2acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <text class="t-head" x="215" y="28" text-anchor="middle">Random UUID v4</text>
+        <text class="t-head" x="645" y="28" text-anchor="middle">UUID v7 (or bigint)</text>
+        <line class="axis" x1="430" y1="16" x2="430" y2="258"/>
+
+        <rect class="bx" x="155" y="44" width="120" height="32" rx="6"/><text class="t-sm" x="215" y="64" text-anchor="middle">root page</text>
+        <path class="wire" d="M215 76 L67 120"/><path class="wire" d="M215 76 L141 120"/><path class="wire" d="M215 76 L215 120"/><path class="wire" d="M215 76 L289 120"/><path class="wire" d="M215 76 L363 120"/>
+        <rect class="bx-bad" x="35" y="120" width="64" height="40" rx="5"/><text class="t-mono" x="67" y="144" text-anchor="middle">0…3</text>
+        <rect class="bx-bad" x="109" y="120" width="64" height="40" rx="5"/><text class="t-mono" x="141" y="144" text-anchor="middle">3…6</text>
+        <rect class="bx" x="183" y="120" width="64" height="40" rx="5"/><text class="t-mono" x="215" y="144" text-anchor="middle">6…9</text>
+        <rect class="bx-bad" x="257" y="120" width="64" height="40" rx="5"/><text class="t-mono" x="289" y="144" text-anchor="middle">9…c</text>
+        <rect class="bx" x="331" y="120" width="64" height="40" rx="5"/><text class="t-mono" x="363" y="144" text-anchor="middle">c…f</text>
+        <path class="wire" d="M67 218 L67 162" marker-end="url(#data-model-a2)"/><text class="t-mono" x="67" y="232" text-anchor="middle">1b2e…</text>
+        <path class="wire" d="M141 218 L141 162" marker-end="url(#data-model-a2)"/><text class="t-mono" x="141" y="232" text-anchor="middle">4a07…</text>
+        <path class="wire" d="M289 218 L289 162" marker-end="url(#data-model-a2)"/><text class="t-mono" x="289" y="232" text-anchor="middle">a3f9…</text>
+        <text class="t-sm" x="215" y="254" text-anchor="middle">Inserts touch pages all over the index</text>
+
+        <rect class="bx" x="585" y="44" width="120" height="32" rx="6"/><text class="t-sm" x="645" y="64" text-anchor="middle">root page</text>
+        <path class="wire" d="M645 76 L497 120"/><path class="wire" d="M645 76 L571 120"/><path class="wire" d="M645 76 L645 120"/><path class="wire" d="M645 76 L719 120"/><path class="wire" d="M645 76 L793 120"/>
+        <rect class="bx" x="465" y="120" width="64" height="40" rx="5"/><text class="t-mono" x="497" y="144" text-anchor="middle">oldest</text>
+        <rect class="bx" x="539" y="120" width="64" height="40" rx="5"/><text class="t-mono" x="571" y="144" text-anchor="middle">…</text>
+        <rect class="bx" x="613" y="120" width="64" height="40" rx="5"/><text class="t-mono" x="645" y="144" text-anchor="middle">…</text>
+        <rect class="bx" x="687" y="120" width="64" height="40" rx="5"/><text class="t-mono" x="719" y="144" text-anchor="middle">…</text>
+        <rect class="bx-pg" x="761" y="120" width="64" height="40" rx="5"/><text class="t-mono" x="793" y="144" text-anchor="middle">newest</text>
+        <path class="wire-acc" d="M701 218 L787 164" marker-end="url(#data-model-a2acc)"/><text class="t-mono" x="701" y="232" text-anchor="middle">…de10</text>
+        <path class="wire-acc" d="M761 218 L791 164" marker-end="url(#data-model-a2acc)"/><text class="t-mono" x="761" y="232" text-anchor="middle">…de11</text>
+        <path class="wire-acc" d="M821 218 L797 164" marker-end="url(#data-model-a2acc)"/><text class="t-mono" x="821" y="232" text-anchor="middle">…de12</text>
+        <text class="t-sm" x="645" y="254" text-anchor="middle">Inserts always touch the rightmost page</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 3.4</b> Where three consecutive inserts land. Random keys change a different page each time, which costs memory, disk reads and page splits across the whole index. Time-ordered keys keep all the write activity on one cached page.</figcaption>
+  </figure>
+
+  <div class="split">
+    <div class="no"><h4>UUID v4 as a public id</h4><p>Unguessable and supported everywhere, but random insert positions spread writes across the whole index, and the ids have no useful order.</p></div>
+    <div class="yes"><h4>UUID v7 as a public id</h4><p>Just as safe to expose, inserts behave like a sequence, and ids sort roughly by creation time. Anyone holding one can read its creation time to the millisecond, which is harmless for briefings and deliveries.</p></div>
+  </div>
+
+  <h4>Where the ids come from</h4>
+  <p>UUID v7 values are generated in application code by one helper, <code>db/ids.py: new_id()</code>, and never by a column default (ADR-015).</p>
+  <ul>
+    <li><b>PostgreSQL 17 can't do it.</b> Its <code>gen_random_uuid()</code> makes v4, and <code>uuidv7()</code> only arrived in PostgreSQL 18, which RDS may lag behind.</li>
+    <li><b>Python 3.14 can.</b> The plan proposes 3.14 for its standard-library <code>uuid.uuid7()</code>, and that choice is still open (Q13). On 3.13 the <code>uuid6</code> package supplies the same function, and only <code>db/ids.py</code> changes.</li>
+    <li><b>The id exists before the insert.</b> The code can put it in log lines and job payloads before the row is written.</li>
+  </ul>
+
+  <h3>Money as integer micro-dollars</h3>
+  <p>The plan stores every amount of money as a <code>bigint</code> count of micro-dollars, where 1 USD = 1,000,000. A <code>float</code> is a binary fraction, and 0.1 has no exact binary form, so every value and sum is rounded and the errors add up. Integer addition is exact, and a <code>bigint</code> holds over nine trillion dollars in micro-dollars.</p>
+
+  <div class="note example"><span class="label">Worked example</span>
+    <p>Two ways floats go wrong with budgets:</p>
+    <ol>
+      <li><b>A check that refuses a legitimate call.</b> A user has a limit of $0.30, has spent $0.10, and the next call is estimated at $0.20. The plan's check is <code>spent + reserved + estimate &lt;= limit</code>. In floats, <code>0.1 + 0.2</code> is <code>0.30000000000000004</code>, so the check fails although the call fits exactly. In micro-dollars, <code>100_000 + 200_000 &lt;= 300_000</code> is true.</li>
+      <li><b>A running total that drifts.</b> The plan estimates about 450 article tokens per scoring input on Haiku 5.5, which at $0.10 per million is $0.000045. Add that 300 times in a loop and the float total is <code>0.013499999999999974</code> instead of <code>0.0135</code>. In micro-dollars each one is <code>450 × 100_000 // 1_000_000 = 45</code>, and 300 of them are exactly <code>13_500</code>.</li>
+    </ol>
+    <p>Python 3.12's built-in <code>sum()</code> compensates for some of this, but a running total or a column updated with <code>spent = spent + $x</code> gets no such help. Postgres <code>numeric</code> would be exact too, but it is slower and arrives in Python as <code>Decimal</code>.</p>
+  </div>
+
+  <h4>Rounding up once per call</h4>
+  <p>Prices are integers too: micro-dollars per million tokens, so Haiku 5.5 input is <code>100_000</code> and output is <code>500_000</code>. A call's exact cost is usually a fraction of a micro-dollar, so the plan rounds it <b>up, once per call</b>, using integer arithmetic only:</p>
+<pre><code>def ceil_div(a: int, b: int) -&gt; int:
+    return -(-a // b)            <span class="c"># integer ceiling, no floats</span>
+
+cost_micros = ceil_div(
+    sum(tokens[t] * price_per_mtok_micros[t] for t in token_types),
+    1_000_000)</code></pre>
+
+  <div class="note example"><span class="label">Worked example</span>
+    <p>A Haiku 5.5 score batch of 10 articles uses 5,733 input tokens and 611 output tokens.</p>
+    <ol>
+      <li>Input: <code>5_733 × 100_000 = 573_300_000</code>.</li>
+      <li>Output: <code>611 × 500_000 = 305_500_000</code>.</li>
+      <li>Sum: <code>878_800_000</code>, which is 878.8 micro-dollars. <code>ceil_div</code> stores <code>879</code>.</li>
+      <li>Rounding each token type separately would give 574 + 306 = <code>880</code>. Summing first and rounding once keeps the bias under 1 µ$ per call, roughly $0.0003 a day.</li>
+    </ol>
+    <p>The plan's own example is a single 451-token Haiku input: 45.1 µ$, stored as 46.</p>
+  </div>
+  <p>Rounding up keeps budgets conservative. Like the reservations, it may overstate a cost by less than a micro-dollar, and it never understates one.</p>
+  <div class="note pitfall"><span class="label">Common mistake</span><p>Computing the cost as a float and converting to integers at the end. The rounding error has already happened by then. Keep prices, token counts and costs as integers from the start, multiply before you divide, and round in one place.</p></div>
+
+  <h4>The budget rows</h4>
+  <p>Two personal tables hold budget state (the reservation logic is in plan §7.7). Both arrive with budget enforcement in stage 3, created by the migration that introduces it. Until then the ledger in <code>llm_calls</code> records every cost without enforcing a limit.</p>
+  <ul>
+    <li><b><code>usage_periods</code></b> has one row per user per month with the limit and three running totals: <code>reserved_micros</code> for calls in flight, <code>spent_micros</code> for confirmed cost, and <code>uncertain_micros</code> for estimated cost from calls whose outcome is unknown. It is <b>created lazily</b> by the month's first reservation (<code>INSERT … ON CONFLICT DO NOTHING</code>, copying <code>users.monthly_budget_micros</code>), so nothing has to create rows in advance. <code>set-budget</code> updates the user and the current month's row.</li>
+    <li><b><code>budget_reservations</code></b> has one row per reservation, with <code>expires_at</code> and <code>settled_at</code> or <code>expired_at</code>. That lets the reaper move exactly the reservations that expired into uncertain spend, which a single total can't do.</li>
+  </ul>
+
+  <h3>Time: <code>timestamptz</code>, IANA zones and the 06:30 send time</h3>
+  <p>The plan stores every moment as <code>timestamptz</code> in UTC, and every send time as a local rule plus an IANA zone name.</p>
+  <ul>
+    <li><b><code>timestamp</code></b> stores a wall-clock reading such as 2026-10-26 06:30 with no zone, so it doesn't identify a moment.</li>
+    <li><b><code>timestamptz</code></b> stores an absolute instant and, despite its name, no zone. Input is converted to UTC, and output is shown in the session's zone.</li>
+  </ul>
+  <p>A send time is a rule about local wall-clock time, and its UTC meaning changes twice a year. So <code>users</code> stores an IANA name such as <code>Europe/Dublin</code> (a pointer to the tz database's rules) plus a local <code>send_time</code>, and <code>briefing_date</code> is the user's local date. A fixed offset like <code>+01:00</code> would be right for only half the year.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 860 260" role="img" aria-label="Two UTC timelines from 04:00 to 08:00. Saturday 24 October 2026, Irish summer time, UTC plus 1: the build is enqueued at 05:00 UTC, which is 06:00 local, and the send is at 05:30 UTC, which is 06:30 local. Monday 26 October 2026, UTC plus 0: the build is enqueued at 06:00 UTC and the send is at 06:30 UTC. A job fixed at 05:30 UTC would fire at 05:30 local, an hour early.">
+        <text x="20" y="96">Sat 24 Oct</text><text class="t-sm" x="20" y="112">UTC+1 (summer time)</text>
+        <path class="wire" d="M190 100 L820 100"/>
+        <path class="wire" d="M190 96 L190 104"/><path class="wire" d="M347.5 96 L347.5 104"/><path class="wire" d="M505 96 L505 104"/><path class="wire" d="M662.5 96 L662.5 104"/><path class="wire" d="M820 96 L820 104"/>
+        <text class="t-mono" x="190" y="118" text-anchor="middle">04:00</text><text class="t-mono" x="347.5" y="118" text-anchor="middle">05:00</text><text class="t-mono" x="505" y="118" text-anchor="middle">06:00</text><text class="t-mono" x="662.5" y="118" text-anchor="middle">07:00</text><text class="t-mono" x="820" y="118" text-anchor="middle">08:00</text>
+        <path class="wire" d="M347.5 70 L347.5 100"/><text class="t-sm" x="347.5" y="64" text-anchor="middle">build enqueued, 06:00 local</text>
+        <path class="wire-acc" d="M426 84 L426 100"/><text class="t-sm" x="426" y="78" text-anchor="middle">send, 06:30 local</text>
+
+        <text x="20" y="196">Mon 26 Oct</text><text class="t-sm" x="20" y="212">UTC+0 (winter time)</text>
+        <path class="wire" d="M190 200 L820 200"/>
+        <path class="wire" d="M190 196 L190 204"/><path class="wire" d="M347.5 196 L347.5 204"/><path class="wire" d="M505 196 L505 204"/><path class="wire" d="M662.5 196 L662.5 204"/><path class="wire" d="M820 196 L820 204"/>
+        <text class="t-mono" x="190" y="218" text-anchor="middle">04:00</text><text class="t-mono" x="347.5" y="218" text-anchor="middle">05:00</text><text class="t-mono" x="505" y="218" text-anchor="middle">06:00</text><text class="t-mono" x="662.5" y="218" text-anchor="middle">07:00</text><text class="t-mono" x="820" y="218" text-anchor="middle">08:00</text>
+        <path class="wire" d="M505 170 L505 200"/><text class="t-sm" x="505" y="164" text-anchor="middle">build enqueued, 06:00 local</text>
+        <path class="wire-acc" d="M584 184 L584 200"/><text class="t-sm" x="584" y="178" text-anchor="middle">send, 06:30 local</text>
+        <path class="strike" d="M426 188 L426 228"/><text class="t-sm" x="426" y="244" text-anchor="middle">a job fixed at 05:30 UTC fires at 05:30 local</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 3.5</b> The same local rule on either side of the clock change, on UTC axes. Ireland left summer time at 01:00 UTC on Sunday 25 October 2026, so 06:30 Dublin time moved an hour later in UTC. A scheduler that stored the UTC time once would now send an hour early.</figcaption>
+  </figure>
+
+  <p>The scheduler enqueues <code>build_briefing</code> at the send time minus 30 minutes, and recomputes the UTC instant every day from the stored rule:</p>
+<pre><code>send_utc = datetime.combine(local_date, send_time,
+                            tzinfo=ZoneInfo(tz)).astimezone(timezone.utc)</code></pre>
+  <p>For <code>Europe/Dublin</code> at 06:30, that gives 05:30 UTC on 24 October 2026 and 06:30 UTC on 26 October, as Figure 3.5 shows.</p>
+
+  <h4>Send times that don't exist or happen twice</h4>
+  <p>On the day clocks go forward some local times don't exist, and on the day they go back some happen twice. The plan settles both cases (§9.1):</p>
+  <ul>
+    <li><b>A gap moves the send forward by the length of the gap.</b> In New York on 8 March 2026 clocks jump from 02:00 to 03:00, so a 02:30 send time becomes 03:30 EDT (07:30 UTC). That is what <code>zoneinfo</code> gives for <code>fold=0</code>.</li>
+    <li><b>An overlap uses the first occurrence.</b> In New York on 1 November 2026, 01:30 happens twice. With <code>fold=0</code> it means 01:30 EDT, which is 05:30 UTC.</li>
+    <li><b>The local date stops duplicates.</b> The build's <code>dedupe_key</code> and <code>UNIQUE(user_id, profile_id, briefing_date)</code> both use the local date, so even an overlap can't produce two briefings.</li>
+  </ul>
+  <p>Unit tests cover both transitions for <code>Europe/Dublin</code> and <code>America/New_York</code>. Your own 06:30 is never affected, because European clocks change at 01:00 UTC. On Windows, <code>zoneinfo</code> needs the <code>tzdata</code> package.</p>
+
+  <h3>Rubrics: immutable versions and a canonical hash</h3>
+  <p>A rubric, the JSON document that tells the scorer what a user cares about, is never changed in place. Each edit adds a version, and scores are keyed by a hash of the rubric's content. Together they tell you which rubric produced last Tuesday's briefing and which cached scores are still valid.</p>
+  <ul>
+    <li><b>Versions.</b> <code>PUT /v1/profiles/{id}/rubric</code> inserts a new <code>profile_versions</code> row and advances <code>profiles.current_version</code>. Each briefing records <code>profile_id</code> and <code>profile_version</code>.</li>
+    <li><b>The hash.</b> Each version stores <code>rubric_hash</code>, the SHA-256 of the rubric's canonical JSON (sorted keys, no whitespace). An edit gives a new hash, so old scores simply stop matching.</li>
+    <li><b>An unchanged PUT writes nothing.</b> If the canonical hash equals the current version's, the answer is <code>200</code> with the current version, so the PUT is idempotent.</li>
+    <li><b>A revert is a new version.</b> Going back to an older rubric keeps the history linear, and its cached scores hit straight away because the hash is the same. Two users with one preset share scores the same way, which is the whole stage 3 shared cache (ADR-005).</li>
+  </ul>
+  <p>Canonicalising matters because key order and whitespace carry no meaning in JSON, so hashing the text as sent would give identical rubrics different hashes. <code>json.dumps(rubric, sort_keys=True, separators=(",", ":"))</code> produces the canonical text. Hash it after Pydantic validation, so defaults and types are applied the same way every time.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 860 240" role="img" aria-label="Input A, with description first, and input B, with avoid first and extra spaces, both flow into a canonicalise step that sorts keys and removes whitespace. Both produce the same canonical text, avoid then description with no spaces, and the same SHA-256 hash beginning d3e91c88b922f48f.">
+        <defs>
+          <marker id="data-model-a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="20" y="30" width="300" height="64" rx="7"/>
+        <text class="t-sm" x="32" y="48">Input A</text>
+        <text class="t-mono" x="32" y="66">{"description": "AI news",</text>
+        <text class="t-mono" x="32" y="82"> "avoid": ["funding rounds"]}</text>
+        <rect class="bx" x="20" y="130" width="300" height="64" rx="7"/>
+        <text class="t-sm" x="32" y="148">Input B: other key order, extra spaces</text>
+        <text class="t-mono" x="32" y="166">{ "avoid": [ "funding rounds" ],</text>
+        <text class="t-mono" x="32" y="182">"description": "AI news" }</text>
+
+        <path class="wire" d="M320 62 L368 100" marker-end="url(#data-model-a3)"/>
+        <path class="wire" d="M320 162 L368 124" marker-end="url(#data-model-a3)"/>
+        <rect class="bx-pg" x="370" y="80" width="140" height="64" rx="7"/>
+        <text class="t-head" x="440" y="104" text-anchor="middle">canonicalise</text>
+        <text class="t-sm" x="440" y="121" text-anchor="middle">sort keys</text>
+        <text class="t-sm" x="440" y="136" text-anchor="middle">no whitespace</text>
+        <path class="wire" d="M510 104 L558 66" marker-end="url(#data-model-a3)"/>
+
+        <rect class="bx" x="560" y="30" width="280" height="64" rx="7"/>
+        <text class="t-sm" x="572" y="48">Canonical text (same for both)</text>
+        <text class="t-mono" x="572" y="66">{"avoid":["funding rounds"],</text>
+        <text class="t-mono" x="572" y="82">"description":"AI news"}</text>
+        <path class="wire" d="M700 94 L700 128" marker-end="url(#data-model-a3)"/>
+        <rect class="bx-ok" x="560" y="130" width="280" height="64" rx="7"/>
+        <text class="t-sm" x="572" y="148">SHA-256, first 8 bytes shown</text>
+        <text class="t-mono" x="572" y="170">d3e91c88b922f48f…</text>
+        <text class="t-sm" x="430" y="224" text-anchor="middle">Both inputs reach the same text, so they get the same rubric_hash and share cached scores.</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 3.6</b> Canonicalising removes the differences JSON treats as meaningless before hashing. The hash prefix is the real SHA-256 of the canonical text.</figcaption>
+  </figure>
+
+  <div class="note example"><span class="label">Worked example</span>
+    <p>Hash the canonical text of three rubrics (first 8 bytes of SHA-256 shown):</p>
+    <ol>
+      <li><code>{"description": "AI news", "avoid": ["funding rounds"]}</code> becomes <code>{"avoid":["funding rounds"],"description":"AI news"}</code>, hash <code>d3e91c88b922f48f</code>.</li>
+      <li>The same object with the keys reversed and extra spaces becomes the identical text, hash <code>d3e91c88b922f48f</code>. Same rubric, same scores.</li>
+      <li><code>"avoid": ["funding rounds", "opinion pieces"]</code> hashes to <code>ace67a2175a9daa4</code>, and the same list in the order <code>["opinion pieces", "funding rounds"]</code> hashes to <code>43a71f6a7aadd685</code>.</li>
+    </ol>
+    <p>Step 3 shows the limit. Only object keys are sorted. Arrays are ordered, so reordering a list gives a new hash and a cache miss. That errs on the safe side, since a looser form could reuse scores for a different rubric. RFC 8785 (the JSON Canonicalization Scheme) is a fully specified alternative if you ever need one.</p>
+  </div>
+
+  <h3>Indexes and partial indexes</h3>
+  <p>A <b>partial index</b> has a <code>WHERE</code> clause, so only the rows a query actually asks about get entries. Every index costs work on each write and takes memory; a partial one stays small.</p>
+  <p> Succeeded jobs are kept for 7 days, so at about 1,000 jobs a day <code>jobs</code> holds roughly 7,000 finished rows and only a handful of queued ones. The claim query only ever asks for queued jobs, so the plan indexes only those:</p>
+<pre><code>CREATE INDEX jobs_ready ON jobs (queue, priority DESC, run_at)
+  <span class="hl">WHERE state = 'queued'</span>;</code></pre>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 860 380" role="img" aria-label="Ten rows of the jobs table: seven succeeded, one running, two queued. On the left, a full index has an entry for every one of the ten rows. On the right, a partial index with the condition state equals queued has entries only for the two queued rows, numbers 109 and 110.">
+        <text class="t-head" x="125" y="30" text-anchor="middle">Full index</text>
+        <text class="t-mono" x="125" y="46" text-anchor="middle">(queue, priority DESC, run_at)</text>
+        <text class="t-head" x="370" y="30" text-anchor="middle">jobs table</text>
+        <text class="t-mono" x="370" y="46" text-anchor="middle">id, queue, state</text>
+        <text class="t-head" x="690" y="30" text-anchor="middle">Partial index</text>
+        <text class="t-mono" x="690" y="46" text-anchor="middle">WHERE state = 'queued'</text>
+        <rect class="bx-ghost" x="540" y="58" width="300" height="268" rx="8"/>
+        <text class="t-sm" x="690" y="160" text-anchor="middle">no entries for succeeded</text>
+        <text class="t-sm" x="690" y="176" text-anchor="middle">or running jobs</text>
+
+        <rect class="bx" x="20" y="64" width="210" height="22" rx="4"/><text class="t-mono" x="125" y="79" text-anchor="middle">(fetch, 1, 05:02) → 101</text><path class="wire" d="M230 75 L270 75"/><rect class="bx" x="270" y="64" width="200" height="22" rx="4"/><text class="t-mono" x="282" y="79">101  fetch  succeeded</text>
+        <rect class="bx" x="20" y="90" width="210" height="22" rx="4"/><text class="t-mono" x="125" y="105" text-anchor="middle">(score, 2, 05:03) → 102</text><path class="wire" d="M230 101 L270 101"/><rect class="bx" x="270" y="90" width="200" height="22" rx="4"/><text class="t-mono" x="282" y="105">102  score  succeeded</text>
+        <rect class="bx" x="20" y="116" width="210" height="22" rx="4"/><text class="t-mono" x="125" y="131" text-anchor="middle">(fetch, 1, 05:04) → 103</text><path class="wire" d="M230 127 L270 127"/><rect class="bx" x="270" y="116" width="200" height="22" rx="4"/><text class="t-mono" x="282" y="131">103  fetch  succeeded</text>
+        <rect class="bx" x="20" y="142" width="210" height="22" rx="4"/><text class="t-mono" x="125" y="157" text-anchor="middle">(score, 2, 05:05) → 104</text><path class="wire" d="M230 153 L270 153"/><rect class="bx" x="270" y="142" width="200" height="22" rx="4"/><text class="t-mono" x="282" y="157">104  score  succeeded</text>
+        <rect class="bx" x="20" y="168" width="210" height="22" rx="4"/><text class="t-mono" x="125" y="183" text-anchor="middle">(build, 3, 05:30) → 105</text><path class="wire" d="M230 179 L270 179"/><rect class="bx" x="270" y="168" width="200" height="22" rx="4"/><text class="t-mono" x="282" y="183">105  build  succeeded</text>
+        <rect class="bx" x="20" y="194" width="210" height="22" rx="4"/><text class="t-mono" x="125" y="209" text-anchor="middle">(fetch, 1, 05:40) → 106</text><path class="wire" d="M230 205 L270 205"/><rect class="bx" x="270" y="194" width="200" height="22" rx="4"/><text class="t-mono" x="282" y="209">106  fetch  succeeded</text>
+        <rect class="bx" x="20" y="220" width="210" height="22" rx="4"/><text class="t-mono" x="125" y="235" text-anchor="middle">(deliver, 4, 06:00) → 107</text><path class="wire" d="M230 231 L270 231"/><rect class="bx" x="270" y="220" width="200" height="22" rx="4"/><text class="t-mono" x="282" y="235">107  deliver  succeeded</text>
+        <rect class="bx" x="20" y="246" width="210" height="22" rx="4"/><text class="t-mono" x="125" y="261" text-anchor="middle">(score, 2, 06:20) → 108</text><path class="wire" d="M230 257 L270 257"/><rect class="bx" x="270" y="246" width="200" height="22" rx="4"/><text class="t-mono" x="282" y="261">108  score  running</text>
+        <rect class="bx" x="20" y="272" width="210" height="22" rx="4"/><text class="t-mono" x="125" y="287" text-anchor="middle">(fetch, 1, 06:30) → 109</text><path class="wire" d="M230 283 L270 283"/><rect class="bx-pg" x="270" y="272" width="200" height="22" rx="4"/><text class="t-mono" x="282" y="287">109  fetch  queued</text>
+        <rect class="bx" x="20" y="298" width="210" height="22" rx="4"/><text class="t-mono" x="125" y="313" text-anchor="middle">(score, 2, 06:31) → 110</text><path class="wire" d="M230 309 L270 309"/><rect class="bx-pg" x="270" y="298" width="200" height="22" rx="4"/><text class="t-mono" x="282" y="313">110  score  queued</text>
+
+        <path class="wire-acc" d="M470 283 L560 283"/><rect class="bx-pg" x="560" y="272" width="260" height="22" rx="4"/><text class="t-mono" x="690" y="287" text-anchor="middle">(fetch, 1, 06:30) → 109</text>
+        <path class="wire-acc" d="M470 309 L560 309"/><rect class="bx-pg" x="560" y="298" width="260" height="22" rx="4"/><text class="t-mono" x="690" y="313" text-anchor="middle">(score, 2, 06:31) → 110</text>
+
+        <text class="t-sm" x="125" y="346" text-anchor="middle">An entry for every row</text>
+        <text class="t-sm" x="690" y="346" text-anchor="middle">Entries only for rows waiting to run</text>
+        <text class="t-sm" x="430" y="368" text-anchor="middle">After a week at about 1,000 jobs a day: roughly 7,000 entries in the full index, a handful in the partial one.</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 3.7</b> The same ten jobs under a full index and a partial one. Entries are drawn beside their rows for clarity; in the real index they are kept in key order. The priority numbers are illustrative.</figcaption>
+  </figure>
+
+  <p>The partial index stays tiny however much history builds up, so it stays in memory. The planner can only use it when the query's own <code>WHERE</code> clause guarantees the index condition. The claim query says <code>state = 'queued'</code>, so it qualifies.</p>
+  <p>The plan uses the same tool wherever a query only cares about a small, live slice of a table:</p>
+  <ul>
+    <li><b>Scheduler.</b> <code>sources (next_fetch_at) WHERE status = 'active'</code> finds due feeds.</li>
+    <li><b>Score batching.</b> <code>jobs (queue, group_key, run_at) WHERE state = 'queued'</code> claims up to 10 jobs for one rubric.</li>
+    <li><b>Reaper.</b> <code>jobs (lease_expires_at) WHERE state = 'running'</code> and <code>budget_reservations (expires_at) WHERE settled_at IS NULL AND expired_at IS NULL</code> find what has expired.</li>
+    <li><b>Copies and replays.</b> <code>articles (duplicate_of) WHERE duplicate_of IS NOT NULL</code> and <code>dead_letters (failed_at) WHERE replayed_at IS NULL</code> skip the many rows that don't qualify.</li>
+  </ul>
+  <p>A partial index can also be <code>UNIQUE</code>, and then it becomes a business rule.</p>
+
+  <h3>Constraints are business rules</h3>
+  <p>A constraint is a rule Postgres checks on every write, and a statement that would break it fails and changes nothing. Application checks can be raced, since two requests can both check, both pass and both write. A unique constraint is enforced in the index during the write, so it can't be.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Business rule</th><th>Constraint</th><th>Table</th></tr></thead>
+    <tbody>
+      <tr><td>One briefing per user, profile and local date</td><td><code>UNIQUE(user_id, profile_id, briefing_date)</code></td><td><code>briefings</code></td></tr>
+      <tr><td>At most one delivery per briefing revision per destination</td><td><code>UNIQUE NULLS NOT DISTINCT (briefing_id, briefing_revision, channel, endpoint_id)</code></td><td><code>deliveries</code></td></tr>
+      <tr><td>At most one live copy of any job</td><td>Partial <code>UNIQUE(dedupe_key) WHERE state IN ('queued', 'running')</code></td><td><code>jobs</code></td></tr>
+      <tr><td>Users who add the same feed share it</td><td><code>UNIQUE(url_normalised)</code></td><td><code>sources</code></td></tr>
+      <tr><td>A feed appears once in each profile, and can feed several of a user's profiles</td><td><code>UNIQUE(profile_id, source_id)</code></td><td><code>subscriptions</code></td></tr>
+      <tr><td>A subscription can only point at its owner's profile</td><td>Composite FK <code>(profile_id, user_id)</code> to <code>profiles(id, user_id)</code></td><td><code>subscriptions</code></td></tr>
+      <tr><td>An article is stored once per normalised URL</td><td><code>UNIQUE(url_hash)</code></td><td><code>articles</code></td></tr>
+      <tr><td>One account per email address, ignoring case</td><td><code>UNIQUE(email)</code> on a <code>citext</code> column</td><td><code>users</code></td></tr>
+      <tr><td>At most one system user</td><td>Partial <code>UNIQUE(is_system) WHERE is_system</code></td><td><code>users</code></td></tr>
+      <tr><td>Reservations and spend never go negative</td><td><code>CHECK (reserved_micros &gt;= 0 AND spent_micros &gt;= 0 AND uncertain_micros &gt;= 0)</code></td><td><code>usage_periods</code></td></tr>
+      <tr><td>Two items in a briefing can't share a rank</td><td><code>UNIQUE(briefing_id, rank)</code></td><td><code>briefing_items</code></td></tr>
+      <tr><td>An idempotency key means one request per user</td><td><code>PRIMARY KEY(user_id, key)</code></td><td><code>idempotency_keys</code></td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li><b><code>NULLS NOT DISTINCT</code>.</b> Email deliveries have a <code>NULL</code> <code>endpoint_id</code>, and two nulls are normally never equal, so a plain unique constraint would allow two email deliveries. This option (PostgreSQL 15 and newer) treats them as equal.</li>
+    <li><b>The system user index.</b> Every entry in <code>UNIQUE(is_system) WHERE is_system</code> has the value <code>true</code>, so it can hold only one row.</li>
+    <li><b><code>ON CONFLICT</code>.</b> Constraints make idempotent code short. The code inserts with <code>ON CONFLICT DO NOTHING</code> or <code>DO UPDATE</code> and lets the constraint decide.</li>
+  </ul>
+  <div class="note principle"><span class="label">Key principle</span><p>Put a rule that must never break where every code path has to pass through it, and that place is the database. Asked how you guarantee one briefing a day, the strongest answer is that a unique constraint makes a second one impossible, and the code turns the conflict into a no-op.</p></div>
+
+  <h3>Changing the schema without breaking the running code</h3>
+  <p>Every migration must work with the code version before it as well as the one after it. Migrations run before new code starts, and old tasks keep serving during the rolling deploy (§11.2).</p>
+  <p>The plan uses Alembic with a linear history, forward-only once deployed. CI applies every migration to an empty database and checks the result against the tables defined in code. Renaming a column breaks the rule at once, because old tasks still query the old name. <b>Expand/contract</b> splits such a change into steps that each keep both versions working. Take a hypothetical rename of <code>articles.hn_points</code> to <code>hn_score</code>:</p>
+  <p>Migrations also let tables arrive when they are needed. The plan adds each table with the checkpoint or stage that first uses it: checkpoint 1.1 needs about ten tables, and multi-user tables such as <code>api_keys</code> arrive in stage 2. An earlier version of the plan created every stage 1 table up front so that stage 2 would need no schema change, which made the first working version much larger than it had to be.</p>
+  <figure>
+    <div class="tbl"><table>
+      <thead><tr><th>Step</th><th>What happens</th><th><code>hn_points</code></th><th><code>hn_score</code></th></tr></thead>
+      <tbody>
+        <tr><td>1. Expand</td><td>A migration adds <code>hn_score int NULL</code>, with no constraints yet</td><td>read and written</td><td>exists, empty</td></tr>
+        <tr><td>2. Dual-write deploy</td><td>Code writes both columns and still reads <code>hn_points</code></td><td>read and written</td><td>written for new rows</td></tr>
+        <tr><td>3. Backfill, twice</td><td><code>UPDATE … WHERE hn_score IS NULL … LIMIT 5000</code>, looped until it touches 0 rows. Run it again once the dual-write deploy has replaced every old task.</td><td>read and written</td><td>complete</td></tr>
+        <tr><td>4. Constrain</td><td>Add <code>NOT NULL</code> or other constraints as <code>NOT VALID</code>, then <code>VALIDATE CONSTRAINT</code></td><td>read and written</td><td>constrained</td></tr>
+        <tr><td>5. Switch deploy</td><td>Code reads and writes only <code>hn_score</code></td><td class="badc">no longer used</td><td class="good">read and written</td></tr>
+        <tr><td>6. Contract</td><td>A subsequent migration drops <code>hn_points</code></td><td class="badc">dropped</td><td class="good">read and written</td></tr>
+      </tbody>
+    </table></div>
+    <figcaption><b>Figure 3.8</b> Expand/contract applied to a column rename, in the plan's six steps. Each row is a separate migration or deploy, and only the last one removes anything.</figcaption>
+  </figure>
+  <p>The second backfill run matters because old tasks keep writing rows without <code>hn_score</code> until the rollout replaces them all. It only touches null rows, so it is cheap.</p>
+  <p>Step 4 avoids a long lock. <code>NOT VALID</code> skips the table scan, and <code>VALIDATE CONSTRAINT</code> then checks existing rows without blocking writes. In PostgreSQL 17 a not-null rule goes in as <code>CHECK (hn_score IS NOT NULL)</code>, which <code>SET NOT NULL</code> can then use to skip its own scan.</p>
+
+  <h4>How old tasks know the schema is compatible</h4>
+  <p>Each migration sets <code>schema_meta.schema_version</code> to its sequence number, and the code declares <code>MIN_SCHEMA_VERSION</code>, the oldest schema it can run on. Readiness checks <code>schema_version &gt;= MIN_SCHEMA_VERSION</code>, so old tasks stay ready after a newer migration has run. An exact match would make them all look broken.</p>
+  <div class="note pitfall"><span class="label">Common mistake</span><p>Trusting a migration because it ran cleanly on your laptop, where there is no old code and no traffic. In production a long lock blocks writes, for example a table rewrite or an index built without <code>CREATE INDEX CONCURRENTLY</code> (which needs Alembic's <code>autocommit_block()</code>). A removal breaks the tasks not yet replaced. Ask whether the previous release could still run against the new schema.</p></div>
+
+  <div class="try">
+    <span class="label">Try it: measure a partial index</span>
+    <ol>
+      <li>In a scratch Postgres database, create a table with 100,000 finished jobs and 10 queued ones, and index it both ways:
+<pre><code>CREATE TABLE jobs_demo (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  queue text, priority smallint, run_at timestamptz, state text);
+INSERT INTO jobs_demo (queue, priority, run_at, state)
+  SELECT 'fetch', 1, now() - n * interval '1 second', 'succeeded'
+  FROM generate_series(1, 100000) AS n;
+INSERT INTO jobs_demo (queue, priority, run_at, state)
+  SELECT 'fetch', 1, now(), 'queued' FROM generate_series(1, 10);
+CREATE INDEX full_idx    ON jobs_demo (queue, priority DESC, run_at);
+CREATE INDEX partial_idx ON jobs_demo (queue, priority DESC, run_at)
+  <span class="hl">WHERE state = 'queued'</span>;
+ANALYZE jobs_demo;</code></pre></li>
+      <li>Compare their sizes:
+<pre><code>SELECT relname, pg_size_pretty(pg_relation_size(oid))
+  FROM pg_class WHERE relname IN ('full_idx', 'partial_idx');</code></pre></li>
+      <li>Check which index the claim-style query uses:
+<pre><code>EXPLAIN SELECT id FROM jobs_demo
+  WHERE state = 'queued' AND queue = 'fetch'
+  ORDER BY priority DESC, run_at LIMIT 5;</code></pre></li>
+      <li>Remove <code>state = 'queued'</code> from the query and run <code>EXPLAIN</code> again.</li>
+    </ol>
+    <p>The full index is measured in megabytes and the partial one is about 16 kB (two 8 kB pages). The first plan uses <code>partial_idx</code>. The second can't, because the query no longer guarantees the index condition.</p>
+  </div>
+
+  <div class="try">
+    <span class="label">Try it: check the money arithmetic</span>
+    <ol>
+      <li>In Python, run <code>s = 0.0</code>, then <code>for _ in range(10): s += 0.1</code>, and print <code>s</code> and <code>s == 1.0</code>.</li>
+      <li>Repeat with integers: <code>s += 100_000</code>, compared with <code>1_000_000</code>.</li>
+      <li>Write <code>ceil_div</code> and check that <code>ceil_div(451 * 100_000, 1_000_000)</code> is 46 and <code>ceil_div(450 * 100_000, 1_000_000)</code> is 45.</li>
+    </ol>
+    <p>The float total is <code>0.9999999999999999</code> and the comparison is false; the integer total is exact. The two <code>ceil_div</code> results show that rounding up only adds a micro-dollar when there is a fraction to round.</p>
+  </div>
+
+
+  <div class="ask">
+    <span class="label">If an interviewer asks</span>
+    <p class="q">"Why don't scores belong to an article id?"</p>
+    <p>"Because the same text can appear under different ids. Syndicated copies have different URLs, and an article can be re-fetched. Scores are keyed on a hash of exactly the text the model reads plus a hash of the canonical rubric, so an identical input under an identical rubric is scored once, even across users. The model and prompt version are in the key too, so changing either invalidates old scores cleanly, with no flush."</p>
+    <p class="q">"Why use two kinds of id?"</p>
+    <p>"Internal keys are <code>bigint</code> identities because they're half the size of a UUID, which matters on the big tables and their foreign keys. Ids in URLs are UUID v7, so they can't be guessed and don't reveal how many rows exist. I chose v7 over v4 because its leading timestamp makes inserts land at the end of the B-tree like a sequence. The app generates them, so the id exists before the insert and doesn't depend on the Postgres version."</p>
+    <p class="q">"How would you rename a column without downtime?"</p>
+    <p>"Expand and contract. Add the new column, deploy code that writes both and still reads the old one, backfill in batches, and run the backfill again once the old tasks are gone. Then add constraints without a long lock, switch the code to the new column, and drop the old one in a subsequent release. At every step the previous version of the code still works, which matters because migrations run before a rolling deploy."</p>
+  </div>
+  <label class="got"><input type="checkbox" id="got-data-model" data-ch="data-model"> I can explain this</label>
+</section>

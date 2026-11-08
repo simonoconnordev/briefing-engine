@@ -1,0 +1,675 @@
+<!-- ============================================================ -->
+<section class="ch" id="queue">
+  <div class="ch-head"><span class="ch-num">Chapter 04</span><span class="plan-ref">plan §9, §4.2, §6.2–6.3, ADR-001, ADR-003, ADR-014</span><h2>The job queue</h2></div>
+
+  <p>Every stage of the pipeline hands work to the next through one table, <code>jobs</code>. So the queue decides whether a briefing arrives on time, whether a crash loses work, and whether a retry sends an email twice. It has to be built so that every job still reaches a final state, even when a worker dies or stalls halfway through. You write it yourself (ADR-003). The core is a few hundred lines, but the responsibility is larger than that suggests, so the plan proves recovery on a narrow path before other features depend on it.</p>
+
+  <h3>Why the work goes through a queue</h3>
+  <p>Every step of a day depends on feed hosts, the Anthropic API or a mail or webhook endpoint, and each fails some of the time. A single script that runs the day top to bottom handles that badly. A crash loses the remaining work, and a retry is a <code>sleep()</code> that holds up everything behind it.</p>
+  <p>A queue records each piece of work as a row before anyone does it, which gives you four things:</p>
+  <ul>
+    <li><b>Durability and retries.</b> A failed job goes back into the table with a future run time. A crash loses nothing, because the job is still a row.</li>
+    <li><b>Spreading load.</b> Three hundred new articles become many score jobs that several workers run in parallel.</li>
+    <li><b>Priorities.</b> Delivery outranks fetching, so a fetch backlog can't delay your email.</li>
+    <li><b>Visibility.</b> <code>SELECT state, count(*) FROM jobs GROUP BY state</code> is a working dashboard from day one.</li>
+  </ul>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 860 330" role="img" aria-label="Work flowing through one jobs table. The jobs table in Postgres is divided into five queues: fetch, extract, score, build and deliver. Fetch workers, extract workers, score workers, the briefing builder and delivery workers each claim jobs from their own queue. Fetch workers enqueue extract jobs, extract workers enqueue score jobs, and the briefing builder enqueues deliver jobs. The scheduler enqueues due fetches, and enqueues build jobs at each user's send time minus 30 minutes.">
+        <defs>
+          <marker id="queue-a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+          <marker id="queue-a1b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <text class="t-sm" x="100" y="30" text-anchor="middle">calls feed hosts</text>
+        <text class="t-sm" x="260" y="30" text-anchor="middle">fetches article pages</text>
+        <text class="t-sm" x="420" y="30" text-anchor="middle">calls Haiku</text>
+        <text class="t-sm" x="580" y="30" text-anchor="middle">calls Sonnet</text>
+        <text class="t-sm" x="740" y="30" text-anchor="middle">calls SES and webhooks</text>
+        <rect class="bx" x="30" y="40" width="140" height="44" rx="8"/><text class="t-head" x="100" y="67" text-anchor="middle">Fetch workers</text>
+        <rect class="bx" x="190" y="40" width="140" height="44" rx="8"/><text class="t-head" x="260" y="67" text-anchor="middle">Extract workers</text>
+        <rect class="bx" x="350" y="40" width="140" height="44" rx="8"/><text class="t-head" x="420" y="67" text-anchor="middle">Score workers</text>
+        <rect class="bx" x="510" y="40" width="140" height="44" rx="8"/><text class="t-head" x="580" y="67" text-anchor="middle">Briefing builder</text>
+        <rect class="bx" x="670" y="40" width="140" height="44" rx="8"/><text class="t-head" x="740" y="67" text-anchor="middle">Delivery workers</text>
+
+        <rect class="bx-pg" x="20" y="170" width="820" height="70" rx="8"/>
+        <line class="axis" x1="180" y1="170" x2="180" y2="240"/>
+        <line class="axis" x1="340" y1="170" x2="340" y2="240"/>
+        <line class="axis" x1="500" y1="170" x2="500" y2="240"/>
+        <line class="axis" x1="660" y1="170" x2="660" y2="240"/>
+        <text class="t-head" x="100" y="198" text-anchor="middle">fetch</text><text class="t-mono" x="100" y="220" text-anchor="middle">fetch(source_id)</text>
+        <text class="t-head" x="260" y="198" text-anchor="middle">extract</text><text class="t-mono" x="260" y="220" text-anchor="middle">extract(article_id)</text>
+        <text class="t-head" x="420" y="198" text-anchor="middle">score</text><text class="t-mono" x="420" y="220" text-anchor="middle">score(article, rubric)</text>
+        <text class="t-head" x="580" y="198" text-anchor="middle">build</text><text class="t-mono" x="580" y="220" text-anchor="middle">build_briefing(…)</text>
+        <text class="t-head" x="740" y="198" text-anchor="middle">deliver</text><text class="t-mono" x="740" y="220" text-anchor="middle">deliver(briefing, …)</text>
+
+        <path class="wire-acc" d="M65 170 L65 88" marker-end="url(#queue-a1b)"/><text class="t-mono" x="71" y="150">claim</text>
+        <path class="wire-acc" d="M225 170 L225 88" marker-end="url(#queue-a1b)"/><text class="t-mono" x="231" y="150">claim</text>
+        <path class="wire-acc" d="M385 170 L385 88" marker-end="url(#queue-a1b)"/><text class="t-mono" x="391" y="150">claim</text>
+        <path class="wire-acc" d="M545 170 L545 88" marker-end="url(#queue-a1b)"/><text class="t-mono" x="551" y="150">claim</text>
+        <path class="wire-acc" d="M705 170 L705 88" marker-end="url(#queue-a1b)"/><text class="t-mono" x="711" y="150">claim</text>
+
+        <path class="wire" d="M150 86 L200 166" marker-end="url(#queue-a1)"/><text class="t-mono" x="160" y="126" text-anchor="end">enqueue</text>
+        <path class="wire" d="M310 86 L360 166" marker-end="url(#queue-a1)"/><text class="t-mono" x="320" y="126" text-anchor="end">enqueue</text>
+        <path class="wire" d="M630 86 L680 166" marker-end="url(#queue-a1)"/><text class="t-mono" x="640" y="126" text-anchor="end">enqueue</text>
+
+        <rect class="bx" x="345" y="276" width="150" height="42" rx="8"/><text class="t-head" x="420" y="302" text-anchor="middle">Scheduler</text>
+        <path class="wire" d="M360 276 L122 246" marker-end="url(#queue-a1)"/><text class="t-sm" x="230" y="284" text-anchor="end">due fetches</text>
+        <path class="wire" d="M480 276 L578 246" marker-end="url(#queue-a1)"/><text class="t-sm" x="515" y="290">build at send_time − 30 min</text>
+        <text class="t-sm" x="840" y="262" text-anchor="end">jobs table (Postgres)</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 4.1</b> Every stage hands work to the next through one table, and no stage calls another directly. Fetch enqueues extract jobs for sources that need full text, and score jobs directly for the rest.</figcaption>
+  </figure>
+  <div class="note principle"><span class="label">Key principle</span><p>Record the decision to do work durably, in the same database as the data, before doing the work. Leases, retries and dead letters all exist to make sure a recorded job reaches a final state without anyone remembering it in memory.</p></div>
+
+  <h3>What a job row holds</h3>
+  <p>A job is one row in <code>jobs</code>. Figure 4.2 shows a fetch job for source 42 that timed out once and is now on its second attempt.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 760 334" role="img" aria-label="One row of the jobs table shown as labelled cells in five groups. What to do: id 48213, queue fetch, kind fetch, payload source_id 42, dedupe_key fetch:42. When: state running, priority 1, run_at 06:00:07. Retries: attempts 2, max_attempts 4, deferrals 0. Ownership: locked_by worker-7f3a, lease_expires_at 06:01:07. Outcome: last_error timeout on attempt 1, created_at 06:00:00, finished_at NULL. The state, attempts, locked_by and lease_expires_at cells are highlighted because the claim query writes them.">
+        <text class="t-head" x="20" y="38">What to do</text><text class="t-sm" x="20" y="54">identity and payload</text>
+        <rect class="bx" x="160" y="16" width="80" height="48" rx="6"/><text class="t-mono" x="200" y="34" text-anchor="middle">id</text><text x="200" y="54" text-anchor="middle">48213</text>
+        <rect class="bx" x="247" y="16" width="90" height="48" rx="6"/><text class="t-mono" x="292" y="34" text-anchor="middle">queue</text><text x="292" y="54" text-anchor="middle">'fetch'</text>
+        <rect class="bx" x="344" y="16" width="90" height="48" rx="6"/><text class="t-mono" x="389" y="34" text-anchor="middle">kind</text><text x="389" y="54" text-anchor="middle">'fetch'</text>
+        <rect class="bx" x="441" y="16" width="170" height="48" rx="6"/><text class="t-mono" x="526" y="34" text-anchor="middle">payload</text><text x="526" y="54" text-anchor="middle">{"source_id": 42}</text>
+        <rect class="bx" x="618" y="16" width="120" height="48" rx="6"/><text class="t-mono" x="678" y="34" text-anchor="middle">dedupe_key</text><text x="678" y="54" text-anchor="middle">'fetch:42'</text>
+
+        <text class="t-head" x="20" y="102">When</text><text class="t-sm" x="20" y="118">eligibility and order</text>
+        <rect class="bx-pg" x="160" y="80" width="120" height="48" rx="6"/><text class="t-mono" x="220" y="98" text-anchor="middle">state</text><text x="220" y="118" text-anchor="middle">'running'</text>
+        <rect class="bx" x="287" y="80" width="100" height="48" rx="6"/><text class="t-mono" x="337" y="98" text-anchor="middle">priority</text><text x="337" y="118" text-anchor="middle">1</text>
+        <rect class="bx" x="394" y="80" width="150" height="48" rx="6"/><text class="t-mono" x="469" y="98" text-anchor="middle">run_at</text><text x="469" y="118" text-anchor="middle">06:00:07</text>
+
+        <text class="t-head" x="20" y="166">Retries</text><text class="t-sm" x="20" y="182">the attempt budget</text>
+        <rect class="bx-pg" x="160" y="144" width="100" height="48" rx="6"/><text class="t-mono" x="210" y="162" text-anchor="middle">attempts</text><text x="210" y="182" text-anchor="middle">2</text>
+        <rect class="bx" x="267" y="144" width="130" height="48" rx="6"/><text class="t-mono" x="332" y="162" text-anchor="middle">max_attempts</text><text x="332" y="182" text-anchor="middle">4</text>
+        <rect class="bx" x="404" y="144" width="110" height="48" rx="6"/><text class="t-mono" x="459" y="162" text-anchor="middle">deferrals</text><text x="459" y="182" text-anchor="middle">0</text>
+
+        <text class="t-head" x="20" y="230">Ownership</text><text class="t-sm" x="20" y="246">who holds the lease</text>
+        <rect class="bx-pg" x="160" y="208" width="200" height="48" rx="6"/><text class="t-mono" x="260" y="226" text-anchor="middle">locked_by</text><text x="260" y="246" text-anchor="middle">'worker-7f3a'</text>
+        <rect class="bx-pg" x="367" y="208" width="200" height="48" rx="6"/><text class="t-mono" x="467" y="226" text-anchor="middle">lease_expires_at</text><text x="467" y="246" text-anchor="middle">06:01:07</text>
+
+        <text class="t-head" x="20" y="294">Outcome</text><text class="t-sm" x="20" y="310">for diagnosis</text>
+        <rect class="bx" x="160" y="272" width="220" height="48" rx="6"/><text class="t-mono" x="270" y="290" text-anchor="middle">last_error</text><text x="270" y="310" text-anchor="middle">timeout (attempt 1)</text>
+        <rect class="bx" x="387" y="272" width="130" height="48" rx="6"/><text class="t-mono" x="452" y="290" text-anchor="middle">created_at</text><text x="452" y="310" text-anchor="middle">06:00:00</text>
+        <rect class="bx" x="524" y="272" width="130" height="48" rx="6"/><text class="t-mono" x="589" y="290" text-anchor="middle">finished_at</text><text x="589" y="310" text-anchor="middle">NULL</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 4.2</b> One job, read as five groups of columns. The highlighted cells are the ones the claim writes. The priority number is illustrative, because the plan fixes the order of priorities but not their values.</figcaption>
+  </figure>
+  <div class="tbl"><table>
+    <thead><tr><th>Column</th><th>What it's for</th></tr></thead>
+    <tbody>
+      <tr><td><code>id</code></td><td>A <code>bigint</code> identity. Logs, dead letters and the replay command refer to it.</td></tr>
+      <tr><td><code>queue</code></td><td>Which pool of worker slots runs the job: <code>fetch</code>, <code>extract</code>, <code>score</code>, <code>build</code>, <code>deliver</code> or <code>maintenance</code>.</td></tr>
+      <tr><td><code>kind</code>, <code>payload</code></td><td>Which handler to run, and its arguments as <code>jsonb</code>. Payloads hold ids, never whole articles, so the handler always reads current data.</td></tr>
+      <tr><td><code>dedupe_key</code></td><td>While one job with a given key is queued or running, a second can't be inserted. Every kind of job has one.</td></tr>
+      <tr><td><code>group_key</code></td><td>The rubric hash, on score jobs only. It lets a worker claim ten jobs for one rubric as a batch.</td></tr>
+      <tr><td><code>state</code></td><td><code>queued</code>, <code>running</code>, <code>succeeded</code> or <code>dead</code>. The partial indexes are defined on it.</td></tr>
+      <tr><td><code>priority</code>, <code>run_at</code></td><td>Order and eligibility. A job is claimable only once <code>run_at &lt;= now()</code>, which is how retries and deferrals wait.</td></tr>
+      <tr><td><code>attempts</code>, <code>max_attempts</code>, <code>deferrals</code></td><td>Runs that actually started work, the limit after which the job goes <code>dead</code>, and how often it was put back without doing any work.</td></tr>
+      <tr><td><code>locked_by</code>, <code>lease_expires_at</code></td><td>Which worker owns a running job, and until when. The reaper reads these.</td></tr>
+      <tr><td><code>last_error</code>, <code>created_at</code>, <code>finished_at</code></td><td>What went wrong last time, and how long the job waited and ran.</td></tr>
+    </tbody>
+  </table></div>
+  <p>A <b>partial index</b> is an index with a <code>WHERE</code> clause, so it holds only the rows that match. The plan defines four on <code>jobs</code>:</p>
+  <ul>
+    <li><b>Dedupe.</b> <code>UNIQUE(dedupe_key) WHERE state IN ('queued', 'running')</code> stops duplicate pending jobs.</li>
+    <li><b>Claim.</b> <code>INDEX(queue, priority DESC, run_at) WHERE state = 'queued'</code> matches the claim query, so finding the next job never touches finished rows.</li>
+    <li><b>Score batches.</b> <code>INDEX(queue, group_key, run_at) WHERE state = 'queued'</code> serves the batched score claim.</li>
+    <li><b>Reaper.</b> <code>INDEX(lease_expires_at) WHERE state = 'running'</code> finds expired leases.</li>
+  </ul>
+
+  <h3>What Postgres does when two writers want the same row</h3>
+  <p>Readers never wait for writers, but two writers of the same row take turns. The claim query relies on both facts.</p>
+  <ul>
+    <li><b>Row versions (MVCC).</b> Under <b>multiversion concurrency control</b>, an <code>UPDATE</code> writes a new version of the row, and each statement reads a snapshot. Old versions stay as <b>dead tuples</b> until <code>VACUUM</code> reclaims them.</li>
+    <li><b>Row locks.</b> An update locks the row until its transaction ends, and a second writer waits. When the first commits, Postgres (at the default <code>READ COMMITTED</code> level) re-reads the newest version and checks the waiter's <code>WHERE</code> clause again. If the row no longer matches, the waiter skips it.</li>
+    <li><b><code>FOR UPDATE</code>.</b> <code>SELECT … FOR UPDATE</code> takes the same lock without changing anything. Plain <code>SELECT</code>s are unaffected.</li>
+  </ul>
+
+  <h3>Claiming work with <code>SKIP LOCKED</code></h3>
+  <p>Several workers ask for work at once. Two must never get the same job, and none should wait for another. Selecting a job and then updating it leaves a gap in which two workers pick the same row, and <code>FOR UPDATE</code> closes the gap.</p>
+  <div class="split">
+    <div class="no"><h4><code>FOR UPDATE</code> on its own</h4><p>Every worker sorts the same way, so all of them try to lock the same first row. One wins and the rest wait, then collide again on the next row.</p></div>
+    <div class="yes"><h4><code>FOR UPDATE SKIP LOCKED</code></h4><p>A row another transaction has locked is skipped at once. Each worker locks a different set of rows, nobody waits, and each extra worker adds throughput.</p></div>
+  </div>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 760 300" role="img" aria-label="Timeline of three workers claiming from the same table with a batch size of two. Worker 1 starts first and locks jobs 101 and 102. Worker 2 starts a moment after, skips 101 and 102 because worker 1 holds them, and locks 103 and 104. Worker 3 skips 101 to 104 and locks 105 and 106. Each claim commits quickly, and each worker then works on its jobs with no transaction open. The bottom row shows jobs 101 and 102 owned by worker 1, 103 and 104 by worker 2, and 105 and 106 by worker 3.">
+        <defs>
+          <marker id="queue-a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <text class="t-head" x="20" y="68">Worker 1</text>
+        <rect class="bx-pg" x="100" y="50" width="200" height="26" rx="6"/><text class="t-mono" x="200" y="67" text-anchor="middle">claim: lock 101, 102</text>
+        <rect class="bx-ok" x="310" y="50" width="420" height="26" rx="6"/><text class="t-sm" x="520" y="67" text-anchor="middle">works on 101 and 102 with no transaction open</text>
+        <text class="t-sm" x="100" y="94">skips nothing</text>
+
+        <text class="t-head" x="20" y="128">Worker 2</text>
+        <rect class="bx-pg" x="140" y="110" width="200" height="26" rx="6"/><text class="t-mono" x="240" y="127" text-anchor="middle">claim: lock 103, 104</text>
+        <rect class="bx-ok" x="350" y="110" width="380" height="26" rx="6"/><text class="t-sm" x="540" y="127" text-anchor="middle">works on 103 and 104</text>
+        <text class="t-sm" x="140" y="154">skips 101, 102 (locked by worker 1)</text>
+
+        <text class="t-head" x="20" y="188">Worker 3</text>
+        <rect class="bx-pg" x="180" y="170" width="200" height="26" rx="6"/><text class="t-mono" x="280" y="187" text-anchor="middle">claim: lock 105, 106</text>
+        <rect class="bx-ok" x="390" y="170" width="340" height="26" rx="6"/><text class="t-sm" x="560" y="187" text-anchor="middle">works on 105 and 106</text>
+        <text class="t-sm" x="180" y="214">skips 101 to 104</text>
+
+        <path class="wire" d="M100 232 L728 232" marker-end="url(#queue-a3)"/>
+        <text class="t-sm" x="730" y="224" text-anchor="end">time (not to scale)</text>
+
+        <text class="t-head" x="20" y="274">Rows</text>
+        <rect class="bx" x="100" y="246" width="95" height="44" rx="6"/><text class="t-mono" x="147" y="263" text-anchor="middle">id 101</text><text x="147" y="282" text-anchor="middle">worker 1</text>
+        <rect class="bx" x="205" y="246" width="95" height="44" rx="6"/><text class="t-mono" x="252" y="263" text-anchor="middle">id 102</text><text x="252" y="282" text-anchor="middle">worker 1</text>
+        <rect class="bx" x="310" y="246" width="95" height="44" rx="6"/><text class="t-mono" x="357" y="263" text-anchor="middle">id 103</text><text x="357" y="282" text-anchor="middle">worker 2</text>
+        <rect class="bx" x="415" y="246" width="95" height="44" rx="6"/><text class="t-mono" x="462" y="263" text-anchor="middle">id 104</text><text x="462" y="282" text-anchor="middle">worker 2</text>
+        <rect class="bx" x="520" y="246" width="95" height="44" rx="6"/><text class="t-mono" x="567" y="263" text-anchor="middle">id 105</text><text x="567" y="282" text-anchor="middle">worker 3</text>
+        <rect class="bx" x="625" y="246" width="95" height="44" rx="6"/><text class="t-mono" x="672" y="263" text-anchor="middle">id 106</text><text x="672" y="282" text-anchor="middle">worker 3</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 4.3</b> Three overlapping claims (shaded). Each passes over rows another transaction has locked, so the batches never overlap and nobody waits. A real claim takes about a millisecond; the work takes seconds.</figcaption>
+  </figure>
+  <h4>The claim query, line by line</h4>
+<pre><code>WITH next AS (
+  SELECT id FROM jobs
+  WHERE state = 'queued' AND queue = ANY($queues) AND run_at &lt;= now()
+  ORDER BY priority DESC, run_at
+  LIMIT $batch
+  <span class="hl">FOR UPDATE SKIP LOCKED</span>
+)
+UPDATE jobs j
+SET state = 'running', <span class="hl">attempts = attempts + 1</span>,
+    locked_by = $worker_id, lease_expires_at = now() + $lease
+FROM next WHERE j.id = next.id
+RETURNING j.*;</code></pre>
+  <ol class="steps">
+    <li><b><code>WITH next AS (…)</code></b> is a named sub-query that the <code>UPDATE</code> joins against. Select and update are one statement, so the claim is one short transaction.</li>
+    <li><b><code>WHERE</code></b> picks jobs that are waiting, in a queue this worker has free slots for, and due. A retry scheduled for 06:31 stays invisible until 06:31.</li>
+    <li><b><code>ORDER BY priority DESC, run_at</code></b> takes the most important, longest-waiting work first, in the order of the partial index.</li>
+    <li><b><code>LIMIT $batch</code></b> takes several jobs in one round trip, typically one per free slot.</li>
+    <li><b><code>SET</code></b> marks the job taken, with its owner and a 60-second lease. It's also the only place <code>attempts</code> goes up, so a run that crashes is still counted.</li>
+  </ol>
+  <p>Skipping means strict ordering across workers isn't guaranteed. That's the price of never waiting, and it doesn't matter here.</p>
+
+  <h4>Claiming score jobs ten at a time</h4>
+  <p>One Haiku call scores up to 10 articles under one rubric, so score jobs carry <code>group_key = rubric_hash</code>. A score worker first locks the oldest due group with <code>SELECT group_key … ORDER BY priority DESC, run_at LIMIT 1 FOR UPDATE SKIP LOCKED</code>, then runs the claim with <code>AND group_key = $g</code> and a batch of 10.</p>
+  <p>Serving the oldest group first means a busy rubric can't starve the others.</p>
+
+  <h3>Leases, heartbeats and the reaper</h3>
+  <p>The claim commits straight away, and the job runs with no transaction open. A lease is how the queue gets the job back if the worker dies.</p>
+  <p>Holding the claim transaction open would also recover crashes, but every running job would hold a connection, and a long-open transaction stops <code>VACUUM</code> removing dead tuples anywhere in the database.</p>
+  <ul>
+    <li><b>Lease.</b> A time limit on a worker's claim to a job. The claim writes <code>lease_expires_at = now() + 60 s</code>.</li>
+    <li><b>Heartbeat.</b> Extends the lease every <code>lease / 3</code>, or 20 seconds, so two heartbeats in a row can fail before it lapses.</li>
+    <li><b>Reaper.</b> Part of the scheduler loop. On each tick it handles jobs whose lease has run out.</li>
+  </ul>
+  <p>The plan gives no SQL for these. One straightforward version:</p>
+<pre><code><span class="c">-- job heartbeat, every lease / 3</span>
+UPDATE jobs
+SET lease_expires_at = now() + $lease
+WHERE id = $job_id AND state = 'running'
+  <span class="hl">AND locked_by = $worker_id</span>;   <span class="c">-- 0 rows: you no longer own this job</span>
+
+<span class="c">-- reaper, on each scheduler tick: lock the expired jobs</span>
+SELECT id, attempts, max_attempts FROM jobs
+WHERE state = 'running' AND lease_expires_at &lt; now()
+FOR UPDATE SKIP LOCKED;
+
+<span class="c">-- then, per job, in the same transaction</span>
+UPDATE jobs
+SET state = 'queued', run_at = now() + $backoff,   <span class="c">-- or 'dead' at max_attempts</span>
+    last_error = 'lease expired', locked_by = NULL, lease_expires_at = NULL
+WHERE id = $id AND state = 'running' AND lease_expires_at &lt; now();</code></pre>
+  <p>The <code>locked_by</code> guard means a worker that has lost its job changes nothing, and the zero row count tells it to stop. </p>
+  <p>A lease expiry counts as an attempt, because the crashed run did start work. If <code>attempts</code> has reached <code>max_attempts</code>, the reaper sends the job to <code>dead</code> instead.</p>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 760 315" role="img" aria-label="Timeline from 0 to 120 seconds. Worker A claims job 48213 at 0 seconds with a lease to 60 seconds. Heartbeats at 20 and 40 seconds extend the lease to 80 and then 100 seconds. Worker A is killed at 45 seconds, and the heartbeat due at 60 seconds is missed. The reaper ticks at 50 seconds and finds nothing expired. The lease expires at 100 seconds. At the reaper tick at 110 seconds the job is requeued with backoff, and worker B claims it again with attempts equal to 2.">
+        <text class="t-head" x="20" y="67">Worker A</text>
+        <text class="t-mono" x="100" y="40">claim</text>
+        <text class="t-mono" x="200" y="40" text-anchor="middle">heartbeat</text>
+        <text class="t-mono" x="300" y="40" text-anchor="middle">heartbeat</text>
+        <text class="t-mono" x="400" y="40" text-anchor="middle">missed</text>
+        <rect class="bx-ok" x="100" y="50" width="225" height="24" rx="5"/><text class="t-sm" x="150" y="66" text-anchor="middle">job 48213</text>
+        <line class="wire-acc" x1="200" y1="46" x2="200" y2="78"/>
+        <line class="wire-acc" x1="300" y1="46" x2="300" y2="78"/>
+        <rect class="bx-bad" x="325" y="48" width="10" height="28" rx="2"/>
+        <line class="wire-dash" x1="400" y1="46" x2="400" y2="78"/>
+        <text class="t-sm" x="320" y="94">killed at 45 s</text>
+
+        <text class="t-head" x="20" y="126">Lease</text>
+        <rect class="bx-pg" x="100" y="106" width="300" height="8" rx="2"/><text class="t-mono" x="406" y="114">60 s</text>
+        <rect class="bx-pg" x="200" y="118" width="300" height="8" rx="2"/><text class="t-mono" x="506" y="126">80 s</text>
+        <rect class="bx-pg" x="300" y="130" width="300" height="8" rx="2"/><text class="t-mono" x="606" y="138">expires at 100 s</text>
+
+        <text class="t-head" x="20" y="194">Reaper</text>
+        <rect class="bx" x="346" y="182" width="8" height="16" rx="1"/><text class="t-sm" x="362" y="194">tick: nothing has expired</text>
+        <rect class="bx" x="646" y="182" width="8" height="16" rx="1"/><text class="t-sm" x="740" y="220" text-anchor="end">tick: lease expired, requeued with backoff</text>
+
+        <text class="t-head" x="20" y="256">Worker B</text>
+        <rect class="bx-ok" x="660" y="240" width="80" height="24" rx="5"/><text class="t-sm" x="700" y="256" text-anchor="middle">job 48213</text>
+        <text class="t-sm" x="650" y="256" text-anchor="end">claims it again, attempts = 2</text>
+
+        <line class="axis" x1="100" y1="284" x2="700" y2="284"/>
+        <line class="axis" x1="100" y1="284" x2="100" y2="290"/><text class="t-mono" x="100" y="304" text-anchor="middle">0 s</text>
+        <line class="axis" x1="200" y1="284" x2="200" y2="290"/><text class="t-mono" x="200" y="304" text-anchor="middle">20 s</text>
+        <line class="axis" x1="300" y1="284" x2="300" y2="290"/><text class="t-mono" x="300" y="304" text-anchor="middle">40 s</text>
+        <line class="axis" x1="400" y1="284" x2="400" y2="290"/><text class="t-mono" x="400" y="304" text-anchor="middle">60 s</text>
+        <line class="axis" x1="500" y1="284" x2="500" y2="290"/><text class="t-mono" x="500" y="304" text-anchor="middle">80 s</text>
+        <line class="axis" x1="600" y1="284" x2="600" y2="290"/><text class="t-mono" x="600" y="304" text-anchor="middle">100 s</text>
+        <line class="axis" x1="700" y1="284" x2="700" y2="290"/><text class="t-mono" x="700" y="304" text-anchor="middle">120 s</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 4.4</b> A worker dies mid-job. Each heartbeat pushes the lease 60 seconds past itself, so the lease outlives the crash by up to a minute. The first reaper tick after expiry requeues the job, and worker B runs it from the start.</figcaption>
+  </figure>
+  <p>Worst-case recovery is the lease, plus the wait for the next reaper tick, plus the retry's backoff. That's ample for a briefing built 30 minutes before its send time.</p>
+
+  <div class="note pitfall"><span class="label">Common mistake</span><p>Calling the LLM between <code>SELECT … FOR UPDATE</code> and <code>COMMIT</code>. It works in testing, but under load it exhausts the connection pool and blocks vacuum. Claim, commit, then work.</p></div>
+
+  <h3>The four job states, and how attempts are counted</h3>
+  <p>A job is <code>queued</code>, <code>running</code>, <code>succeeded</code> or <code>dead</code>. There is no <code>failed</code> state. A failure that will be retried goes back to <code>queued</code> with a future <code>run_at</code>, and one that won't becomes <code>dead</code>.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 800 410" role="img" aria-label="Job state machine with four states. A queued job is claimed, which adds one to attempts, and becomes running. From running: the handler returns and the job becomes succeeded, which is deleted after 7 days. A retryable error returns the job to queued with run_at set to now plus backoff. A host deferral returns it to queued, taking one off attempts and adding one to deferrals. An expired lease with attempts below the maximum returns it to queued through the reaper, with backoff. An error at max_attempts, a fatal error, or an expired lease at max_attempts leads to dead, which is deleted after 30 days. A dead job can be replayed by hand with briefing jobs replay, which returns the same row to queued with attempts set to 0.">
+        <defs>
+          <marker id="queue-a5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+          <marker id="queue-a5b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <rect class="bx" x="30" y="170" width="120" height="46" rx="23"/><text class="t-head" x="90" y="198" text-anchor="middle">queued</text>
+        <rect class="bx-pg" x="290" y="170" width="130" height="46" rx="23"/><text class="t-head" x="355" y="198" text-anchor="middle">running</text>
+        <rect class="bx-ok" x="560" y="70" width="130" height="46" rx="23"/><text class="t-head" x="625" y="98" text-anchor="middle">succeeded</text>
+        <rect class="bx-bad" x="560" y="270" width="130" height="46" rx="23"/><text class="t-head" x="625" y="298" text-anchor="middle">dead</text>
+        <rect class="bx-ghost" x="700" y="176" width="86" height="34" rx="17"/><text x="743" y="198" text-anchor="middle">deleted</text>
+
+        <path class="wire-acc" d="M150 193 L288 193" marker-end="url(#queue-a5b)"/>
+        <text class="t-mono" x="219" y="185" text-anchor="middle">claim, attempts + 1</text>
+
+        <path class="wire" d="M405 172 L558 104" marker-end="url(#queue-a5)"/>
+        <text class="t-sm" x="548" y="82" text-anchor="end">handler returns</text>
+
+        <path class="wire" d="M405 214 L558 282" marker-end="url(#queue-a5)"/>
+        <text class="t-sm" x="550" y="322" text-anchor="end">error at max_attempts, a fatal error,</text>
+        <text class="t-sm" x="550" y="338" text-anchor="end">or lease expired at max_attempts</text>
+
+        <path class="wire-dash" d="M690 100 L738 174" marker-end="url(#queue-a5)"/>
+        <text class="t-sm" x="722" y="128">7 days</text>
+        <path class="wire-dash" d="M690 286 L738 212" marker-end="url(#queue-a5)"/>
+        <text class="t-sm" x="722" y="266">30 days</text>
+
+        <path class="wire-dash" d="M355 170 C 335 110, 120 110, 95 168" marker-end="url(#queue-a5)"/>
+        <text class="t-sm" x="225" y="84" text-anchor="middle">lease expired, attempts below max:</text>
+        <text class="t-sm" x="225" y="100" text-anchor="middle">the reaper requeues it with backoff</text>
+
+        <path class="wire" d="M345 216 C 330 275, 130 275, 115 218" marker-end="url(#queue-a5)"/>
+        <text class="t-sm" x="245" y="284" text-anchor="middle">retryable error: run_at = now() + backoff</text>
+        <text class="t-sm" x="245" y="300" text-anchor="middle">host deferral: attempts − 1, deferrals + 1</text>
+
+        <path class="wire-dash" d="M625 316 C 600 400, 20 400, 50 218" marker-end="url(#queue-a5)"/>
+        <text class="t-sm" x="340" y="392" text-anchor="middle">replay by hand: briefing jobs replay &lt;id&gt; (attempts = 0)</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 4.5</b> The full job lifecycle. The three arrows back to <code>queued</code> from <code>running</code> are retries, deferrals and crash recovery, and replay is the only way out of <code>dead</code>. All of them reuse the same claim path.</figcaption>
+  </figure>
+  <p>Every change of state is one <code>UPDATE</code>, guarded by the state it expects to leave. The plan's attempt accounting:</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Event</th><th><code>attempts</code></th><th><code>deferrals</code></th><th>Next state</th></tr></thead>
+    <tbody>
+      <tr><td>Claimed</td><td>+1, here and only here</td><td></td><td><code>running</code></td></tr>
+      <tr><td>Succeeded</td><td></td><td></td><td><code>succeeded</code></td></tr>
+      <tr><td>Retryable failure, <code>attempts &lt; max_attempts</code></td><td>unchanged</td><td></td><td><code>queued</code>, <code>run_at = now() + backoff(attempts)</code></td></tr>
+      <tr><td>Retryable failure at <code>max_attempts</code>, or a fatal error</td><td>unchanged</td><td></td><td><code>dead</code>, plus a <code>dead_letters</code> row</td></tr>
+      <tr><td>Deferral: host slot in the future, or host blocked</td><td>−1, giving back the claim's +1</td><td>+1</td><td><code>queued</code>, <code>run_at = slot</code></td></tr>
+      <tr><td>Lease expired</td><td>unchanged: the crashed run counts</td><td></td><td>Reaper: <code>dead</code> at <code>max_attempts</code>, otherwise <code>queued</code> with backoff</td></tr>
+    </tbody>
+  </table></div>
+  <p>So <code>attempts</code> means "runs that actually started work". A fatal error, such as a feed that answers <code>404</code>, goes straight to <code>dead</code>.</p>
+  <ul>
+    <li><b>Poison pills.</b> A job that crashes its worker every time is counted by the reaper and stops at <code>max_attempts</code>, instead of crashing workers for ever.</li>
+    <li><b>Deferral storms.</b> A deferral costs no attempt, so a job that defers in a loop never dies. Over 100 deferrals logs <code>job.deferral_storm</code> and alerts.</li>
+  </ul>
+  <p>Every finishing write carries the guard <code>AND locked_by = $worker_id AND state = 'running'</code>. A worker whose lease has gone discards its result, so it can't overwrite a job another worker may now own.</p>
+
+  <h3>Why a slow worker can run a job twice</h3>
+  <p>The queue is <b>at-least-once</b>, so a job can occasionally run twice. Exactly-once isn't possible when the work has effects outside the database, such as an email, because no transaction covers both systems.</p>
+  <div class="split">
+    <div class="no"><h4>At-most-once</h4><p>Record completion, then act. A crash in between means the work never happens. For a daily briefing, silently losing an email is the worse failure.</p></div>
+    <div class="yes"><h4>At-least-once</h4><p>Act, then record completion. A crash in between means the work happens twice. If every handler is idempotent, that does no harm.</p></div>
+  </div>
+  <p>A crash is the obvious way to get a second run. The subtler one is a worker that is alive but slow, for example because CPU-heavy code blocks the event loop the heartbeat runs on. A lease can't tell it from a dead one.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 760 352" role="img" aria-label="Sequence of a duplicate run, not to scale. Worker A claims a webhook delivery job and stalls without sending heartbeats. Its lease expires. The reaper requeues the job with backoff, and worker B claims it with attempts equal to 2 and posts the webhook, which the receiver processes. Worker A resumes and posts the same webhook again. The receiver sees the same webhook-id and skips it. Worker A's final update matches zero rows.">
+        <defs>
+          <marker id="queue-a6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-acc" d="M0 0 L10 5 L0 10 z"/></marker>
+          <marker id="queue-a6b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <text class="t-head" x="20" y="67">Worker A</text>
+        <text class="t-mono" x="100" y="40">claim</text>
+        <rect class="bx-ok" x="100" y="50" width="50" height="24" rx="5"/>
+        <rect class="bx-ghost" x="150" y="50" width="350" height="24" rx="5"/><text class="t-sm" x="325" y="66" text-anchor="middle">stalled: no heartbeats sent</text>
+        <rect class="bx-ok" x="500" y="50" width="40" height="24" rx="5"/>
+        <text class="t-sm" x="548" y="60">resumes and POSTs again</text>
+        <text class="t-sm" x="548" y="78">its final UPDATE matches 0 rows</text>
+        <path class="wire-acc" d="M525 76 L525 278" marker-end="url(#queue-a6)"/>
+
+        <text class="t-head" x="20" y="126">Lease</text>
+        <rect class="bx-pg" x="100" y="116" width="300" height="8" rx="2"/>
+        <text class="t-mono" x="395" y="110" text-anchor="end">lease expires</text>
+
+        <text class="t-head" x="20" y="188">Reaper</text>
+        <rect class="bx" x="421" y="176" width="8" height="16" rx="1"/>
+        <text class="t-sm" x="412" y="188" text-anchor="end">tick: requeues it with backoff</text>
+
+        <text class="t-head" x="20" y="248">Worker B</text>
+        <rect class="bx-ok" x="430" y="232" width="30" height="24" rx="5"/>
+        <text class="t-sm" x="420" y="248" text-anchor="end">claims it, attempts = 2</text>
+        <path class="wire-acc" d="M450 258 L450 278" marker-end="url(#queue-a6)"/>
+
+        <text class="t-head" x="20" y="297">Receiver</text>
+        <rect class="bx-ok" x="445" y="282" width="10" height="20" rx="2"/>
+        <rect class="bx" x="520" y="282" width="10" height="20" rx="2"/>
+        <text class="t-sm" x="436" y="297" text-anchor="end">POST 1: processed</text>
+        <text class="t-sm" x="538" y="297">POST 2: same webhook-id, skipped</text>
+
+        <path class="wire" d="M100 325 L708 325" marker-end="url(#queue-a6b)"/>
+        <text class="t-sm" x="710" y="342" text-anchor="end">time (not to scale)</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 4.6</b> A slow worker causes a duplicate. The <code>locked_by</code> guard stops worker A overwriting the job's state, but it can't recall the request A already sent. The stable webhook id lets the receiver discard the second copy.</figcaption>
+  </figure>
+  <p>The guard keeps the job's record correct, and idempotent handlers keep the effects correct. A second score run finds the cached score, and a second build finds the existing <code>briefings</code> row. Email receivers can't deduplicate, so a rare duplicate email is possible, a trade-off the plan documents openly.</p>
+  <div class="note principle"><span class="label">Key principle</span><p>A queue can't tell a dead worker from a slow one, so any queue that recovers from crashes will sometimes run a job twice. Make every handler idempotent so that running twice has the effect of running once.</p></div>
+
+  <h3>Enqueueing in the same transaction as the data</h3>
+  <p>A fetch worker saves an article and must also enqueue its score job. With the queue in another system, such as SQS, those are two writes that no transaction spans, and a crash between them breaks either order:</p>
+  <ul>
+    <li><b>Commit, then send.</b> The article is saved but never scored, and nothing records the missing job.</li>
+    <li><b>Send, then commit.</b> A score worker receives a job for an article that doesn't exist.</li>
+  </ul>
+  <p>The usual fix is a <b>transactional outbox</b>. The worker writes the message into an <code>outbox</code> table with the data, and a <b>relay</b> process publishes it. That adds a table, a process and a second system that fails on its own.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 760 350" role="img" aria-label="Two panels. Left, the outbox pattern with SQS: a transaction inserts the article and an outbox row and commits; a relay process reads unsent rows, sends them and marks them sent; the message goes into the SQS queue, a second system with its own failures; a worker receives the message and runs the job. Right, transactional enqueue in Postgres: a transaction inserts the article and a jobs row, issues NOTIFY and commits; a worker claims the row with SKIP LOCKED. There is no relay process and no second system to run or monitor.">
+        <defs>
+          <marker id="queue-a7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker>
+        </defs>
+        <text class="t-head" x="190" y="28" text-anchor="middle">Outbox pattern (database + SQS)</text>
+        <rect class="bx-pg" x="30" y="50" width="320" height="50" rx="7"/>
+        <text class="t-mono" x="190" y="71" text-anchor="middle">BEGIN; INSERT article;</text>
+        <text class="t-mono" x="190" y="89" text-anchor="middle">INSERT outbox row; COMMIT</text>
+        <path class="wire" d="M190 100 L190 128" marker-end="url(#queue-a7)"/>
+        <rect class="bx" x="30" y="130" width="320" height="50" rx="7"/>
+        <text class="t-head" x="190" y="151" text-anchor="middle">Relay process</text>
+        <text class="t-sm" x="190" y="169" text-anchor="middle">reads unsent rows, sends them, marks them sent</text>
+        <path class="wire" d="M190 180 L190 208" marker-end="url(#queue-a7)"/>
+        <rect class="bx" x="30" y="210" width="320" height="50" rx="7"/>
+        <text class="t-head" x="190" y="231" text-anchor="middle">SQS queue</text>
+        <text class="t-sm" x="190" y="249" text-anchor="middle">a second system with its own failures</text>
+        <path class="wire" d="M190 260 L190 288" marker-end="url(#queue-a7)"/>
+        <rect class="bx-ok" x="30" y="290" width="320" height="50" rx="7"/>
+        <text class="t-head" x="190" y="311" text-anchor="middle">Worker</text>
+        <text class="t-sm" x="190" y="329" text-anchor="middle">receives the message and runs the job</text>
+
+        <text class="t-head" x="570" y="28" text-anchor="middle">Transactional enqueue (Postgres)</text>
+        <rect class="bx-pg" x="410" y="50" width="320" height="50" rx="7"/>
+        <text class="t-mono" x="570" y="71" text-anchor="middle">BEGIN; INSERT article;</text>
+        <text class="t-mono" x="570" y="89" text-anchor="middle">INSERT jobs row; NOTIFY; COMMIT</text>
+        <path class="wire" d="M570 100 L570 128" marker-end="url(#queue-a7)"/>
+        <rect class="bx-ok" x="410" y="130" width="320" height="50" rx="7"/>
+        <text class="t-head" x="570" y="151" text-anchor="middle">Worker</text>
+        <text class="t-sm" x="570" y="169" text-anchor="middle">claims the row with SKIP LOCKED</text>
+        <rect class="bx-ghost" x="410" y="210" width="320" height="50" rx="7"/>
+        <text class="t-sm" x="570" y="239" text-anchor="middle">no relay process</text>
+        <rect class="bx-ghost" x="410" y="290" width="320" height="50" rx="7"/>
+        <text class="t-sm" x="570" y="319" text-anchor="middle">no second system to run or monitor</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 4.7</b> With SQS, an outbox makes the enqueue atomic at the cost of a relay. With the queue in Postgres, the <code>jobs</code> table is both the outbox and the queue, so the relay disappears.</figcaption>
+  </figure>
+  <p>With the queue in the same database, enqueueing is an ordinary <code>INSERT</code> in the transaction that writes the data. This is the main reason ADR-001 chooses Postgres.</p>
+<pre><code>BEGIN;
+INSERT INTO articles (url_hash, url_canonical, content_hash, input_hash, title, …)
+VALUES (…)
+ON CONFLICT (url_hash) DO UPDATE SET last_seen_at = now(), …
+RETURNING id, (xmax = 0) AS inserted;
+
+<span class="c">-- for each (input_hash, rubric_hash) not already in llm_scores</span>
+INSERT INTO jobs (queue, kind, payload, dedupe_key, group_key, priority)
+VALUES ('score', 'score', $payload,
+        $dedupe_key,                <span class="c">-- 'score:{rubric_hash}:{input_hash}'</span>
+        $rubric_hash, $score_priority)
+ON CONFLICT DO NOTHING;
+
+NOTIFY jobs_score;
+<span class="hl">COMMIT;</span>   <span class="c">-- the article and its score jobs appear together, or not at all</span></code></pre>
+  <p>If the worker crashes before <code>COMMIT</code>, both vanish and the fetch simply runs again.</p>
+
+  <h3>Retries and host deferrals</h3>
+  <p>A job that fails with a retryable error is rescheduled in its own row, and the slot is freed. A worker never sleeps holding a job, so no slot idles and a restart loses no retry.</p>
+<pre><code>UPDATE jobs
+SET state = 'queued',
+    run_at = now() + $delay,        <span class="c">-- backoff with jitter, computed in Python</span>
+    last_error = $error,
+    locked_by = NULL, lease_expires_at = NULL
+WHERE id = $job_id AND state = 'running' AND locked_by = $worker_id;</code></pre>
+  <p>This leaves <code>attempts</code> alone, because the claim already counted the run. The delay is "full jitter", <code>uniform(0, min(cap, base × 2^(n−1)))</code>, where <code>n</code> is the attempt that just failed, counted from 1. Every queue uses this formula with its own <code>base</code>, <code>cap</code> and <code>max_attempts</code>. Fetch uses a 2 s base, a 5 min cap and 4 attempts per fetch cycle.</p>
+
+  <div class="note example"><span class="label">Worked example</span>
+    <p>One fetch job for source 42, with a 5-second connect timeout:</p>
+    <ol>
+      <li><b>06:00:00.</b> Attempt 1 times out at 06:00:05. The ceiling is 2 s and the draw is 1.3 s, so <code>run_at</code> is about 06:00:06.</li>
+      <li><b>06:00:06.</b> Attempt 2 gets <code>503</code> with no <code>Retry-After</code>. The ceiling is 4 s and the draw is 2.9 s.</li>
+      <li><b>06:00:09.</b> Attempt 3 gets <code>429</code> with <code>Retry-After: 120</code>. <code>hosts.blocked_until</code> becomes 06:02:09, and the job waits until then plus up to 12 s of jitter (10% of the wait), say 7.5 s.</li>
+      <li><b>06:02:17.</b> Attempt 4 succeeds. Had it failed, the job would have gone <code>dead</code> with <code>attempts = 4</code>.</li>
+    </ol>
+  </div>
+
+  <h4>A host deferral gives the attempt back</h4>
+  <p>Before fetching, a worker asks the per-host rate limiter for a slot. If the slot is in the future, the job is <b>deferred</b>. No request was made, so no attempt is used.</p>
+<pre><code>UPDATE jobs
+SET state = 'queued', run_at = $slot,
+    <span class="hl">attempts = attempts - 1, deferrals = deferrals + 1</span>,
+    payload = payload || jsonb_build_object('host_slot', $slot),
+    locked_by = NULL, lease_expires_at = NULL
+WHERE id = $job_id AND state = 'running' AND locked_by = $worker_id;</code></pre>
+  <ul>
+    <li><b>One ticket per request.</b> In revision 2, a job that runs within 30 seconds after its stored <code>host_slot</code> uses that slot, because asking again would give it a slot further out each time. Reserved slots can still bunch up when jobs resume late, so the rule is under revision (Q16), and the candidate fix claims the host just before sending and stores no slot at all.</li>
+    <li><b>Blocked hosts.</b> While <code>hosts.blocked_until</code> is in the future, every job for that host defers to it plus jitter.</li>
+    <li><b>The job that got the 429.</b> It did make a request, so its reschedule counts as an attempt.</li>
+  </ul>
+
+  <h3>One pending job per key</h3>
+  <p>A partial unique index allows at most one queued or running job per key. Without it, the scheduler's next one-minute tick would enqueue a slow fetch a second time.</p>
+<pre><code>CREATE UNIQUE INDEX jobs_dedupe_pending ON jobs (dedupe_key)
+  <span class="hl">WHERE state IN ('queued', 'running')</span>;
+
+INSERT INTO jobs (queue, kind, payload, dedupe_key, priority)
+VALUES ('fetch', 'fetch', '{"source_id": 42}', 'fetch:42', $fetch_priority)
+ON CONFLICT DO NOTHING;   <span class="c">-- a second pending fetch for source 42 is dropped</span></code></pre>
+  <p>Every kind of job has a key:</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Queue</th><th><code>dedupe_key</code></th></tr></thead>
+    <tbody>
+      <tr><td><code>fetch</code></td><td><code>fetch:{source_id}</code></td></tr>
+      <tr><td><code>extract</code></td><td><code>extract:{article_id}</code></td></tr>
+      <tr><td><code>score</code></td><td><code>score:{rubric_hash}:{input_hash}</code></td></tr>
+      <tr><td><code>build</code></td><td><code>build:{user_id}:{profile_id}:{briefing_date}</code></td></tr>
+      <tr><td><code>deliver</code></td><td><code>deliver:{delivery_id}</code></td></tr>
+      <tr><td><code>maintenance</code></td><td><code>maint:{task}:{utc_date}</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>A finished job is outside the partial index, so the next fetch for source 42 inserts normally. If you name a conflict target, repeat the predicate: <code>ON CONFLICT (dedupe_key) WHERE state IN ('queued', 'running') DO NOTHING</code>.</p>
+  <p>If two inserts with the same key race, the second waits for the first transaction, then does nothing if it committed or goes ahead if it rolled back. A "check, then insert" in Python can't settle a race that way.</p>
+  <div class="note pitfall"><span class="label">Common mistake</span><p>Writing a plain <code>UNIQUE(dedupe_key)</code> without the <code>WHERE</code> clause. Finished jobs stay in the table for days, so the first job for each key would block every one after it.</p></div>
+
+  <h3>Waking workers with <code>LISTEN</code> and <code>NOTIFY</code></h3>
+  <p>Workers wake within a second of an enqueue. A session that runs <code>LISTEN jobs_score</code> receives every <code>NOTIFY jobs_score</code>, and an idle worker waits on that with psycopg 3.</p>
+  <ul>
+    <li><b>Sent only on commit.</b> A worker never wakes for a job that doesn't exist yet, and a rollback sends nothing.</li>
+    <li><b>Merged.</b> Identical notifications from one transaction may arrive as one. The worker claims a batch, so that's fine.</li>
+    <li><b>Not stored.</b> A worker that is reconnecting at the time never receives it.</li>
+  </ul>
+  <p>So the plan keeps a 5-second poll as a fallback. It also catches retries, which fall due with no notification.</p>
+
+  <h3>Exactly one scheduler</h3>
+  <p>Every worker contains the scheduler loop, and a Postgres <b>advisory lock</b> decides which one runs it. That's a lock on a number your code chooses, which only one session can hold at a time.</p>
+<pre><code>SELECT pg_try_advisory_lock(<span class="hl">$scheduler_lock_id</span>);   <span class="c">-- true: you lead; false, at once: you don't</span></code></pre>
+  <p>The lock lasts until the session ends, which gives you failover. The leader enqueues due fetches, reaps expired leases, releases expired budget reservations, and enqueues <code>build_briefing</code> at each user's <code>send_time</code> minus 30 minutes in their timezone.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 800 320" role="img" aria-label="Leader election over 180 seconds with scheduler ticks every 60 seconds. At 0 seconds worker A's pg_try_advisory_lock returns true and workers B and C get false. A runs the scheduler until its process is killed at 95 seconds. At 60 seconds B and C still get false. When A's connection closes, Postgres releases the lock, which is free until the next tick. At 120 seconds B gets true and becomes the new leader, and C gets false at 120 and 180 seconds.">
+        <g transform="translate(40 0)">
+        <text class="t-head" x="-20" y="65">Worker A</text>
+        <rect class="bx-ok" x="77" y="49" width="46" height="22" rx="5"/><text class="t-mono" x="100" y="64" text-anchor="middle">true</text>
+        <rect class="bx-pg" x="127" y="52" width="289" height="16" rx="4"/><text class="t-sm" x="272" y="64" text-anchor="middle">leader: runs the scheduler</text>
+        <rect class="bx-bad" x="416" y="48" width="10" height="24" rx="2"/>
+        <text class="t-sm" x="434" y="64">process killed at 95 s</text>
+
+        <text class="t-head" x="-20" y="125">Worker B</text>
+        <rect class="bx" x="77" y="109" width="46" height="22" rx="5"/><text class="t-mono" x="100" y="124" text-anchor="middle">false</text>
+        <rect class="bx" x="277" y="109" width="46" height="22" rx="5"/><text class="t-mono" x="300" y="124" text-anchor="middle">false</text>
+        <rect class="bx-ok" x="477" y="109" width="46" height="22" rx="5"/><text class="t-mono" x="500" y="124" text-anchor="middle">true</text>
+        <rect class="bx-pg" x="527" y="112" width="213" height="16" rx="4"/><text class="t-sm" x="633" y="124" text-anchor="middle">new leader</text>
+
+        <text class="t-head" x="-20" y="185">Worker C</text>
+        <rect class="bx" x="77" y="169" width="46" height="22" rx="5"/><text class="t-mono" x="100" y="184" text-anchor="middle">false</text>
+        <rect class="bx" x="277" y="169" width="46" height="22" rx="5"/><text class="t-mono" x="300" y="184" text-anchor="middle">false</text>
+        <rect class="bx" x="477" y="169" width="46" height="22" rx="5"/><text class="t-mono" x="500" y="184" text-anchor="middle">false</text>
+        <rect class="bx" x="677" y="169" width="46" height="22" rx="5"/><text class="t-mono" x="700" y="184" text-anchor="middle">false</text>
+
+        <text class="t-head" x="-20" y="240">Lock</text>
+        <text class="t-sm" x="-20" y="256">in Postgres</text>
+        <rect class="bx-pg" x="100" y="230" width="316" height="22" rx="4"/><text class="t-sm" x="258" y="245" text-anchor="middle">held by A's session</text>
+        <rect class="bx-ghost" x="416" y="230" width="84" height="22" rx="4"/><text class="t-sm" x="458" y="245" text-anchor="middle">free</text>
+        <rect class="bx-pg" x="500" y="230" width="240" height="22" rx="4"/><text class="t-sm" x="620" y="245" text-anchor="middle">held by B's session</text>
+        <text class="t-sm" x="416" y="272">A's connection closes, so the lock is released</text>
+
+        <line class="axis" x1="100" y1="290" x2="700" y2="290"/>
+        <text class="t-mono" x="100" y="306" text-anchor="middle">0 s</text>
+        <text class="t-mono" x="300" y="306" text-anchor="middle">60 s</text>
+        <text class="t-mono" x="500" y="306" text-anchor="middle">120 s</text>
+        <text class="t-mono" x="700" y="306" text-anchor="middle">180 s</text>
+        </g>
+      </svg>
+    </div>
+    <figcaption><b>Figure 4.8</b> Leader election with no extra service. The lock belongs to the leader's database session, so when the leader dies the lock goes with it, and another worker wins it on its next tick.</figcaption>
+  </figure>
+  <ul>
+    <li><b>Use a dedicated connection.</b> A lock taken on a pooled connection goes back to the pool with it.</li>
+    <li><b>Call it once.</b> These locks stack, so a leader that calls again must unlock twice.</li>
+    <li><b>Expect brief overlaps.</b> After a silent network failure, Postgres may not notice the session has gone until TCP keepalives time out.</li>
+  </ul>
+  <p>An overlap is harmless, because duplicate fetches and builds collide on their dedupe keys and on <code>UNIQUE(user_id, profile_id, briefing_date)</code>. The lock prevents wasted work; the constraints guarantee correctness.</p>
+
+  <h3>Priorities and the extract queue</h3>
+  <p>The queues are ordered <code>deliver</code> &gt; <code>build</code> &gt; <code>score</code> &gt; <code>extract</code> &gt; <code>fetch</code>. The closer a job is to something the user is waiting for, the sooner it runs, so a fetch backlog can never delay a briefing.</p>
+  <p>For sources with <code>extract_full_text</code> set, the fetch enqueues <code>extract(article_id)</code> in place of scoring. The extract job fetches the page through the same host limiter, stores <code>body_text</code>, recomputes <code>input_hash</code> and only then enqueues scoring, so an article is never scored twice.</p>
+  <p>If an extract job goes <code>dead</code>, a failure hook enqueues scoring on the summary. Extract ranks above fetch so that extraction finishes before more fetches pile up.</p>
+  <p>Strict priority can cause <b>starvation</b>, where steady high-priority work blocks low-priority work for ever. At a few builds per user per day it can't happen here, but be ready to name it.</p>
+
+  <h3>Dead letters and replay</h3>
+  <p>A job that goes <code>dead</code> gets a <code>dead_letters</code> row holding the job id, the exact payload and the last error. Nothing retries it automatically, because a job that failed every attempt usually points to a broken feed or a bug. Once you've fixed the cause, <code>briefing jobs replay &lt;id&gt;</code> works on the <b>same job row</b>:</p>
+  <ol class="steps">
+    <li><b>Reset.</b> It sets <code>state = 'queued'</code>, <code>attempts = 0</code>, <code>deferrals = 0</code> and <code>run_at = now()</code>.</li>
+    <li><b>Mark.</b> It sets <code>replayed_at</code> on the dead letter, which drops it from the unresolved list.</li>
+    <li><b>Refuse a duplicate.</b> If another live job with the same <code>dedupe_key</code> exists, the unique index rejects the update. Replay reports "an equivalent job is already queued: #id" and changes nothing, because that job will do the same work.</li>
+  </ol>
+  <p>Deliveries use the same table with <code>kind = 'delivery'</code>, and their replay resends with the same event id.</p>
+
+  <h3>How long rows are kept</h3>
+  <p>A maintenance job deletes old rows in modest batches:</p>
+  <ul>
+    <li><b>Succeeded jobs</b> after 7 days.</li>
+    <li><b>Dead jobs and their dead letters</b> 30 days after the job died. A replayed job's dead letter goes 7 days after the replay.</li>
+    <li><b>Delivery dead letters</b> after 90 days, because a user may want to replay them after a long outage.</li>
+  </ul>
+  <p>Every claim, heartbeat and finish leaves a dead tuple. Because <code>state</code> and <code>lease_expires_at</code> are indexed, these updates can't use the heap-only tuple (HOT) shortcut, so each adds index entries too. At a thousand jobs a day autovacuum barely notices. At 100× in the load test it might, which is why vacuum lag on <code>jobs</code> is a switch condition.</p>
+
+  <h3>The worker process</h3>
+  <p>Each container runs one worker process with one asyncio event loop, because fetches and LLM calls mostly wait on the network. It has fixed <b>slots</b> per queue, for example fetch 8, score 4, build 2 and deliver 4, plus a pool for extract. Fixed slots isolate the queues and limit the load on each external service.</p>
+  <h4>Shutting down on SIGTERM</h4>
+  <p>On a deploy, ECS sends <code>SIGTERM</code>, waits 30 seconds and then sends <code>SIGKILL</code>. The worker stops claiming, gives jobs in progress up to 25 seconds, and exits. Anything still running is left for the reaper, with the attempt counted, so shutdown reuses the tested crash path.</p>
+  <h4>Liveness, heartbeats and a database outage</h4>
+  <ul>
+    <li><b>Job heartbeat.</b> Extends one job's lease every 20 seconds, for recovery.</li>
+    <li><b>Worker heartbeat.</b> Writes <code>workers.last_heartbeat_at</code> every 15 seconds, for monitoring. An alarm fires after 5 minutes without one.</li>
+    <li><b>Container health check.</b> <code>briefing worker-health</code> checks a timestamp file the main loop touches on every iteration, whether or not the database answered. It fails only if the loop is stuck for over 2 minutes.</li>
+  </ul>
+  <p>The health check ignores the database on purpose, because a restart can't fix a database outage (ADR-014). During one, the loop logs <code>db.unavailable</code> and backs off from 1 s, doubling to 30 s. Running jobs finish or fail their final write, and the reaper retries them once Postgres is back. ECS leaves the task alone, and the heartbeat alarm fires next to the RDS alarm.</p>
+
+  <h3>Postgres or SQS</h3>
+  <p>ADR-001 also weighed Redis-based libraries (RQ, Celery, arq), but SQS is the comparison you'll defend most often.</p>
+  <div class="tbl"><table>
+    <thead><tr><th></th><th>Postgres (<code>SKIP LOCKED</code>)</th><th>Amazon SQS</th></tr></thead>
+    <tbody>
+      <tr><td>Enqueue in the same transaction as data</td><td class="good">Yes. Commits atomically.</td><td>No. Needs an outbox table plus a relay process.</td></tr>
+      <tr><td>Infrastructure</td><td>None extra</td><td>Queue, DLQ, IAM policies, plus LocalStack or ElasticMQ for local development and CI</td></tr>
+      <tr><td>Dedupe</td><td>Partial unique index, any time window</td><td>FIFO queues only, 5-minute dedupe window</td></tr>
+      <tr><td>Delayed jobs</td><td><code>run_at</code>, any delay</td><td>At most 15 minutes (<code>DelaySeconds</code>)</td></tr>
+      <tr><td>Visibility and inspection</td><td>It's SQL: <code>SELECT … GROUP BY state</code></td><td>CloudWatch metrics; messages can't be queried</td></tr>
+      <tr><td>Throughput ceiling</td><td>Thousands of jobs per second on a small RDS instance, then index churn and vacuum pressure</td><td class="good">Effectively unlimited</td></tr>
+      <tr><td>DLQ and redrive</td><td>Built by you (<code>dead_letters</code>)</td><td class="good">Built in</td></tr>
+      <tr><td>Cost at this scale</td><td>$0 (the existing database)</td><td>About $0 (free tier)</td></tr>
+      <tr><td>Failure coupling</td><td class="badc">The queue fails along with the database</td><td>Independent of the database</td></tr>
+    </tbody>
+  </table></div>
+  <p>Postgres wins on atomicity, simplicity and inspection, and SQS on throughput and isolation. The coupling matters less than it looks, because workers can't do useful work while the database is down anyway.</p>
+  <p>The plan keeps Postgres in all three stages, behind a <code>Queue</code> interface, with a <b>switch condition</b>. The stage 3 load test measures claims at 10× and 100× the expected volume. A p95 claim time over 50 ms, or vacuum lag on <code>jobs</code>, would move <code>deliver</code> to SQS first, because it gains most from isolation and least from transactional enqueue.</p>
+  <p>ADR-003 records writing the queue instead of using <code>procrastinate</code>, a mature Postgres queue for Python. The risk is subtle lease and retry bugs. The mitigation is concurrency tests, such as four workers draining 1,000 jobs with each running exactly once.</p>
+
+  <div class="try">
+    <span class="label">Try it: see SKIP LOCKED with your own eyes</span>
+    <ol>
+      <li>Start a throwaway Postgres with <code>docker run --rm -e POSTGRES_PASSWORD=pw -p 5432:5432 postgres:17</code> and open <b>two</b> psql windows.</li>
+      <li>In window 1, lock one row and leave the transaction open:
+<pre><code>CREATE TABLE jobs (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                   state text NOT NULL DEFAULT 'queued');
+INSERT INTO jobs (state) SELECT 'queued' FROM generate_series(1, 5);
+
+BEGIN;
+SELECT id FROM jobs WHERE state = 'queued' ORDER BY id LIMIT 1
+FOR UPDATE SKIP LOCKED;   <span class="c">-- returns 1</span></code></pre></li>
+      <li>In window 2, try both kinds of lock:
+<pre><code>BEGIN;
+SELECT id FROM jobs WHERE state = 'queued' ORDER BY id LIMIT 1
+FOR UPDATE SKIP LOCKED;   <span class="c">-- returns 2 immediately</span>
+ROLLBACK;
+
+BEGIN;
+SELECT id FROM jobs WHERE state = 'queued' ORDER BY id LIMIT 1
+FOR UPDATE;               <span class="c">-- hangs</span></code></pre></li>
+      <li>In window 1, run <code>UPDATE jobs SET state = 'running' WHERE id = 1; COMMIT;</code>. Then type <code>ROLLBACK;</code> in window 2.</li>
+    </ol>
+    <p>The hang in step 3 is what <code>SKIP LOCKED</code> prevents. After step 4, window 2 returns 2. Postgres re-checked row 1 after the wait, found it no longer queued, and moved on.</p>
+  </div>
+
+  <div class="try">
+    <span class="label">Try it: a refused replay</span>
+    <ol>
+      <li>Build a small table with the partial unique index and one pending job:
+<pre><code>CREATE TABLE q (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                dedupe_key text, state text NOT NULL);
+CREATE UNIQUE INDEX q_pending ON q (dedupe_key)
+  WHERE state IN ('queued', 'running');
+INSERT INTO q (dedupe_key, state) VALUES ('fetch:42', 'queued');</code></pre></li>
+      <li>Run the same <code>INSERT</code> with <code>ON CONFLICT DO NOTHING</code> on the end. psql reports <code>INSERT 0 0</code>.</li>
+      <li>Kill the job with <code>UPDATE q SET state = 'dead' WHERE id = 1;</code>, then run the plain <code>INSERT</code> again. It succeeds.</li>
+      <li>Replay the dead row: <code>UPDATE q SET state = 'queued' WHERE id = 1;</code>.</li>
+    </ol>
+    <p>Step 4 fails with <code>duplicate key value violates unique constraint "q_pending"</code>. That's how the replay command knows an equivalent job is already queued.</p>
+  </div>
+
+  <div class="ask">
+    <span class="label">If an interviewer asks</span>
+    <p class="q">"Why didn't you use Celery or SQS?"</p>
+    <p>"Because I enqueue jobs in the same transaction as the data. When a fetch saves articles, the score jobs commit with them or not at all, and with SQS I'd need an outbox and a relay for that. At a thousand jobs a day Postgres has huge headroom, and jobs are rows I can query. I also wrote down when I'd switch: a p95 claim time over 50 ms in the load test moves the delivery queue to SQS first."</p>
+    <p class="q" style="margin-top:14px">"What happens if a worker dies halfway through a job?"</p>
+    <p>"Its lease expires, because the heartbeats stop. The reaper counts the crashed run as an attempt. Below <code>max_attempts</code> the job goes back to queued with backoff, and at the limit it goes to dead with a dead letter, so a poison pill can't crash workers for ever. A stalled worker can lose its job the same way and run it twice, which is why every handler is idempotent."</p>
+    <p class="q" style="margin-top:14px">"Does waiting for a rate-limited host use up a job's attempts?"</p>
+    <p>"No. The job is deferred to the host's next slot, the claim's attempt is given back, and <code>deferrals</code> goes up instead, so <code>attempts</code> only counts runs that did work. The job that actually got the 429 made a request, so its retry counts."</p>
+  </div>
+  <label class="got"><input type="checkbox" id="got-queue" data-ch="queue"> I can explain this</label>
+</section>

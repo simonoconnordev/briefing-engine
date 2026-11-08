@@ -1,0 +1,86 @@
+  </main>
+</div>
+
+<script>
+(function () {
+  // Contents: open on wide screens
+  var box = document.getElementById('toc-box');
+  var wide = window.matchMedia('(min-width: 1000px)');
+  function syncToc() { if (wide.matches) box.open = true; }
+  syncToc();
+  if (wide.addEventListener) wide.addEventListener('change', syncToc);
+
+  // Progress ticks, saved in this browser only
+  var KEY = 'bef-guide-progress';
+  var state = {};
+  try { state = JSON.parse(localStorage.getItem(KEY) || '{}') || {}; } catch (e) { state = {}; }
+  var boxes = document.querySelectorAll('input[data-ch]');
+  function render() {
+    var n = 0;
+    boxes.forEach(function (b) {
+      var on = !!state[b.dataset.ch];
+      b.checked = on;
+      if (on) n++;
+      var t = document.querySelector('.tick[data-for="' + b.dataset.ch + '"]');
+      if (t) t.classList.toggle('on', on);
+    });
+    document.getElementById('progress-count').textContent = n + ' of ' + boxes.length + ' understood';
+  }
+  boxes.forEach(function (b) {
+    b.addEventListener('change', function () {
+      state[b.dataset.ch] = b.checked;
+      try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
+      render();
+    });
+  });
+  render();
+
+  // Highlight the chapter in view
+  var links = {};
+  document.querySelectorAll('#toc-list a').forEach(function (a) { links[a.getAttribute('href').slice(1)] = a; });
+  if ('IntersectionObserver' in window) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) {
+          Object.keys(links).forEach(function (k) { links[k].classList.remove('here'); });
+          if (links[e.target.id]) links[e.target.id].classList.add('here');
+        }
+      });
+    }, { rootMargin: '-20% 0px -70% 0px' });
+    document.querySelectorAll('section.ch').forEach(function (s) { io.observe(s); });
+  }
+
+  // Jitter demo
+  var N = 100, CAP = 16, BINS = 20, W = 640, H = 170, L = 40, B = 28, T = 22, R = 24;
+  function draw(id, data, cls) {
+    var svg = document.getElementById(id);
+    var plotW = W - L - R, plotH = H - T - B, bw = plotW / BINS;
+    var out = '';
+    out += '<line class="axis" x1="' + L + '" y1="' + (H - B) + '" x2="' + (W - R) + '" y2="' + (H - B) + '"/>';
+    out += '<line class="axis" x1="' + L + '" y1="' + T + '" x2="' + L + '" y2="' + (H - B) + '"/>';
+    out += '<text class="t-mono" x="' + (L - 6) + '" y="' + (T + 4) + '" text-anchor="end">' + N + '</text>';
+    out += '<text class="t-mono" x="' + (L - 6) + '" y="' + (H - B) + '" text-anchor="end">0</text>';
+    for (var s = 0; s <= BINS; s += 4) {
+      out += '<text class="t-mono" x="' + (L + s * bw) + '" y="' + (H - B + 16) + '" text-anchor="middle">' + s + ' s</text>';
+    }
+    for (var i = 0; i < BINS; i++) {
+      if (!data[i]) continue;
+      var h = (data[i] / N) * plotH;
+      out += '<rect class="' + cls + '" x="' + (L + i * bw + 2) + '" y="' + (H - B - h) + '" width="' + (bw - 4) + '" height="' + h + '" rx="2"/>';
+      if (data[i] >= 4) out += '<text class="t-mono" x="' + (L + i * bw + bw / 2) + '" y="' + (H - B - h - 4) + '" text-anchor="middle">' + data[i] + '</text>';
+    }
+    svg.innerHTML = out;
+  }
+  function roll() {
+    var none = new Array(BINS).fill(0), full = new Array(BINS).fill(0);
+    none[CAP] = N;
+    for (var i = 0; i < N; i++) full[Math.min(BINS - 1, Math.floor(Math.random() * CAP))]++;
+    draw('jit-none', none, 'bar');
+    draw('jit-full', full, 'bar-alt');
+    var peak = Math.max.apply(null, full);
+    document.getElementById('jit-full-cap').textContent = 'Full jitter: the same 100 retries spread across 16 seconds. Busiest second this roll: ' + peak + ' requests.';
+  }
+  roll();
+  document.getElementById('jit-again').addEventListener('click', roll);
+})();
+</script>
