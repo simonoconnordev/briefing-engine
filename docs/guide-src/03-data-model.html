@@ -230,7 +230,7 @@
   <p>UUID v7 values are generated in application code by one helper, <code>db/ids.py: new_id()</code>, and never by a column default (ADR-015).</p>
   <ul>
     <li><b>PostgreSQL 17 can't do it.</b> Its <code>gen_random_uuid()</code> makes v4, and <code>uuidv7()</code> only arrived in PostgreSQL 18, which RDS may lag behind.</li>
-    <li><b>Python 3.14 can.</b> The plan proposes 3.14 for its standard-library <code>uuid.uuid7()</code>, and that choice is still open (Q13). On 3.13 the <code>uuid6</code> package supplies the same function, and only <code>db/ids.py</code> changes.</li>
+    <li><b>Python 3.14 can.</b> The project uses 3.14 for its standard-library <code>uuid.uuid7()</code>, a decision settled in Q13. If a dependency ever forced a step back to 3.13, the <code>uuid6</code> package would supply the same function, and only <code>db/ids.py</code> would change.</li>
     <li><b>The id exists before the insert.</b> The code can put it in log lines and job payloads before the row is written.</li>
   </ul>
 

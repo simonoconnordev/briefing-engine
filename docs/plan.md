@@ -167,7 +167,7 @@ infra/            Terraform
 
 PostgreSQL 17. Ids are `bigint generated always as identity` for internal tables and `uuid` (v7, so they sort by time) for ids that appear in the API. Times are `timestamptz` in UTC. Money is stored as **integer micro-dollars** (`bigint`, where 1 USD = 1,000,000) so there's no float rounding in budgets.
 
-**Where UUID v7 values come from.** They're generated **in application code**, never by a column default. PostgreSQL 17 has no `uuidv7()` (it arrived in 18). Python's `uuid.uuid7()` arrived in 3.14, which this plan now targets (Q13). If we stay on 3.13, the `uuid6` package provides the same function behind the same one-line helper (`db/ids.py: new_id()`). Generating ids in the app has a second benefit: the id exists before the insert, so it can go straight into log lines and job payloads.
+**Where UUID v7 values come from.** They're generated **in application code**, never by a column default. PostgreSQL 17 has no `uuidv7()` (it arrived in 18). Python's `uuid.uuid7()` arrived in 3.14, which the project uses (Q13, settled). The call sits behind a one-line helper (`db/ids.py: new_id()`), so a fallback to 3.13 with the `uuid6` package would change only that file. Generating ids in the app has a second benefit: the id exists before the insert, so it can go straight into log lines and job payloads.
 
 **Rounding money.** Prices are stored as integer micro-dollars per million tokens (Haiku 5.5 input is `100_000`). Each call's cost is calculated exactly and **rounded up once per call** to a whole micro-dollar, using integer arithmetic only:
 
@@ -1024,7 +1024,7 @@ Each metric has a definition, how it's measured, and the result I'm aiming for. 
 Stage 1 is delivered as **four checkpoints** (revision 3). Each one ends in something I can run and inspect, with its own tests, so a failure can be traced to the layer just added. Revision 2 made one finish line out of a queue, several ingestion paths, two model stages, two caches, cost accounting, delivery recovery and an evaluation. The destination is the same; the checkpoints make progress visible and keep different kinds of uncertainty apart.
 
 **Foundations from checkpoint 1.1 onwards:**
-- Repo skeleton: `pyproject.toml` (Python version per Q13, `uv`), ruff, mypy, pytest, pre-commit; `docker compose` with Postgres 17 and Mailpit. The fake feed server and the fake Anthropic server are added when a checkpoint's tests need them.
+- Repo skeleton: `pyproject.toml` (Python 3.14, ADR-015, managed with `uv`), ruff, mypy, pytest, pre-commit; `docker compose` with Postgres 17 and Mailpit. The fake feed server and the fake Anthropic server are added when a checkpoint's tests need them.
 - Alembic migrations. **Tables are added by the checkpoint that needs them.** Owned rows carry `user_id` from the start, which is cheap, but revision 3 drops the rule that stage 2 must need no schema change: migrations exist so tables can arrive with their features.
 - CI: lint, types, unit and integration tests against a real Postgres 17.
 - Safe email rendering with the golden escaping test (§8.1), and the cost ledger (`llm_calls`), so every call's cost is visible from the first briefing.
@@ -1034,7 +1034,8 @@ Stage 1 is delivered as **four checkpoints** (revision 3). Each one ends in some
 - **Scope:** one feed, one profile with a rubric, the real Postgres `jobs` table with one worker, Haiku scoring with structured output and validation (§7.3), recorded cost, and a simple email listing the top-scored articles with the scorer's reasons. Run by hand with `briefing run-daily`; no scheduler.
 - **Tables:** roughly `users`, `sources`, `articles`, `profiles`, `llm_scores`, `llm_calls`, `briefings`, `briefing_items`, `jobs` and `schema_meta`.
 - **Evidence:** a real article travels through the whole system into an email I can read, and the first reading-log entry is written (see Reading quality below).
-- **Decisions it needs:** Q13 (Python version) and running locally in Docker. Q3 only if the email goes to my real inbox; reading it in Mailpit is enough for this checkpoint.
+- **Decisions it needs:** none left open. Q13 is settled (Python 3.14), and Postgres 17 and Mailpit run locally in Docker. Q3 matters only if the email goes to my real inbox; reading it in Mailpit is enough for this checkpoint.
+- **Prerequisites on the development PC:** Docker Desktop (with WSL 2) and `uv`, both installed by me. `uv` installs Python 3.14 for the project, so the PC's own Python 3.12 doesn't need changing.
 
 #### Checkpoint 1.2: repeatable and recoverable
 
@@ -1186,7 +1187,7 @@ Short ADRs. Each will move to `docs/adr/NNN-*.md` once accepted.
 - *Choice:* the ALB checks `/healthz`, and the worker's container check is an in-process loop marker. `/readyz` (database plus `schema_version >= MIN_SCHEMA_VERSION`) gates deploys and drives alarms.
 - *Why:* orchestrators should only restart what a restart can fix. Wiring the database into liveness turns a database outage into a restart storm across every task, which makes recovery slower, and it also clashes with migrate-before-deploy. Checking schema compatibility with `>=` keeps old tasks ready while a newer migration is in place.
 
-**ADR-015: Python 3.14 and application-generated UUID v7**
+**ADR-015: Python 3.14 and application-generated UUID v7** *(accepted 2026-11-08, settling Q13)*
 - *Options:* Python 3.13 plus the `uuid6` package; Python 3.14 (`uuid.uuid7()` in the standard library); PostgreSQL 18 `uuidv7()` as a column default.
 - *Choice:* Python 3.14, with ids generated in the app. PostgreSQL stays on 17.
 - *Why:* 3.14 has been stable for a year, and it removes a dependency. Generating ids in the app means they exist before the insert (for logs and payloads), and they don't depend on the database version. That matters because RDS may lag behind on major versions. *Fallback:* if a dependency isn't ready for 3.14, stay on 3.13 and use `uuid6`. Only `db/ids.py` changes (Q13).
@@ -1197,7 +1198,7 @@ Short ADRs. Each will move to `docs/adr/NNN-*.md` once accepted.
 
 Revision 3 adds, for each question, the checkpoint or stage that needs its answer. Following the working rule, only questions needed by the next checkpoint have to be settled before building it.
 
-1. **Postgres in stage 1?** I recommend Postgres from day one (ADR-010) instead of the SQLite-then-Postgres path. OK? *Needed by: checkpoint 1.1.*
+1. **Postgres in stage 1?** **Settled 2026-11-08: Postgres from day one** (ADR-010), run locally in Docker alongside Mailpit.
 2. **Where does stage 1 run?** Options: your Windows PC (Docker Desktop plus Task Scheduler, the way Horizon runs now, but it misses days when the PC is asleep at 06:00), or a small always-on host earlier than planned. Which do you prefer? *Needed by: checkpoint 1.3 (checkpoint 1.1 runs by hand).*
 3. **Email in stage 1:** reuse Horizon's SMTP account and app password (moved into this repo's `.env`, never committed), or go straight to SES, which needs a domain you control for DKIM? *Needed by: checkpoint 1.1 if the first email goes to my real inbox; otherwise checkpoint 1.3.*
 4. **Sources:** port Horizon's 14 RSS feeds plus HN (score ≥ 100) as they are? Anything to add (arXiv cs.CL/cs.LG, GitHub releases for SDKs you track) or drop? *Needed by: checkpoint 1.3 (checkpoint 1.1 uses one feed).*
@@ -1209,9 +1210,9 @@ Revision 3 adds, for each question, the checkpoint or stage that needs its answe
 10. **Domain name** for the API and SES (for example a subdomain of endpoint51.com)? This affects TLS, SES DKIM and the webhook HTTPS requirement. *Needed by: stage 2.*
 11. **Real second users** in stage 2 (friends or readers of the book), or synthetic test users only? Real users raise privacy and data deletion (a `DELETE /v1/me` endpoint, a retention policy). *Needed by: stage 2.*
 12. **Repo visibility and licence:** private while in development (as proposed), then public for the case study? MIT licence? *Needed by: before the repo goes public.*
-13. **Python 3.14 and `uv`**: revision 2 moves to 3.14 for the standard library's `uuid.uuid7()` (ADR-015). Fine, or stay on 3.13 with the `uuid6` package, or match what the book uses? *Needed by: checkpoint 1.1.*
+13. **Python 3.14 and `uv`**: **settled 2026-11-08: Python 3.14**, managed with `uv`, for the standard library's `uuid.uuid7()` (ADR-015). The fallback to 3.13 with `uuid6` stays available if a dependency isn't ready.
 14. **Scorer evaluation thresholds** (§7.1): accept Haiku if its top-10 overlap is within 1 item of Sonnet's and its ρ is at least 90% of Sonnet's. These are proposals. Tighter or looser? They also depend on you labelling 200 articles during the shadow week (roughly an hour's work). *Needed by: checkpoint 1.4.*
-15. **CI minutes on a private repo:** running end-to-end tests on every PR adds about 4 minutes per run. On a private repo that counts against GitHub's free monthly allowance (public repos are free). Keep end-to-end on every PR (proposed), or run it only on `main` and nightly while the repo is private? *Needed by: checkpoint 1.1 (when CI is set up).*
+15. **CI minutes on a private repo:** running end-to-end tests on every PR adds about 4 minutes per run. On a private repo that counts against GitHub's free monthly allowance (public repos are free). Keep end-to-end on every PR (proposed), or run it only on `main` and nightly while the repo is private? *Needed by: when the repo is first pushed to GitHub and CI runs there.*
 16. **Host rate-limit spacing** (§6.2): the deferred-ticket rule can't guarantee the minimum interval between request starts. The candidate fix claims the host at dispatch time with a conditional `UPDATE`, at the cost of arrival order. Stays open until a test asserting on recorded request start times passes. *Needed by: checkpoint 1.2.*
 17. **Score input after extraction** (§6.5): the upsert keeps the old `input_hash` once `body_text` exists, so a title edited after extraction leaves a stale cache key. Likely fix: store `scoring_text` and recompute `input_hash` in the statement that changes it. *Needed by: checkpoint 1.3.*
 
@@ -1236,6 +1237,7 @@ Revision 3 adds, for each question, the checkpoint or stage that needs its answe
 | 11 | System user created in stage 2; stage 1 evaluation and audit calls are charged to me and told apart by `purpose` | §7.1, ADR-013 |
 | 12 | Corrected figures: rounding bias (about 31 calls a day, not 300) and tokens per article (at most about 1,500, about 450 on average) | §4, §7.3 |
 | 13 | Each open question notes the checkpoint or stage that needs it; Q16 and Q17 added | §16 |
+| 14 | Q13 settled (Python 3.14 with `uv`) and Q1 settled (Postgres from day one, in Docker Desktop with Mailpit). Checkpoint 1.1 has no open decisions left | §14, §16, ADR-010, ADR-015 |
 
 **Recorded, not yet settled.** These inconsistencies were found while writing the learning guide. Following the working rule, each is settled when its checkpoint or stage arrives:
 
