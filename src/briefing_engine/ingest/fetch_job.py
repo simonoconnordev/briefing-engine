@@ -9,6 +9,7 @@ to `fetch_log`. What the response means follows the table in §6.3:
 | result                                   | what happens                                |
 |------------------------------------------|---------------------------------------------|
 | 200                                      | store the entries                           |
+| 200 with the same bytes as last time     | nothing new (a "soft 304"), not parsed      |
 | 304                                      | nothing new                                 |
 | 429 / 503 with Retry-After               | block the host until then, retry after it   |
 | 408, 425, 429, 5xx, connection errors    | retry with backoff                          |
@@ -17,7 +18,7 @@ to `fetch_log`. What the response means follows the table in §6.3:
 | 410                                      | broken now                                  |
 | unparseable, or larger than 5 MB         | dead, and counts towards broken             |
 
-Conditional GET and adaptive intervals arrive in checkpoint 1.3.
+Requests are conditional (§6.4): the last 200's ETag and Last-Modified are sent back.
 """
 
 import logging
@@ -42,6 +43,7 @@ from briefing_engine.ingest.feeds import (
 )
 from briefing_engine.ingest.politeness import (
     GIVE_UP_AFTER_S,
+    FetchResult,
     Outcome,
     block_host,
     claim_host,
@@ -205,7 +207,8 @@ def store_entries(
 
 _SOURCE = text(
     """
-    SELECT id, name, url, status, exclude_categories, consecutive_failures
+    SELECT id, name, url, status, exclude_categories, consecutive_failures, etag,
+           last_modified, last_body_sha256
     FROM sources WHERE id = :id
     """
 )
@@ -232,10 +235,25 @@ def _record_failure(conn: Connection, source_id: int, *, gone: bool) -> str:
     )
 
 
-def _record_success(conn: Connection, source_id: int, moved_to: str | None) -> None:
+def _record_success(
+    conn: Connection, source_id: int, moved_to: str | None, result: FetchResult | None = None
+) -> None:
+    """Reset the failure count; after a 200, also keep its validators and body hash."""
     conn.execute(
         text("UPDATE sources SET consecutive_failures = 0 WHERE id = :id"), {"id": source_id}
     )
+    if result is not None and result.status_code == 200:
+        # Validators come only from a 200, never from a 304 (§6.4).
+        conn.execute(
+            text(
+                """
+                UPDATE sources SET etag = :etag, last_modified = :lm, last_body_sha256 = :h
+                WHERE id = :id
+                """
+            ),
+            {"id": source_id, "etag": result.etag, "lm": result.last_modified,
+             "h": sha256(result.body)},
+        )  # fmt: skip
     if moved_to is not None:
         # A permanent redirect: fetch the new address from now on, unless another source
         # already has it.
@@ -297,7 +315,7 @@ def _fetch_one(ctx: Context, job: Job) -> None:
                      started_at=started_at)  # fmt: skip
     try:
         with ctx.http_client() as client:
-            result = fetch(client, source.url)
+            result = fetch(client, source.url, source.etag, source.last_modified)
     except FeedTooLarge as exc:
         with ctx.engine.begin() as conn:
             _record_failure(conn, source_id, gone=False)
@@ -311,6 +329,15 @@ def _fetch_one(ctx: Context, job: Job) -> None:
 
     outcome = classify(result.status_code, result.retry_after_s)
     record = partial(record, status_code=result.status_code)
+    if outcome is Outcome.OK and sha256(result.body) == source.last_body_sha256:
+        # The feed ignored the validators but sent the same bytes: nothing new to parse.
+        with ctx.engine.begin() as conn:
+            _record_success(conn, source_id, None, result)
+            record(conn, outcome=Outcome.UNCHANGED_BODY, size=len(result.body))
+            complete(conn, job.id, ctx.worker_id)
+        log.info("fetched %s: unchanged since last time", source.name)
+        return
+
     if outcome is Outcome.OK:
         try:
             parsed = parse_feed(result.body)
@@ -325,7 +352,9 @@ def _fetch_one(ctx: Context, job: Job) -> None:
                 conn, source_id, entries, model=ctx.scorer.model,
                 prompt_version=ctx.prompt_version,
             )  # fmt: skip
-            _record_success(conn, source_id, result.final_url if result.moved_permanently else None)
+            _record_success(
+                conn, source_id, result.final_url if result.moved_permanently else None, result
+            )
             record(conn, outcome=outcome, size=len(result.body))
             complete(conn, job.id, ctx.worker_id)
         log.info(
@@ -335,6 +364,9 @@ def _fetch_one(ctx: Context, job: Job) -> None:
         return
 
     if outcome is Outcome.NOT_MODIFIED:
+        if not (source.etag or source.last_modified):
+            log.warning("fetch.odd_304: %s answered 304 to a request with no validators",
+                        source.name)  # fmt: skip
         with ctx.engine.begin() as conn:
             _record_success(conn, source_id, None)
             record(conn, outcome=outcome)

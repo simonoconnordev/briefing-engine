@@ -262,3 +262,54 @@ def test_a_permanent_redirect_moves_the_source(db: Engine) -> None:
 
     fetch_all(make_ctx(db, handler))
     assert rows(db, "SELECT url FROM sources WHERE id = :i", i=sid) == [(f"https://{HOST}/new",)]
+
+
+def test_requests_are_conditional_and_an_unchanged_body_is_not_parsed(db: Engine) -> None:
+    [sid] = add_sources(db, [f"https://{HOST}/a"])
+    spacing(db, HOST, 0)
+    seen: list[dict[str, str | None]] = []
+    replies = iter(["etag-1", "same-bytes", "304"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append({h: request.headers.get(h) for h in ("if-none-match", "if-modified-since")})
+        reply = next(replies)
+        if reply == "304":
+            return httpx.Response(304)
+        headers = {"ETag": 'W/"v1"', "Last-Modified": "Mon, 09 Nov 2026 05:00:00 GMT"}
+        return httpx.Response(200, content=FEED, headers=headers)
+
+    ctx = make_ctx(db, handler)
+    for _ in range(3):
+        queue_fetches(db, [sid])
+        fetch_all(ctx)
+    assert seen[0] == {"if-none-match": None, "if-modified-since": None}
+    assert (
+        seen[1]
+        == seen[2]
+        == {
+            "if-none-match": 'W/"v1"',
+            "if-modified-since": "Mon, 09 Nov 2026 05:00:00 GMT",
+        }
+    )
+    assert [r[0] for r in rows(db, "SELECT outcome FROM fetch_log ORDER BY id")] == [
+        "ok",
+        "unchanged_body",
+        "not_modified",
+    ]
+
+
+def test_a_rubric_edit_makes_the_next_fetch_unconditional(db: Engine) -> None:
+    [sid] = add_sources(db, [f"https://{HOST}/a"])
+    with db.begin() as conn:
+        conn.execute(text("UPDATE sources SET etag = 'x', last_body_sha256 = :h"), {"h": bytes(1)})
+    config = one_feed_config()
+    profile = config.profiles[0].name
+    config.sources = [SourceConfig(name="Feed 0", url=f"https://{HOST}/a", kind="atom",
+                                   profiles=[profile])]  # fmt: skip
+    load_config(db, config)  # nothing changed: the validators stay
+    assert rows(db, "SELECT etag FROM sources WHERE id = :i", i=sid) == [("x",)]
+    config.profiles[0].rubric.description += " Also robotics."
+    load_config(db, config)
+    assert rows(db, "SELECT etag, last_body_sha256 FROM sources WHERE id = :i", i=sid) == [
+        (None, None)
+    ]

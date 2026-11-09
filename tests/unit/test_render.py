@@ -111,3 +111,52 @@ def test_marking_link_appears_only_when_safe() -> None:
     assert "http://127.0.0.1:8000/briefings/x" in rendered.text
     hostile = render_briefing(replace(fixture_briefing(), mark_url="javascript:alert(1)"))
     assert "javascript:" not in hostile.html and "Mark these items" not in hostile.html
+
+
+def written_briefing() -> EmailBriefing:
+    base = fixture_briefing()
+    third = replace(
+        base.items[1], rank=3, title="Second take on the same release", url="https://b.example/"
+    )
+    items = [
+        replace(
+            base.items[0], blurb="Model text with <b>tags</b> & an ampersand.", story="The release"
+        ),
+        replace(base.items[1], blurb="", story="A lone story"),
+        replace(third, blurb="Another angle.", story="the release"),
+    ]
+    return replace(
+        base,
+        items=items,
+        headline="Agents <everywhere> & evals",
+        intro="Today's intro, said once.",
+        writer="claude-sonnet-5-5",
+    )
+
+
+def test_model_text_is_escaped_like_feed_text() -> None:
+    html = render_briefing(written_briefing()).html
+    assert "Agents &lt;everywhere&gt; &amp; evals</h1>" in html
+    assert "Model text with &lt;b&gt;tags&lt;/b&gt; &amp; an ampersand." in html
+    assert "Today&#39;s intro, said once." in html
+    assert "written up by claude-sonnet-5-5" in html
+
+
+def test_items_about_one_story_are_grouped_under_its_heading() -> None:
+    briefing = written_briefing()
+    sections = briefing.sections
+    assert [(s.heading, [i.rank for i in s.items]) for s in sections] == [
+        ("The release", [1, 3]),  # matched regardless of case, in the first one's place
+        ("", [2]),  # a heading over a single item is dropped
+    ]
+    text = render_briefing(briefing).text
+    assert (
+        text.index("== The release ==") < text.index("1. ") < text.index("3. ") < text.index("2. ")
+    )
+    assert "Plain reason." in text  # no blurb for item 2: the scorer's reason stands in
+
+
+def test_a_degraded_briefing_says_so() -> None:
+    rendered = render_briefing(replace(fixture_briefing(), degraded=True))
+    assert "The write-up failed today" in rendered.text
+    assert "The write-up failed today" in rendered.html

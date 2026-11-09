@@ -2,7 +2,7 @@
 
 A multi-user news-ingestion and LLM-scoring service: it fetches feeds politely, deduplicates articles, scores them against each user's own rubric with Claude, and delivers a daily briefing by email or signed webhook.
 
-**Status: checkpoint 1.1 (one complete briefing).** One feed, one profile, a Postgres job queue with one worker, Claude Haiku scoring with structured output, a cost ledger, and an email of the top-scored articles. It runs by hand; there is no scheduler yet. The design and the remaining checkpoints are in [docs/plan.md](docs/plan.md).
+**Status: checkpoint 1.3 (a daily briefing I can live with).** Five feeds and one profile; a Postgres job queue with retries, leases and dead letters; polite fetching (per-host spacing, `Retry-After`, conditional GET); Claude Haiku scores each article against the rubric, and Claude Sonnet writes the briefing's headline, introduction and a short paragraph per item; a cost ledger; an email sent exactly once; and a local page for marking what was worth reading. A script runs it daily from Windows Task Scheduler. The design and the remaining checkpoints are in [docs/plan.md](docs/plan.md).
 
 Planned stack: Python, FastAPI, PostgreSQL, a Postgres-backed job queue and worker, Docker, GitHub Actions, AWS (ECS Fargate, RDS), Anthropic API.
 
@@ -50,7 +50,19 @@ Planned stack: Python, FastAPI, PostgreSQL, a Postgres-backed job queue and work
    uv run briefing usage
    ```
 
-Running `run-daily` again for the same date makes no LLM calls and sends no email: scores come from the cache and the briefing already exists. `uv run briefing jobs` shows the queue.
+Running `run-daily` again for the same date makes no LLM calls and sends no email: scores come from the cache and the briefing already exists. Feeds that haven't changed answer `304 Not Modified`, so a re-run downloads almost nothing. `uv run briefing jobs` shows the queue.
+
+A typical day costs about 2–3 cents: well under a cent for Haiku's scoring, and about 2 cents for Sonnet's write-up. To send the scorer's one-line reasons instead of a write-up, set `WRITEUP_MODEL=` (empty) in `.env`. If the write-up call fails, the briefing still goes out with those reasons and says so.
+
+### Run it every day (Windows)
+
+`scripts/run-daily.ps1` starts the containers if needed, runs `run-daily` and appends its output to `logs/run-daily-<date>.log`. To have Task Scheduler run it at 06:00 (or `-At 05:30`, say):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\schedule-daily.ps1
+```
+
+The task runs as you while you're signed in, and if the PC was asleep at 06:00 it runs when it wakes. Docker Desktop must be set to start at sign-in. Remove the task with `-Remove`.
 
 ### When something fails
 

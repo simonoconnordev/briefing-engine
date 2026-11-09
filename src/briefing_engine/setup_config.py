@@ -2,8 +2,9 @@
 from a small TOML file.
 
 Editing a rubric inserts a new profile version; unchanged rubrics keep their version,
-so their cached scores stay valid. Nothing is deleted: removing a source from the file
-leaves its row in place.
+so their cached scores stay valid. The file is the list of subscriptions: a feed taken out
+of it (or out of a profile) is unsubscribed, so it is no longer fetched, scored or sent.
+Its source row and articles stay, so past briefings and marks keep their history.
 """
 
 import json
@@ -64,6 +65,7 @@ class LoadReport:
     profiles_new_version: list[str]
     sources: int
     subscriptions: int
+    unsubscribed: int = 0
 
 
 def read_config(path: Path) -> BriefingConfig:
@@ -196,6 +198,8 @@ def load_config(engine: Engine, config: BriefingConfig) -> LoadReport:
     with engine.begin() as conn:
         user_id = _upsert_user(conn, config.user)
         profile_ids: dict[str, Any] = {}
+        new_feeds_for: set[str] = set()
+        kept: list[tuple[Any, int]] = []
         for profile in config.profiles:
             profile_id, created = _upsert_profile(conn, user_id, profile)
             profile_ids[profile.name] = profile_id
@@ -205,12 +209,13 @@ def load_config(engine: Engine, config: BriefingConfig) -> LoadReport:
             source_id = _upsert_source(conn, source)
             report.sources += 1
             for name in source.profiles:
-                conn.execute(
+                inserted = conn.execute(
                     text(
                         """
                         INSERT INTO subscriptions (id, user_id, source_id, profile_id, weight)
                         VALUES (:id, :u, :s, :p, :w)
                         ON CONFLICT (profile_id, source_id) DO UPDATE SET weight = EXCLUDED.weight
+                        RETURNING (xmax = 0) AS inserted
                         """
                     ),
                     {
@@ -220,6 +225,34 @@ def load_config(engine: Engine, config: BriefingConfig) -> LoadReport:
                         "p": profile_ids[name],
                         "w": source.weight,
                     },
-                )
+                ).scalar_one()
                 report.subscriptions += 1
+                kept.append((profile_ids[name], source_id))
+                if inserted:
+                    new_feeds_for.add(name)
+        report.unsubscribed = conn.execute(
+            text(
+                """
+                DELETE FROM subscriptions
+                WHERE user_id = :u
+                  AND (profile_id, source_id) NOT IN (
+                      SELECT * FROM unnest(CAST(:profiles AS uuid[]), CAST(:sources AS bigint[])))
+                """
+            ),
+            {"u": user_id, "profiles": [p for p, _ in kept], "sources": [s for _, s in kept]},
+        ).rowcount
+        # A new rubric, or a feed new to a profile, must see the feed's current posts, so
+        # the next fetch of those feeds is unconditional (no 304, no soft 304).
+        changed = set(report.profiles_new_version) | new_feeds_for
+        if changed:
+            conn.execute(
+                text(
+                    """
+                    UPDATE sources SET etag = NULL, last_modified = NULL, last_body_sha256 = NULL
+                    WHERE id IN (SELECT source_id FROM subscriptions
+                                 WHERE profile_id = ANY(:profiles))
+                    """
+                ),
+                {"profiles": [profile_ids[name] for name in changed]},
+            )
     return report

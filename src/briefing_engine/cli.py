@@ -25,6 +25,7 @@ from briefing_engine.delivery.email import SmtpMailer
 from briefing_engine.ingest.feeds import make_http_client
 from briefing_engine.llm.client import AnthropicClient
 from briefing_engine.llm.scorer import ClaudeScorer
+from briefing_engine.llm.writer import ClaudeWriter
 from briefing_engine.pipeline import run_daily
 from briefing_engine.setup_config import load_config, read_config
 
@@ -46,6 +47,7 @@ def _context(settings: Settings, engine: Engine) -> Context:
         mailer=SmtpMailer(settings),
         http_client=make_http_client,
         web_base_url=settings.web_base_url,
+        writer=ClaudeWriter(client, settings.writeup_model) if settings.writeup_model else None,
     )
 
 
@@ -61,6 +63,11 @@ def cmd_load_config(settings: Settings, args: argparse.Namespace) -> None:
     print(
         f"Loaded {len(config.profiles)} profile(s), {report.sources} source(s) and "
         f"{report.subscriptions} subscription(s). New rubric versions: {changed}."
+        + (
+            f" Unsubscribed {report.unsubscribed} feed(s) no longer in the file."
+            if report.unsubscribed
+            else ""
+        )
     )
 
 

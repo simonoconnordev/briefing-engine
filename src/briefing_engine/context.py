@@ -10,6 +10,7 @@ from sqlalchemy import Engine
 
 from briefing_engine.delivery.email import Mailer
 from briefing_engine.llm.scorer import PROMPT_VERSION, Scorer
+from briefing_engine.llm.writer import Writer
 from briefing_engine.queue.jobs import DEFAULT_LEASE_S, POLICIES, QueuePolicy
 
 
@@ -26,6 +27,7 @@ class Context:
     worker_id: str = field(default_factory=default_worker_id)
     prompt_version: int = PROMPT_VERSION
     web_base_url: str | None = None  # where `briefing web` runs, for the email's marking link
+    writer: Writer | None = None  # None sends the ranked list with the scorer's reasons
     policies: Mapping[str, QueuePolicy] = field(default_factory=lambda: dict(POLICIES))
     lease_s: int = DEFAULT_LEASE_S
     # The worker waits for a job due within this long (a deferred fetch, a quick retry)

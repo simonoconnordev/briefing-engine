@@ -6,9 +6,11 @@ from dataclasses import dataclass, field
 from sqlalchemy import Engine, text
 
 from briefing_engine.delivery.render import RenderedEmail
+from briefing_engine.llm.client import LlmApiError
 from briefing_engine.llm.pricing import TokenUsage
 from briefing_engine.llm.rubric import Rubric
 from briefing_engine.llm.scorer import BatchResult, ScoredItem, ScoreInput
+from briefing_engine.llm.writer import WriteInput, WriteResult, WrittenItem
 
 
 @dataclass
@@ -68,4 +70,38 @@ def no_host_spacing(db: Engine) -> None:
                 ON CONFLICT (host) DO UPDATE SET min_interval_ms = 0
                 """
             )
+        )
+
+
+@dataclass
+class FakeWriter:
+    """Writes a blurb per item; agent stories share a heading. `errors` fail the next calls."""
+
+    calls: list[list[str]] = field(default_factory=list)
+    errors: list[LlmApiError] = field(default_factory=list)
+
+    @property
+    def model(self) -> str:
+        return "claude-sonnet-5-5"
+
+    def write(self, rubric: Rubric, items: Sequence[WriteInput]) -> WriteResult:
+        self.calls.append([i.title for i in items])
+        usage = TokenUsage(2000, 400)
+        if self.errors:
+            error = self.errors.pop(0)
+            return WriteResult(outcome="api_error", missing=[i.ref for i in items], error=error,
+                               estimate_micros=50_000)  # fmt: skip
+        return WriteResult(
+            outcome="ok",
+            headline="Agents and evals",
+            intro="Two practical posts today.",
+            items={
+                i.ref: WrittenItem(
+                    i.ref, f"Blurb for {i.title}.", "Agents" if "agent" in i.title else ""
+                )
+                for i in items
+            },
+            usage=usage,
+            cost_micros=8000,
+            estimate_micros=50_000,
         )

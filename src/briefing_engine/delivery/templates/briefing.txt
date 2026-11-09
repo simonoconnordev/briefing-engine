@@ -1,19 +1,33 @@
 {{ b.profile_name | upper }} · {{ b.briefing_date | long_date }}
+{% if b.headline %}
+
+{{ b.headline }}
+{% endif %}
+{% if b.intro %}
+
+{{ b.intro }}
+{% endif %}
 
 {% if b.items %}
 {{ b.items | length }} of {{ b.above_threshold }} articles that scored {{ '%g' % b.threshold }} or more, from {{ b.scored }} scored in this window.
 {% else %}
 Nothing scored {{ '%g' % b.threshold }} or more today ({{ b.scored }} articles scored).
 {% endif %}
-{% for item in b.items %}
+{% for section in b.sections %}
+{% if section.heading %}
+
+== {{ section.heading }} ==
+{% endif %}
+{% for item in section.items %}
 
 {{ item.rank }}. {{ item.title }}
    {{ item.score }}/10 · {{ item.sources }}{% if item.published_at %} · {{ item.published_at | short_date }}{% endif %}
 
-   {{ item.reason }}
+   {{ item.text }}
 {% if item.href %}
    {{ item.href }}
 {% endif %}
+{% endfor %}
 {% endfor %}
 {% if b.mark_href %}
 
@@ -22,5 +36,8 @@ Mark these items as interesting or not for you (needs `briefing web` running):
 {% endif %}
 
 --
-Scored by {{ b.model }}. Model cost in this window: {{ b.cost_micros | dollars }}.
+Scored by {{ b.model }}{% if b.writer %}, written up by {{ b.writer }}{% endif %}. Model cost in this window: {{ b.cost_micros | dollars }}.
+{% if b.degraded %}
+The write-up failed today, so the scorer's reasons are shown instead.
+{% endif %}
 {{ b.in_window }} articles arrived in this window and {{ b.scored }} were scored. Briefing {{ b.briefing_id }}.

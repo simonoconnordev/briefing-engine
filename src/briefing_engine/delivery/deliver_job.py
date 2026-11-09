@@ -145,7 +145,7 @@ def load_email_briefing(ctx: Context, briefing_id: uuid.UUID) -> tuple[str, Emai
         b = conn.execute(
             text(
                 """
-                SELECT b.id, b.briefing_date, b.writeup, b.cost_micros, u.email,
+                SELECT b.id, b.briefing_date, b.writeup, b.cost_micros, b.status, u.email,
                        p.name AS profile_name, p.threshold
                 FROM briefings b
                 JOIN users u ON u.id = b.user_id
@@ -155,6 +155,7 @@ def load_email_briefing(ctx: Context, briefing_id: uuid.UUID) -> tuple[str, Emai
             ),
             {"id": briefing_id},
         ).one()
+        written = (b.writeup or {}).get("items", {})
         items = [
             EmailItem(
                 rank=r.rank,
@@ -164,11 +165,14 @@ def load_email_briefing(ctx: Context, briefing_id: uuid.UUID) -> tuple[str, Emai
                 published_at=r.published_at,
                 score=r.score,
                 reason=r.blurb,
+                blurb=written.get(str(r.article_id), {}).get("blurb", ""),
+                story=written.get(str(r.article_id), {}).get("story", ""),
             )
             for r in conn.execute(
                 text(
                     """
-                    SELECT bi.rank, bi.score, bi.blurb, a.title, a.url_canonical,
+                    SELECT bi.rank, bi.score, bi.blurb, a.id AS article_id, a.title,
+                           a.url_canonical,
                            a.published_at,
                            string_agg(DISTINCT s.name, ', ') AS sources
                     FROM briefing_items bi
@@ -196,6 +200,10 @@ def load_email_briefing(ctx: Context, briefing_id: uuid.UUID) -> tuple[str, Emai
         model=ctx.scorer.model,
         briefing_id=str(b.id),
         mark_url=f"{ctx.web_base_url.rstrip('/')}/briefings/{b.id}" if ctx.web_base_url else None,
+        headline=str(writeup.get("headline", "")),
+        intro=str(writeup.get("intro", "")),
+        writer=writeup.get("writer") if written else None,
+        degraded=b.status == "degraded",
     )
 
 

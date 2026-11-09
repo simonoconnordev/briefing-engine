@@ -28,6 +28,7 @@ GIVE_UP_AFTER_S = 6 * 3600.0  # a host blocked for longer than this is skipped f
 class Outcome(StrEnum):
     OK = "ok"
     NOT_MODIFIED = "not_modified"
+    UNCHANGED_BODY = "unchanged_body"  # a 200 with the same bytes as last time (soft 304)
     BLOCKED = "blocked"  # 429 or 503 with Retry-After: the host told us when to come back
     RETRYABLE = "retryable"  # 408, 425, 429, 5xx, connection errors
     MISSING = "missing"  # 401, 403, 404 and other 4xx: counts towards broken
@@ -42,6 +43,8 @@ class FetchResult:
     final_url: str
     moved_permanently: bool  # every redirect on the way was a 301 or 308
     retry_after_s: float | None
+    etag: str | None = None  # validators from a 200, kept exactly as sent
+    last_modified: str | None = None
 
 
 def parse_retry_after(value: str | None, now: datetime | None = None) -> float | None:
@@ -91,9 +94,20 @@ def classify(status_code: int, retry_after_s: float | None) -> Outcome:
     return Outcome.FATAL  # a 1xx or 3xx we couldn't follow
 
 
-def fetch(client: httpx.Client, url: str) -> FetchResult:
-    """GET `url`, reading at most 5 MB of a 200. Transport errors propagate (retryable)."""
-    with client.stream("GET", url) as response:
+def fetch(
+    client: httpx.Client, url: str, etag: str | None = None, last_modified: str | None = None
+) -> FetchResult:
+    """GET `url`, reading at most 5 MB of a 200. Transport errors propagate (retryable).
+
+    The validators from the last 200, if any, go out as If-None-Match and
+    If-Modified-Since, so an unchanged feed can answer 304 (§6.4).
+    """
+    headers = {}
+    if etag:
+        headers["If-None-Match"] = etag
+    if last_modified:
+        headers["If-Modified-Since"] = last_modified
+    with client.stream("GET", url, headers=headers) as response:
         body = b""
         if response.status_code == 200:
             chunks: list[bytes] = []
@@ -111,6 +125,10 @@ def fetch(client: httpx.Client, url: str) -> FetchResult:
             final_url=str(response.url),
             moved_permanently=bool(history) and all(r.status_code in (301, 308) for r in history),
             retry_after_s=parse_retry_after(response.headers.get("retry-after")),
+            etag=response.headers.get("etag") if response.status_code == 200 else None,
+            last_modified=(
+                response.headers.get("last-modified") if response.status_code == 200 else None
+            ),
         )
 
 

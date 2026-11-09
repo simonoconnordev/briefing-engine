@@ -71,6 +71,9 @@ sources = Table(
     Column("created_at", TS, nullable=False, server_default=text("now()")),
     Column("exclude_categories", ARRAY(Text), nullable=False, server_default="{}"),
     Column("consecutive_failures", Integer, nullable=False, server_default="0"),
+    Column("etag", Text),
+    Column("last_modified", Text),
+    Column("last_body_sha256", LargeBinary),
 )
 
 hosts = Table(
@@ -289,6 +292,18 @@ dead_letters = Table(
     Column("created_at", TS, nullable=False, server_default=text("now()")),
     Column("replayed_at", TS),
     Index("dead_letters_job", "job_id"),
+)
+
+llm_writeups = Table(
+    "llm_writeups",
+    metadata,
+    Column("items_hash", LargeBinary, primary_key=True),
+    Column("rubric_hash", LargeBinary, primary_key=True),
+    Column("model", Text, primary_key=True),
+    Column("prompt_version", Integer, primary_key=True),
+    Column("writeup", JSONB, nullable=False),
+    Column("llm_call_id", BigInteger, ForeignKey("llm_calls.id"), nullable=False),
+    Column("created_at", TS, nullable=False, server_default=text("now()")),
 )
 
 article_feedback = Table(

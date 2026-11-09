@@ -1,6 +1,6 @@
 # briefing-engine: design plan
 
-**Status:** revision 3. Checkpoints 1.1 and 1.2 are built; see [Checkpoint 1.1: as built](#checkpoint-11-as-built), [the trial set-up](#trial-set-up-between-11-and-12) and [Checkpoint 1.2: as built](#checkpoint-12-as-built).
+**Status:** revision 3. Checkpoints 1.1, 1.2 and most of 1.3 are built; see [Checkpoint 1.1: as built](#checkpoint-11-as-built), [the trial set-up](#trial-set-up-between-11-and-12), [Checkpoint 1.2: as built](#checkpoint-12-as-built) and [Checkpoint 1.3: as built](#checkpoint-13-as-built). What 1.3 still needs is a week of reading-log evidence and my decisions on Q2, Q3 and Q5.
 **Author:** Simon O'Connor
 **Last updated:** 2026-11-09 (as-built notes for 1.2; Q16 settled). Revision 3 was made on 2026-11-08. Revision 3 splits stage 1 into four checkpoints, adds a reading-quality routine, and corrects the budget, rate-limit, score-input and subscription rules after two design reviews; see the [revision history](#17-revision-history).
 
@@ -1078,6 +1078,20 @@ Built 2026-11-09. Where the code settles or differs from this plan:
 - **`briefing jobs replay ID`** requeues a dead job from attempt 0 and, for a delivery, reopens the delivery. It refuses if the job isn't dead or equivalent work is already queued.
 - **Mailpit** now skips its reverse-DNS lookup (it added 8 s to every send inside Docker Desktop) and keeps its inbox on a volume.
 - **Migration 0003** holds these tables. 152 tests pass (unit and integration), with ruff and mypy strict clean.
+
+#### Checkpoint 1.3: as built
+
+Built 2026-11-09. Where the code settles or differs from this plan:
+
+- **Feeds.** Five, chosen for relevance rather than ported from Horizon (Q4): Simon Willison, One Useful Thing, Latent Space, the Hugging Face blog and Show HN at 100+ points (`hnrss.org`, so no separate HN adapter). The Hugging Face feed carries titles only, so those items are scored, and written up, from the title; the write-up says so. Each feed earns its place by its hit rate in `briefing report`.
+- **Conditional GET (§6.4).** `If-None-Match` and `If-Modified-Since` from the last 200; a 304 is `not_modified`, and a 200 whose body hash matches the last one is `unchanged_body` (a soft 304). Validators change only on a 200. A new rubric version, or a feed newly added to a profile, clears that profile's validators, so the next fetch sees every current post. On the real feeds, a re-run got four 304s and one unchanged body.
+- **Write-up (§7.6).** One Sonnet call per briefing, over the placed items only: a headline, a two- or three-sentence introduction, and per item a short paragraph and an optional story heading that groups items about the same story. Structured output, the same per-request boundary token as scoring, and hard word limits applied after the reply (headline 14, intro 80, paragraph 60). Cached in `llm_writeups` by the hash of the items' score inputs plus rubric, model and prompt version, so a rebuilt briefing with the same items costs nothing. The paragraphs live in `briefings.writeup`; `briefing_items.blurb` keeps the scorer's reason.
+- **When the write-up fails,** a temporary error retries the build (up to 3 attempts); after that, or on a permanent error, the briefing is `degraded` and goes out with the scorer's reasons and a line saying so. The paid call is in the ledger either way. First real run: $0.022, 11 s.
+- **Score jobs and API errors.** A batch the API rejected or rate-limited is now retried (after `Retry-After`) or made dead, rather than counted as done with no scores. The ledger row still commits first.
+- **The config file is the list of subscriptions.** A feed removed from `briefing.toml`, or from a profile, is unsubscribed on `load-config`; its source row and articles stay for history. Found on the real data: a URL change had left the old Latent Space address subscribed beside the new one.
+- **Daily scheduling** is a script, not a service: `scripts/run-daily.ps1` (starts the containers, runs `run-daily`, logs to `logs/`) and `scripts/schedule-daily.ps1`, which registers a Task Scheduler entry at 06:00 that catches up after sleep. Registering it is my decision (Q2), so the code doesn't do it.
+- **Deferred:** full-text extraction (the reading log hasn't yet shown it's needed; the Hugging Face titles are the first candidate), the second profile (Q5), and real SMTP (Q3). Q17 stays open with extraction.
+- **Migration 0004** holds the validator columns and `llm_writeups`. 166 tests pass, with ruff and mypy strict clean.
 
 #### Checkpoint 1.2: repeatable and recoverable
 

@@ -8,7 +8,10 @@
 <body style="margin:0;padding:0;background:#f4f3ef;">
 <div style="max-width:640px;margin:0 auto;padding:24px 16px;font-family:Georgia,'Times New Roman',serif;color:#1d1c1a;">
   <p style="margin:0;font-family:Arial,Helvetica,sans-serif;font-size:12px;letter-spacing:0.08em;text-transform:uppercase;color:#6b675f;">{{ b.profile_name }} &middot; {{ b.briefing_date | long_date }}</p>
-  <h1 style="margin:6px 0 4px;font-size:26px;font-weight:normal;">Today's briefing</h1>
+  <h1 style="margin:6px 0 4px;font-size:26px;font-weight:normal;line-height:1.25;">{% if b.headline %}{{ b.headline }}{% else %}Today's briefing{% endif %}</h1>
+{% if b.intro %}
+  <p style="margin:8px 0 12px;font-size:16px;line-height:1.55;color:#33312d;">{{ b.intro }}</p>
+{% endif %}
   <p style="margin:0 0 24px;font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#4a4740;">
 {% if b.items %}
     {{ b.items | length }} of {{ b.above_threshold }} articles that scored {{ '%g' % b.threshold }} or more, from {{ b.scored }} scored in this window.
@@ -16,7 +19,11 @@
     Nothing scored {{ '%g' % b.threshold }} or more today ({{ b.scored }} articles scored).
 {% endif %}
   </p>
-{% for item in b.items %}
+{% for section in b.sections %}
+{% if section.heading %}
+  <p style="margin:20px 0 0;padding-top:12px;border-top:2px solid #1d1c1a;font-family:Arial,Helvetica,sans-serif;font-size:12px;letter-spacing:0.06em;text-transform:uppercase;color:#1d1c1a;font-weight:bold;">{{ section.heading }}</p>
+{% endif %}
+{% for item in section.items %}
   <div style="padding:16px 0;border-top:1px solid #dcd8cf;">
     <p style="margin:0 0 4px;font-family:Arial,Helvetica,sans-serif;font-size:12px;color:#6b675f;">
       <span style="display:inline-block;min-width:34px;padding:1px 6px;margin-right:6px;border-radius:3px;background:#1d1c1a;color:#f4f3ef;text-align:center;font-weight:bold;">{{ item.score }}/10</span>
@@ -29,8 +36,9 @@
       {{ item.title }}
 {% endif %}
     </h2>
-    <p style="margin:0;font-size:15px;line-height:1.5;color:#33312d;">{{ item.reason }}</p>
+    <p style="margin:0;font-size:15px;line-height:1.5;color:#33312d;">{{ item.text }}</p>
   </div>
+{% endfor %}
 {% endfor %}
 {% if b.mark_href %}
   <p style="margin:24px 0 0;font-family:Arial,Helvetica,sans-serif;font-size:14px;">
@@ -39,7 +47,10 @@
   </p>
 {% endif %}
   <p style="margin:24px 0 0;padding-top:12px;border-top:1px solid #dcd8cf;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:1.6;color:#6b675f;">
-    Scored by {{ b.model }}. Model cost in this window: {{ b.cost_micros | dollars }}.<br>
+    Scored by {{ b.model }}{% if b.writer %}, written up by {{ b.writer }}{% endif %}. Model cost in this window: {{ b.cost_micros | dollars }}.<br>
+{% if b.degraded %}
+    The write-up failed today, so the scorer's reasons are shown instead.<br>
+{% endif %}
     {{ b.in_window }} articles arrived in this window and {{ b.scored }} were scored. Briefing {{ b.briefing_id }}.
   </p>
 </div>

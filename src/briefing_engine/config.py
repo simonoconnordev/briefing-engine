@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     anthropic_api_key: SecretStr | None = None
     anthropic_base_url: str | None = None
     score_model: str = "claude-haiku-5-5"
+    # The write-up reads only the items placed in the briefing, so a stronger model is cheap
+    # here. Leave it empty to send the ranked list with the scorer's reasons instead.
+    writeup_model: str = "claude-sonnet-5-5"
 
     smtp_host: str = "127.0.0.1"
     smtp_port: int = 1025

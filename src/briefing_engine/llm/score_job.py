@@ -17,13 +17,19 @@ from briefing_engine.llm.client import ErrorKind, LlmApiError
 from briefing_engine.llm.rubric import Rubric
 from briefing_engine.llm.scorer import BatchResult, ScoreInput
 from briefing_engine.llm.scoring_input import input_hash, scoring_input
+from briefing_engine.llm.writer import WriteResult
 from briefing_engine.queue.jobs import Fatal, Job, RetryLater, complete, fail
 
 log = logging.getLogger(__name__)
 
 
 def record_call(
-    conn: Connection, *, user_id: uuid.UUID, purpose: str, model: str, result: BatchResult
+    conn: Connection,
+    *,
+    user_id: uuid.UUID,
+    purpose: str,
+    model: str,
+    result: BatchResult | WriteResult,
 ) -> int:
     """Write one row to the cost ledger and return its id."""
     return int(
@@ -55,6 +61,14 @@ def record_call(
             },
         ).scalar_one()
     )
+
+
+def _requeue_or_bury(exc: LlmApiError) -> RetryLater | Fatal:
+    """Rate limits, overload and 5xx come back later (after Retry-After when the API sends
+    one); a rejected request or key would fail the same way every time."""
+    if exc.kind is ErrorKind.RETRYABLE:
+        return RetryLater(str(exc), delay_s=exc.retry_after_s)
+    return Fatal(str(exc))
 
 
 def handle_score(ctx: Context, jobs: Sequence[Job]) -> None:
@@ -116,11 +130,7 @@ def handle_score(ctx: Context, jobs: Sequence[Job]) -> None:
     try:
         result = ctx.scorer.score(rubric, inputs) if inputs else None
     except LlmApiError as exc:
-        # Rate limits, overload and 5xx come back later (after Retry-After when the API
-        # sends one); a rejected request or key would fail the same way every time.
-        if exc.kind is ErrorKind.RETRYABLE:
-            raise RetryLater(str(exc), delay_s=exc.retry_after_s) from exc
-        raise Fatal(str(exc)) from exc
+        raise _requeue_or_bury(exc) from exc
 
     # The call has been paid for, so its ledger row commits on its own: if this worker
     # has lost its lease, the scores below roll back but the cost is still recorded.
@@ -130,6 +140,9 @@ def handle_score(ctx: Context, jobs: Sequence[Job]) -> None:
             call_id = record_call(
                 conn, user_id=billed_user, purpose="score", model=model, result=result
             )
+        if result.outcome == "api_error" and result.error is not None:
+            # The whole batch failed at the API: none of its jobs is the batch's fault.
+            raise _requeue_or_bury(result.error)
 
     with ctx.engine.begin() as conn:
         for job in missing:

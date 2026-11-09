@@ -69,3 +69,9 @@ Thumbs.db
 
 # --- Local briefing config (holds your real email address) ---
 briefing.toml
+
+# --- Daily-run logs ---
+logs/
+
+# --- Personal learning guide (kept out of the repo) ---
+docs/Briefing Engine Field Guide.html

@@ -16,7 +16,7 @@ from briefing_engine.pipeline import run_daily
 from briefing_engine.queue.jobs import LeaseLost, claim_score_batch, enqueue
 from briefing_engine.queue.worker import run_until_idle
 from briefing_engine.setup_config import BriefingConfig, load_config, read_config
-from tests.integration.fakes import FakeMailer, FakeScorer, no_host_spacing
+from tests.integration.fakes import FakeMailer, FakeScorer, FakeWriter, no_host_spacing
 
 pytestmark = pytest.mark.integration
 
@@ -143,6 +143,26 @@ def test_editing_the_rubric_creates_a_new_version(db: Engine) -> None:
     assert count(db, "SELECT count(*) FROM profile_versions") == 2
 
 
+def test_a_feed_taken_out_of_the_file_is_unsubscribed(db: Engine) -> None:
+    config = read_config(ROOT / "briefing.example.toml")
+    first = load_config(db, config)
+    removed = config.sources.pop()
+    again = load_config(db, config)
+    assert first.unsubscribed == 0
+    assert again.unsubscribed == 1
+    assert count(db, "SELECT count(*) FROM subscriptions") == first.subscriptions - 1
+    with db.connect() as conn:  # the source row stays, so its history does
+        assert (
+            conn.execute(
+                text("SELECT count(*) FROM sources WHERE url = :u"), {"u": removed.url}
+            ).scalar_one()
+            == 1
+        )
+    config.sources.append(removed)
+    assert load_config(db, config).unsubscribed == 0  # and putting it back resubscribes
+    assert count(db, "SELECT count(*) FROM subscriptions") == first.subscriptions
+
+
 def test_a_paid_call_stays_in_the_ledger_when_the_lease_is_lost(ctx: Context) -> None:
     """The worker scores, but another worker took the jobs meanwhile: the scores are
     discarded, the money spent is not forgotten."""
@@ -157,3 +177,88 @@ def test_a_paid_call_stays_in_the_ledger_when_the_lease_is_lost(ctx: Context) ->
         handle_score(ctx, batch)
     assert count(ctx.engine, "SELECT count(*) FROM llm_calls") == 1
     assert count(ctx.engine, "SELECT count(*) FROM llm_scores") == 0
+
+
+def test_a_rate_limited_batch_is_retried_not_buried(ctx: Context) -> None:
+    from briefing_engine.llm.client import ErrorKind, LlmApiError
+    from briefing_engine.llm.scorer import BatchResult
+
+    assert isinstance(ctx.scorer, FakeScorer)
+    real_score = ctx.scorer.score
+    replies = iter(
+        [
+            BatchResult(
+                outcome="api_error",
+                error=LlmApiError(ErrorKind.RETRYABLE, "RateLimitError", status_code=429,
+                                  retry_after_s=0.2),
+            )
+        ]
+    )  # fmt: skip
+    ctx.scorer.score = lambda rubric, articles: (
+        next(replies, None)
+        or real_score(  # type: ignore[method-assign]
+            rubric, articles
+        )
+    )
+    report = run_daily(ctx, DAY)
+    assert report.ingest.failed == {}
+    assert count(ctx.engine, "SELECT count(*) FROM llm_scores") == 3
+    assert count(ctx.engine, "SELECT count(*) FROM llm_calls WHERE outcome = 'api_error'") == 1
+    assert len(ctx.mailer.sent) == 1
+
+
+def test_the_write_up_heads_the_email_and_is_cached(ctx: Context) -> None:
+    writer = FakeWriter()
+    ctx.writer = writer
+    report = run_daily(ctx, DAY)
+    assert report.llm_calls == 2  # one score batch, one write-up
+    [(_, email)] = ctx.mailer.sent
+    assert "Agents and evals" in email.text and "Two practical posts today." in email.text
+    assert "Blurb for New open-source eval harness." in email.text
+    assert "written up by claude-sonnet-5-5" in email.text
+    with ctx.engine.connect() as conn:
+        status, fmt = conn.execute(text("SELECT status, writeup->>'format' FROM briefings")).one()
+        purposes = conn.execute(text("SELECT purpose FROM llm_calls ORDER BY id")).scalars().all()
+    assert (status, fmt) == ("ready", "writeup")
+    assert purposes == ["score", "writeup"]
+
+    # The same items on another day are written up from the cache, at no cost.
+    with ctx.engine.begin() as conn:
+        conn.execute(text("DELETE FROM deliveries"))
+        conn.execute(text("DELETE FROM briefing_items"))
+        conn.execute(text("DELETE FROM briefings"))
+    run_daily(ctx, DAY)
+    assert len(writer.calls) == 1
+    assert "Agents and evals" in ctx.mailer.sent[-1][1].text
+
+
+def test_a_failed_write_up_sends_a_degraded_briefing_with_the_reasons(ctx: Context) -> None:
+    from briefing_engine.llm.client import ErrorKind, LlmApiError
+
+    ctx.writer = FakeWriter(errors=[LlmApiError(ErrorKind.FATAL_REQUEST, "BadRequestError")])
+    report = run_daily(ctx, DAY)
+    assert report.build.failed == {}
+    [(_, email)] = ctx.mailer.sent
+    assert "Why: Building an agent" in email.text  # the scorer's reason stands in
+    assert "The write-up failed today" in email.text
+    with ctx.engine.connect() as conn:
+        assert conn.execute(text("SELECT status FROM briefings")).scalar_one() == "degraded"
+        assert conn.execute(text("SELECT count(*) FROM llm_writeups")).scalar_one() == 0
+        assert (
+            conn.execute(
+                text("SELECT outcome FROM llm_calls WHERE purpose = 'writeup'")
+            ).scalar_one()
+            == "api_error"
+        )
+
+
+def test_a_rate_limited_write_up_is_retried_before_degrading(ctx: Context) -> None:
+    from briefing_engine.llm.client import ErrorKind, LlmApiError
+
+    busy = LlmApiError(ErrorKind.RETRYABLE, "OverloadedError", status_code=529, retry_after_s=0.1)
+    writer = FakeWriter(errors=[busy])
+    ctx.writer = writer
+    run_daily(ctx, DAY)
+    assert len(writer.calls) == 2
+    with ctx.engine.connect() as conn:
+        assert conn.execute(text("SELECT status FROM briefings")).scalar_one() == "ready"

@@ -1,5 +1,6 @@
 # Copy to briefing.toml (ignored by git) and run `briefing load-config`.
-# Trial set-up: three feeds whose posts carry their full text, and one profile.
+# Five feeds and one profile: three that carry whole posts, the Hugging Face blog (titles
+# only) and Show HN. Add feeds one at a time and judge each by its hit rate (`briefing report`).
 
 [user]
 email = "you@example.com"          # Mailpit catches everything locally, so any address works
@@ -78,3 +79,18 @@ url = "https://www.latent.space/feed"
 kind = "rss"
 profiles = ["ai-news"]
 exclude_categories = ["AINews: Weekday Roundups"]   # its daily news digest
+
+[[sources]]
+name = "Hugging Face blog"
+url = "https://huggingface.co/blog/feed.xml"
+kind = "rss"
+profiles = ["ai-news"]
+# Titles only: the feed carries no summaries, so these are scored on the title alone.
+
+[[sources]]
+name = "Show HN (100+ points)"
+url = "https://hnrss.org/show?points=100"
+kind = "rss"
+profiles = ["ai-news"]
+# Things people built, with the poster's own description. Most aren't about AI, and the
+# rubric scores those down.

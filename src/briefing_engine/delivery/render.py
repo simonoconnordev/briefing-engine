@@ -48,11 +48,23 @@ class EmailItem:
     sources: str
     published_at: datetime | None
     score: int
-    reason: str
+    reason: str  # the scorer's one-line reason
+    blurb: str = ""  # the write-up's paragraph, when there is one
+    story: str = ""  # a heading shared by items about the same story
 
     @property
     def href(self) -> str | None:
         return safe_href(self.url)
+
+    @property
+    def text(self) -> str:
+        return self.blurb or self.reason
+
+
+@dataclass(frozen=True)
+class Section:
+    heading: str  # empty for an item that stands alone
+    items: list[EmailItem]
 
 
 @dataclass(frozen=True)
@@ -68,10 +80,31 @@ class EmailBriefing:
     model: str
     briefing_id: str
     mark_url: str | None = None  # the local page for marking these items
+    headline: str = ""
+    intro: str = ""
+    writer: str | None = None  # the model that wrote the blurbs, if any did
+    degraded: bool = False  # the write-up failed; the scorer's reasons stand in
 
     @property
     def mark_href(self) -> str | None:
         return safe_href(self.mark_url) if self.mark_url else None
+
+    @property
+    def sections(self) -> list[Section]:
+        """Items in rank order, with items about one story gathered under the first."""
+        sections: list[Section] = []
+        by_story: dict[str, Section] = {}
+        for item in self.items:
+            key = item.story.casefold()
+            if key and key in by_story:
+                by_story[key].items.append(item)
+                continue
+            section = Section(heading=item.story, items=[item])
+            sections.append(section)
+            if key:
+                by_story[key] = section
+        # A story heading only earns its place over two or more items.
+        return [s if len(s.items) > 1 else Section(heading="", items=s.items) for s in sections]
 
 
 @dataclass(frozen=True)
