@@ -961,7 +961,7 @@ The end-to-end job adds about 4 minutes to a PR. On a private repo that counts a
 
 **Deploy pipeline:** build the image tagged with the git SHA → push to ECR → run `briefing migrate` as a **one-off ECS task** (migrations run before new code starts) → update both services → rolling deployment with a circuit breaker that rolls back automatically if health checks fail. The rollback path is to redeploy the previous image tag. Migrations are backward-compatible by policy (§4.3), so rolling the code back is safe. Old tasks keep passing readiness after the migration, because readiness checks `schema_version >= MIN_SCHEMA_VERSION`, not an exact match (§12.3). After the rollout, the pipeline calls `/readyz` on the new tasks as a final gate.
 
-**Estimated cost:** ALB about $18, two Fargate tasks about $18, RDS about $15, everything else about $2. **About $50/month always on**, plus LLM usage (about $2/month for me). `terraform destroy` and re-apply are documented and tested once in stage 2.
+**Estimated cost:** ALB about $18, two Fargate tasks about $18, RDS about $15, public IPv4 addresses about $15 (AWS charges about $3.65/month each: two for the ALB across two AZs, one per task), everything else about $2. **About $65/month always on**, plus LLM usage (about $2/month for me). New-account credits ($100, up to $200) cover two to three months of that. `terraform destroy` and re-apply are documented and tested once in stage 2.
 
 ---
 
@@ -1152,6 +1152,19 @@ Built 2026-11-09, everything that doesn't need an AWS account:
 - **Admin CLI:** `create-user`, `create-key` (prints the key once) and `set-budget`. Budgets are shown by `/v1/me` and `/v1/usage` but not yet enforced; that's §7.7, stage 3.
 - **Not built (needs AWS or my decision):** SES and one-click unsubscribe, Terraform, the OIDC deploy pipeline, EMF metrics and alarms. Also deferred: per-key API rate limits (stage 3) and the system user for shared work (ADR-013), which is only needed once one user's fetch is charged to another.
 - 206 tests pass (40 new: the API, the scheduler, the guard, the cursors), with ruff and mypy strict clean. A smoke test ran the image under compose against the development database.
+
+#### Stage 2: the AWS half, written (demo mode)
+
+Written 2026-11-09 after the AWS account was set up (Free plan, `eu-west-1`, an IAM admin user with MFA, `aws login` for the CLI). Not yet applied: it waits for the domain. Runbook: `infra/README.md`.
+
+- **Demo mode (decided 2026-11-09, settles Q6).** Always-on costs about $65/month against $100–200 of credits, so the stack is up only for demos. This splits §11.2's two roots differently: **`infra/base/`** holds everything that is cheap and slow to recreate (the state bucket, ECR, SES with DKIM, MAIL FROM and DMARC, the API's ACM certificate, SSM parameters, the GitHub OIDC roles); **`infra/demo/`** holds everything billed by the hour (VPC, RDS, ALB, ECS services, log groups, the `api.<domain>` record). `demo-up.ps1` pushes the image, applies demo, runs `migrate` as a one-off task and restarts the services; `demo-down.ps1` destroys demo. The demo database is disposable: no final snapshot.
+- **Domain (settles Q10):** bought at Cloudflare, whose registrar requires its DNS, so Terraform uses the Cloudflare provider with a token scoped to that zone's DNS. No Route 53.
+- **Bootstrap:** base's first apply uses local state with the S3 backend switched off, then `init -migrate-state` moves it into the bucket. The bucket name contains the account ID, so it's passed at `init` (`-backend-config`), not committed.
+- **Secrets never in state:** SSM SecureStrings are created with a placeholder and `ignore_changes`, then set by `put-secrets.ps1` from `.env`. RDS manages its own master password in Secrets Manager; ECS injects it as `DB_PASSWORD` and the app builds its URL from `DB_*` parts with `sslmode=require` (new settings; `DATABASE_URL` still works locally).
+- **Email via the SES API** with the worker's task role (`MAIL_TRANSPORT=ses`): no SMTP credentials exist. `SesMailer` maps `MessageRejected` and unverified-sender errors to permanent failures, and throttling, pauses, quotas and network errors to retries. SES replaces our Message-ID, which weakens duplicate suppression after a crash mid-send. The sandbox (verified recipients only, 200 a day) is enough for one reader; production access waits for bounce handling.
+- **CI roles exist, workflows don't yet:** the deploy role can push to ECR and roll ECS services (passing only `briefing-engine-ecs-*` roles); the plan role is read-only plus the lock file. Both are trusted only for this repository's `production` environment and pull requests. The workflows come with the GitHub repository.
+- **Changed from §11.2:** no NAT, as planned; backups 1 day instead of 7 and no final snapshot (demo data is disposable); Container Insights off; CloudWatch alarms, EMF metrics and the synthetic `/readyz` check are not written yet.
+- **Credentials for Terraform and Docker** come from `aws configure export-credentials` on the `aws login` session, so no access keys exist anywhere.
 
 ### Stage 3: shared caching, cost budgets, webhooks, load test
 

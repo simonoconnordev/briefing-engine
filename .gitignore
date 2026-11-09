@@ -53,6 +53,9 @@ out/
 *.tfstate
 *.tfstate.*
 *.tfplan
+*.tfvars
+!*.tfvars.example
+backend.tf.bootstrapping
 crash.log
 override.tf
 override.tf.json

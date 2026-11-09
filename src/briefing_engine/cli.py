@@ -29,7 +29,7 @@ from sqlalchemy import Engine, text
 from briefing_engine.config import Settings, get_settings
 from briefing_engine.context import Context
 from briefing_engine.db.engine import make_engine, upgrade_to_head
-from briefing_engine.delivery.email import SmtpMailer
+from briefing_engine.delivery.email import make_mailer
 from briefing_engine.ingest.feeds import guarded_http_client
 from briefing_engine.llm.client import AnthropicClient
 from briefing_engine.llm.scorer import ClaudeScorer
@@ -52,7 +52,7 @@ def _context(settings: Settings, engine: Engine) -> Context:
     return Context(
         engine=engine,
         scorer=ClaudeScorer(client, settings.score_model),
-        mailer=SmtpMailer(settings),
+        mailer=make_mailer(settings),
         http_client=guarded_http_client,
         web_base_url=settings.web_base_url,
         writer=ClaudeWriter(client, settings.writeup_model) if settings.writeup_model else None,

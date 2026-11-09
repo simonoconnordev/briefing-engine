@@ -1,0 +1,9 @@
+# Copy to terraform.tfvars (ignored by git) and fill in.
+
+domain = "simonoconnor.dev"
+
+# SES sandbox: only these addresses can receive mail. Each gets a verification email.
+ses_verified_recipients = ["you@example.com"]
+
+# Optional: where DMARC aggregate reports go.
+# dmarc_report_address = "you@example.com"
