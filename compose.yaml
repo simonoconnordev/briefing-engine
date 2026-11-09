@@ -1,0 +1,31 @@
+# Local services for development and integration tests.
+# Both bind to 127.0.0.1 only, so nothing is reachable from the network.
+# The Postgres password is a local development value, not a secret.
+name: briefing-engine
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: briefing
+      POSTGRES_PASSWORD: briefing
+      POSTGRES_DB: briefing
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U briefing -d briefing"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Catches every email sent to localhost:1025 and shows it at http://localhost:8025
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
+
+volumes:
+  pgdata:

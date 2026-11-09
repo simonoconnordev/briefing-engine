@@ -1,0 +1,21 @@
+{{ b.profile_name | upper }} · {{ b.briefing_date | long_date }}
+
+{% if b.items %}
+{{ b.items | length }} of {{ b.above_threshold }} articles that scored {{ '%g' % b.threshold }} or more, from {{ b.scored }} scored in this window.
+{% else %}
+Nothing scored {{ '%g' % b.threshold }} or more today ({{ b.scored }} articles scored).
+{% endif %}
+{% for item in b.items %}
+
+{{ item.rank }}. {{ item.title }}
+   {{ item.score }}/10 · {{ item.sources }}{% if item.published_at %} · {{ item.published_at | short_date }}{% endif %}
+
+   {{ item.reason }}
+{% if item.href %}
+   {{ item.href }}
+{% endif %}
+{% endfor %}
+
+--
+Scored by {{ b.model }}. Model cost in this window: {{ b.cost_micros | dollars }}.
+{{ b.in_window }} articles arrived in this window and {{ b.scored }} were scored. Briefing {{ b.briefing_id }}.

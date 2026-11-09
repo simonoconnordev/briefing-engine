@@ -1,6 +1,6 @@
 # briefing-engine: design plan
 
-**Status:** draft for review, revision 3. No code yet.
+**Status:** revision 3. Checkpoint 1.1 is built; see [Checkpoint 1.1: as built](#checkpoint-11-as-built).
 **Author:** Simon O'Connor
 **Last updated:** 2026-11-08. Revision 3 splits stage 1 into four checkpoints, adds a reading-quality routine, and corrects the budget, rate-limit, score-input and subscription rules after two design reviews; see the [revision history](#17-revision-history).
 
@@ -1037,6 +1037,19 @@ Stage 1 is delivered as **four checkpoints** (revision 3). Each one ends in some
 - **Decisions it needs:** none left open. Q13 is settled (Python 3.14), and Postgres 17 and Mailpit run locally in Docker. Q3 matters only if the email goes to my real inbox; reading it in Mailpit is enough for this checkpoint.
 - **Prerequisites on the development PC:** Docker Desktop (with WSL 2) and `uv`, both installed by me. `uv` installs Python 3.14 for the project, so the PC's own Python 3.12 doesn't need changing.
 
+#### Checkpoint 1.1: as built
+
+Built 2026-11-09. Where the code differs from, or settles, something in this plan:
+
+- **Boundary token (settles the checkpoint 1.1 item in §17).** The random boundary token is generated per request and goes in the **user message**, around the articles. The system prompt holds only the instructions and the rubric, so it stays identical between batches and the prompt cache still hits.
+- **Constraints the model can't be given.** Structured outputs reject `minimum`, `maximum`, `maxLength` and `maxItems` in the JSON schema, so the score range (0 to 10), the reason length (240 characters) and the topic count (5) are checked or trimmed in `validate_items` after the reply. Missing, duplicate and unknown refs are checked there too.
+- **Cost estimate.** Input is priced at the higher of the input rate and the cache-write rate, so the estimate stays an upper bound whether the system prompt is written to the cache, read from it or not cached at all. This answers the stage 3 item about the estimate ignoring cache prices, for the bound; a tighter estimate is still a stage 3 question. The Haiku 5.5 cache prices in `llm/pricing.toml` are the usual ratios to the input price, not yet checked against the price list.
+- **Already in place from checkpoint 1.2.** The score cache (`llm_scores` keyed by rubric hash and input hash) and `UNIQUE(user_id, profile_id, briefing_date)` came with 1.1, because a day can't be built without them. Re-running a day already makes 0 LLM calls and sends 0 emails (integration test). Retries, backoff, the reaper and delivery state are still 1.2: in 1.1 a failed job goes straight to `dead`.
+- **Synchronous code.** The worker runs in-process from `run-daily` and handles one batch at a time. The async slots of §9.3 come with the long-running worker.
+- **Schema.** `sources.name` was added for the email. `articles.duplicate_of` and `body_text`, and the source's ETag and polling-interval columns, arrive with the checkpoints that use them (1.2 and 1.3). The deliver job's dedupe key is `deliver:{briefing_id}:email` until the `deliveries` table exists.
+- **Tests.** Integration tests run against a separate `briefing_test` database and truncate the tables between tests rather than rolling back, because the code under test opens its own transactions.
+- **SDK.** `anthropic` 2.6.0, which is built on httpx2. `llm/client.py` is the only module that imports it.
+
 #### Checkpoint 1.2: repeatable and recoverable
 
 - **Scope,** on the same narrow path: the score cache (§7.5), URL and content deduplication (§6.5), bounded retries with backoff (§6.3), leases and the reaper (§9.1), delivery state so an email is sent once (§8.3), and the per-host limiter once Q16 is resolved (§6.2).
@@ -1241,7 +1254,7 @@ Revision 3 adds, for each question, the checkpoint or stage that needs its answe
 
 **Recorded, not yet settled.** These inconsistencies were found while writing the learning guide. Following the working rule, each is settled when its checkpoint or stage arrives:
 
-- **Checkpoint 1.1:** where the random boundary token for injection defence goes, given that the system prompt is cached (§7.2).
+- **Checkpoint 1.1:** ~~where the random boundary token for injection defence goes, given that the system prompt is cached (§7.2).~~ Settled 2026-11-09: in the user message, per request (§14, Checkpoint 1.1: as built).
 - **Checkpoint 1.2:** a worker whose lease expires after a paid call may discard that `llm_calls` row (§7.7, §9.1); the transaction for picking a score group and claiming its batch, and SQL for the heartbeat and the reaper (§9.1); solo batches for flagged articles versus `group_key` (§7.2, §9.1); and whether the 7-day retention after replay applies beyond `dead_letters` (§9.1).
 - **Checkpoint 1.3:** extraction is missing from the §3 diagram, the §9.3 worker slots and the code layout; "changed" is not defined for adaptive polling (§6.1); what happens to a fetch job after its fourth attempt and to `next_fetch_at` after a failed cycle, the derivation of the 6-hour give-up rule, a 429 on the fourth attempt, and the jitter size while a host is blocked (§6.1, §6.3); a fatal 404 creating a dead letter every cycle (§6.3).
 - **Stage 2:** the 409 path for handlers that can't share a transaction (§5.1); the §5.4 cursor example is in the old format and the filter-hash form is undefined; problem types for 401, 409, 429 and 503 are unnamed (§5.1); `PATCH /v1/me` `email_enabled` is missing from the §5.2 table; `unsubscribe_key` is missing from Secrets Manager (§11.2); how the `/readyz` deploy gate reaches new tasks and where the synthetic check runs, the ADR-014 wording, and the order of approval and the ECR push (§11.2, §12.3).

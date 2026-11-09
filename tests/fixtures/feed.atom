@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Test feed</title>
+  <link href="https://feed.example/" rel="alternate"/>
+  <id>https://feed.example/</id>
+  <updated>2026-11-09T06:00:00+00:00</updated>
+  <entry>
+    <title>Building an agent with &lt;b&gt;tools&lt;/b&gt; &amp; tests</title>
+    <link href="https://feed.example/2026/agent?utm_source=rss" rel="alternate"/>
+    <id>https://feed.example/2026/agent</id>
+    <updated>2026-11-09T05:00:00+00:00</updated>
+    <author><name>Alice</name></author>
+    <summary type="html">&lt;p&gt;How I built an &lt;em&gt;agent&lt;/em&gt; for AT&amp;amp;T &amp;#x27;support&amp;#x27;.&lt;/p&gt;&lt;script&gt;bad()&lt;/script&gt;</summary>
+  </entry>
+  <entry>
+    <title type="text">Startup raises $50M</title>
+    <link href="https://feed.example/2026/funding" rel="alternate"/>
+    <id>https://feed.example/2026/funding</id>
+    <updated>2026-11-08T12:00:00+00:00</updated>
+    <content type="html">&lt;p&gt;A funding round with no technical detail.&lt;/p&gt;</content>
+  </entry>
+  <entry>
+    <title>New open-source eval harness</title>
+    <link href="https://feed.example/2026/evals" rel="alternate"/>
+    <id>https://feed.example/2026/evals</id>
+    <updated>2026-11-09T04:00:00+00:00</updated>
+    <summary>A small library for running LLM evals in CI.</summary>
+  </entry>
+  <entry>
+    <title>Entry without a link</title>
+    <id>urn:no-link</id>
+    <updated>2026-11-09T03:00:00+00:00</updated>
+  </entry>
+</feed>

@@ -1,0 +1,64 @@
+# Copy to briefing.toml (ignored by git) and run `briefing load-config`.
+# Checkpoint 1.1 uses one feed and one profile.
+
+[user]
+email = "you@example.com"          # Mailpit catches everything locally, so any address works
+display_name = "Simon"
+timezone = "Europe/Dublin"
+send_time = "06:30"
+
+[[profiles]]
+name = "ai-news"
+threshold = 6.0
+max_items = 12
+
+# Adapted from Horizon's ai-news profile (analysis.md).
+[profiles.rubric]
+description = """\
+A software developer who wants a daily briefing on what people are building with AI: \
+popular and interesting projects, apps, tools, demos and open-source repositories, and \
+practical techniques they could try or learn from. Industry news matters only when it is \
+big enough to change what builders can do. The item must be primarily about AI, machine \
+learning or LLMs: items not about AI score at most 3, and items that only mention AI in \
+passing score at most 4. For projects, judge how interesting and useful the project itself \
+is, and treat traction (stars, upvotes, comments) as supporting evidence, not proof."""
+avoid = [
+    "funding rounds, valuations, acquisitions, revenue and hiring news",
+    "lab politics, executive moves, lawsuits, policy and regulation, unless they directly change what developers can build or use",
+    "benchmark disputes, capability forecasts, AI safety research reports and speculation about future models",
+    "routine product updates and announcements of plans with nothing to try yet",
+    "memes, complaints without information, spam and purely promotional posts",
+]
+scale_hint = """\
+9-10 must see: a breakout project everyone is talking about, a release that changes what \
+builders can do, or an exceptional build write-up. 7-8 high value: a popular or genuinely \
+novel project or tool, a useful open-source release, a strong how-I-built-it post, or a \
+significant model or API launch for developers. 5-6 worth a look: a promising smaller \
+project, a useful technique, an interesting demo. 3-4 low priority: industry and business \
+news, policy, forecasts, rumours, thin launches. 0-2 noise."""
+
+[[profiles.rubric.interests]]
+topic = "projects, apps, tools, demos and repositories built with AI, especially ones getting real attention or doing something new"
+weight = 3
+
+[[profiles.rubric.interests]]
+topic = "open-source releases a developer could install or use today"
+weight = 3
+
+[[profiles.rubric.interests]]
+topic = "write-ups from people who built something, with concrete details of how it works, what it cost or what went wrong"
+weight = 3
+
+[[profiles.rubric.interests]]
+topic = "practical techniques, patterns and workflows for building with LLMs and agents"
+weight = 2
+
+[[profiles.rubric.interests]]
+topic = "major model or API launches that change what builders can do"
+weight = 2
+
+[[sources]]
+name = "Simon Willison"
+url = "https://simonwillison.net/atom/everything/"
+kind = "atom"
+profiles = ["ai-news"]

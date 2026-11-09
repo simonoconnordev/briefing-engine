@@ -66,3 +66,6 @@ cdk.out/
 *.swp
 .DS_Store
 Thumbs.db
+
+# --- Local briefing config (holds your real email address) ---
+briefing.toml

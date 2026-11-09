@@ -1,0 +1,16 @@
+AI-NEWS · Monday 9 November 2026
+
+2 of 5 articles that scored 6 or more, from 30 scored in this window.
+
+1. AT&T <script>alert(1)</script> "quotes" & 'apostrophes'
+   9/10 · Simon Willison · 8 Nov
+   Already-escaped feed text stays literal: &amp; and it's fine.
+   https://example.com/a?x=1&y=2
+
+2. A link that must not survive
+   6/10 · Simon Willison
+   Plain reason.
+
+--
+Scored by claude-haiku-5-5. Model cost in this window: $0.0023.
+30 articles arrived in this window and 30 were scored. Briefing 0190f0e0-0000-7000-8000-000000000000.

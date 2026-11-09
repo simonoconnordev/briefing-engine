@@ -1,0 +1,23 @@
+# Model prices in micro-dollars per million tokens (1 USD = 1,000,000 micro-dollars).
+#
+# Input and output prices are from Anthropic's price list for prompts up to 100K tokens,
+# checked on 2026-11-09. The cache prices are assumed at 10% (read) and 125% (write) of
+# the input price, the ratios on other current models; confirm them for Haiku 5.5 before
+# relying on cost reports (plan §7.7).
+#
+# llm_calls.cost_micros is calculated with these prices at call time and stored, so a
+# later price change doesn't rewrite history.
+
+[models.claude-haiku-5-5]
+effective = 2026-11-09
+input = 100_000
+output = 500_000
+cache_read = 10_000
+cache_write = 125_000
+
+[models.claude-sonnet-5-5]
+effective = 2026-11-09
+input = 2_000_000
+output = 10_000_000
+cache_read = 200_000
+cache_write = 2_500_000
