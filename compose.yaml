@@ -23,9 +23,18 @@ services:
   # Catches every email sent to localhost:1025 and shows it at http://localhost:8025
   mailpit:
     image: axllent/mailpit:latest
+    environment:
+      # Mailpit looks up the client's hostname before greeting it. Inside Docker Desktop
+      # that lookup times out, which made every send take 8 seconds.
+      MP_SMTP_DISABLE_RDNS: "true"
+      # Keep the inbox on a volume, so recreating the container doesn't empty it.
+      MP_DATABASE: /data/mailpit.db
+    volumes:
+      - mailpit:/data
     ports:
       - "127.0.0.1:1025:1025"
       - "127.0.0.1:8025:8025"
 
 volumes:
   pgdata:
+  mailpit:
