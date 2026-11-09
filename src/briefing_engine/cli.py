@@ -5,6 +5,8 @@ briefing load-config [PATH]        load the user, profiles and sources (default 
 briefing run-daily [--date DATE]   fetch, score, build and send today's briefing
 briefing jobs                      job counts by queue and state, and recent failures
 briefing usage                     model calls and cost by day
+briefing web [--port 8000]         local page for marking items interesting or not for you
+briefing report [--days 30]        what each feed contributes, and where Claude and you disagree
 """
 
 import argparse
@@ -42,6 +44,7 @@ def _context(settings: Settings, engine: Engine) -> Context:
         scorer=ClaudeScorer(client, settings.score_model),
         mailer=SmtpMailer(settings),
         http_client=make_http_client,
+        web_base_url=settings.web_base_url,
     )
 
 
@@ -118,6 +121,55 @@ def cmd_usage(settings: Settings, _args: argparse.Namespace) -> None:
         )
 
 
+def cmd_web(settings: Settings, args: argparse.Namespace) -> None:
+    import uvicorn
+
+    from briefing_engine.web.app import create_app
+
+    app = create_app(make_engine(settings.database_url), args.email)
+    print(f"Marking page on http://127.0.0.1:{args.port}  (Ctrl+C to stop)")
+    uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
+
+
+def cmd_report(settings: Settings, args: argparse.Namespace) -> None:
+    from briefing_engine.feedback import FeedbackError, profiles, resolve_user
+    from briefing_engine.report import agreement, source_report
+
+    with make_engine(settings.database_url).connect() as conn:
+        try:
+            user_id = resolve_user(conn, args.email)
+        except FeedbackError as exc:
+            sys.exit(str(exc))
+        for profile in profiles(conn, user_id):
+            if args.profile and profile.name != args.profile:
+                continue
+            print(f"\n{profile.name}: last {args.days} days, threshold {profile.threshold:g}\n")
+            print(f"{'feed':<34} {'fetched':>7} {'scored':>6} {'>=thr':>5} {'hit':>5} "
+                  f"{'sent':>4} {'liked':>5} {'not':>4}")  # fmt: skip
+            for r in source_report(conn, user_id, profile, args.days):
+                hit = f"{r.hit_rate:.0%}" if r.hit_rate is not None else "-"
+                print(
+                    f"{r.name[:34]:<34} {r.fetched:>7} {r.scored:>6} {r.above_threshold:>5} "
+                    f"{hit:>5} {r.sent:>4} {r.interesting:>5} {r.not_for_me:>4}"
+                )
+            agree = agreement(conn, user_id, profile)
+            if not agree.marked:
+                print("\nNothing marked yet. Run `briefing web` and use the Review page.")
+                continue
+            print(
+                f"\nMarked {agree.marked}: {agree.interesting} interesting, "
+                f"{agree.not_for_me} not for you. Claude agreed on {agree.agreed}."
+            )
+            for label, items in (
+                ("Claude would send, you didn't want", agree.unwanted),
+                ("Claude would skip, you found interesting", agree.missed),
+            ):
+                if items:
+                    print(f"\n{label}:")
+                    for d in items:
+                        print(f"  [{d.score}] {d.title}" + (f"  ({d.note})" if d.note else ""))
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="briefing", description="Daily news briefing engine")
     parser.add_argument("-v", "--verbose", action="store_true", help="log every job")
@@ -131,6 +183,15 @@ def main(argv: list[str] | None = None) -> None:
     daily.set_defaults(func=cmd_run_daily)
     sub.add_parser("jobs", help="job counts and recent failures").set_defaults(func=cmd_jobs)
     sub.add_parser("usage", help="model calls and cost by day").set_defaults(func=cmd_usage)
+    web = sub.add_parser("web", help="local page for marking items")
+    web.add_argument("--port", type=int, default=8000)
+    web.add_argument("--email", default=None, help="the user to act for, if there are several")
+    web.set_defaults(func=cmd_web)
+    rep = sub.add_parser("report", help="per-feed contribution and agreement with your marks")
+    rep.add_argument("--days", type=int, default=30)
+    rep.add_argument("--profile", default=None)
+    rep.add_argument("--email", default=None)
+    rep.set_defaults(func=cmd_report)
 
     args = parser.parse_args(argv)
     logging.basicConfig(

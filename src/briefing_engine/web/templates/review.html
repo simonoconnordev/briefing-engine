@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Review · {{ profile.name }}{% endblock %}
+{% block body %}
+<h1>Review</h1>
+<p class="sub">Everything from the {{ profile.name }} feeds scored in the last {{ days }} days, unmarked first. Claude's score stays hidden until you've marked an item, so it can't sway you. {{ unmarked }} of {{ items | length }} still to mark.</p>
+<p class="pills">
+  Last <a href="/review?days=3&profile={{ profile.name }}">3</a>,
+  <a href="/review?days=7&profile={{ profile.name }}">7</a> or
+  <a href="/review?days=30&profile={{ profile.name }}">30</a> days
+  {% if profiles | length > 1 %}&middot; Profile:
+    {% for p in profiles %}<a href="/review?days={{ days }}&profile={{ p.name }}">{{ p.name }}</a>{% if not loop.last %}, {% endif %}{% endfor %}
+  {% endif %}
+</p>
+{% for item in items %}
+  {% with context="review", reveal=(item.verdict is not none) %}{% include "_item.html" %}{% endwith %}
+{% else %}
+  <p class="empty">Nothing scored in the last {{ days }} days. Run <code>briefing run-daily</code> first.</p>
+{% endfor %}
+{% endblock %}

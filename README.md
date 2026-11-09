@@ -52,6 +52,22 @@ Planned stack: Python, FastAPI, PostgreSQL, a Postgres-backed job queue and work
 
 Running `run-daily` again for the same date makes no LLM calls and sends no email: scores come from the cache and the briefing already exists. `uv run briefing jobs` shows the queue.
 
+## Teach it what you find interesting
+
+The briefing improves from your verdicts, not from guesses about your taste.
+
+```bash
+uv run briefing web
+```
+
+This opens a local page at <http://127.0.0.1:8000> (the email links to it):
+
+- **Latest briefing:** mark each item *Interesting* or *Not for me*, with a few words on why.
+- **Review:** everything scored in the last few days, including what wasn't sent. Claude's score stays hidden until you've marked an item, so it can't sway you.
+- **Feeds report:** what each feed contributes (fetched, scored, above the threshold, sent, and your marks), and the items where Claude and you disagree.
+
+`uv run briefing report` prints the same report in the terminal. The disagreements, and your notes on them, are what to edit the rubric in `briefing.toml` from.
+
 Use `127.0.0.1` rather than `localhost` in URLs. On some Windows machines `localhost` tries IPv6 first and the connection to Postgres hangs.
 
 ## Tests

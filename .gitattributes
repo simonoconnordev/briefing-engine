@@ -1,0 +1,5 @@
+# Keep LF line endings in the working tree on every platform. The golden email files are
+# compared byte for byte, so a CRLF checkout on Windows would fail those tests.
+* text=auto eol=lf
+*.png binary
+*.jpg binary

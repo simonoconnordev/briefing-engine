@@ -28,6 +28,7 @@ class FeedEntry:
     summary: str
     author: str | None
     published_at: datetime | None
+    categories: tuple[str, ...] = ()
 
 
 def make_http_client(transport: httpx.BaseTransport | None = None) -> httpx.Client:
@@ -63,15 +64,17 @@ def _text_field(entry: Any, name: str) -> str:
 
 
 def _summary(entry: Any) -> str:
-    # Prefer the summary; fall back to the first content block (Atom feeds often use it).
-    summary = _text_field(entry, "summary")
-    if summary:
-        return summary
+    """The fullest text the feed gives for an entry.
+
+    Newsletter feeds (Substack and similar) put a one-line teaser in the summary and the
+    whole post in a content block, so the longer of the two is what the scorer should read.
+    """
+    candidates = [_text_field(entry, "summary")]
     for content in entry.get("content") or []:
         value = content.get("value")
         if value:
-            return to_plain_text(str(value), str(content.get("type", "text/html")))
-    return ""
+            candidates.append(to_plain_text(str(value), str(content.get("type", "text/html"))))
+    return max(candidates, key=len)
 
 
 def _published(entry: Any) -> datetime | None:
@@ -98,6 +101,17 @@ def parse_feed(content: bytes) -> list[FeedEntry]:
                 summary=_summary(entry),
                 author=to_plain_text(str(author), "text/plain") if author else None,
                 published_at=_published(entry),
+                categories=tuple(
+                    str(tag["term"]) for tag in entry.get("tags") or [] if tag.get("term")
+                ),
             )
         )
     return entries
+
+
+def without_categories(entries: list[FeedEntry], excluded: list[str]) -> list[FeedEntry]:
+    """Drop entries carrying any excluded category, compared case-insensitively."""
+    if not excluded:
+        return entries
+    skip = {c.casefold() for c in excluded}
+    return [e for e in entries if not skip.intersection(c.casefold() for c in e.categories)]

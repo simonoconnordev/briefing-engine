@@ -32,9 +32,15 @@ def test_ranks_by_value_then_newer_then_lower_id() -> None:
     assert [c.article_id for c in ranked] == [2, 1, 4, 3]
 
 
-def test_more_sources_and_weight_raise_rank() -> None:
-    ranked = rank([cand(1, 7), cand(2, 6, n=3), cand(3, 6, w=1.5)], max_items=10)
-    assert [c.article_id for c in ranked] == [2, 3, 1]
+def test_weight_raises_rank() -> None:
+    ranked = rank([cand(1, 7), cand(2, 6, w=1.5)], max_items=10)
+    assert [c.article_id for c in ranked] == [2, 1]
+
+
+def test_copies_break_ties_but_never_outrank_a_higher_score() -> None:
+    # Codex's case: a 6 carried by three feeds must not bury a 9 carried by one.
+    ranked = rank([cand(1, 9), cand(2, 6, n=3), cand(3, 6), cand(4, 7)], max_items=10)
+    assert [c.article_id for c in ranked] == [1, 4, 2, 3]
 
 
 def test_skips_repeated_content_and_caps_items() -> None:

@@ -36,6 +36,8 @@ class ProfileConfig(BaseModel):
     name: str
     threshold: float = Field(ge=0, le=10)
     max_items: int = Field(default=12, ge=1, le=50)
+    # Articles published longer ago than this are neither scored nor sent.
+    max_age_days: int = Field(default=7, ge=1, le=365)
     rubric: Rubric
 
 
@@ -46,6 +48,8 @@ class SourceConfig(BaseModel):
     kind: str = Field(pattern="^(rss|atom)$")
     profiles: list[str] = Field(min_length=1)
     weight: float = Field(default=1.0, gt=0)
+    # Feed categories whose entries are skipped, compared case-insensitively.
+    exclude_categories: list[str] = Field(default_factory=list)
 
 
 class BriefingConfig(BaseModel):
@@ -116,8 +120,9 @@ def _upsert_profile(conn: Connection, user_id: Any, profile: ProfileConfig) -> t
         conn.execute(
             text(
                 """
-                INSERT INTO profiles (id, user_id, name, current_version, threshold, max_items)
-                VALUES (:id, :u, :name, 1, :threshold, :max_items)
+                INSERT INTO profiles (id, user_id, name, current_version, threshold, max_items,
+                                      max_age_days)
+                VALUES (:id, :u, :name, 1, :threshold, :max_items, :max_age_days)
                 """
             ),
             {
@@ -126,6 +131,7 @@ def _upsert_profile(conn: Connection, user_id: Any, profile: ProfileConfig) -> t
                 "name": profile.name,
                 "threshold": profile.threshold,
                 "max_items": profile.max_items,
+                "max_age_days": profile.max_age_days,
             },
         )
     else:
@@ -133,9 +139,15 @@ def _upsert_profile(conn: Connection, user_id: Any, profile: ProfileConfig) -> t
         version = row.current_version + 1 if row.rubric_hash != new_hash else row.current_version
         conn.execute(
             text(
-                "UPDATE profiles SET threshold = :threshold, max_items = :max_items WHERE id = :id"
+                "UPDATE profiles SET threshold = :threshold, max_items = :max_items, "
+                "max_age_days = :max_age_days WHERE id = :id"
             ),
-            {"id": profile_id, "threshold": profile.threshold, "max_items": profile.max_items},
+            {
+                "id": profile_id,
+                "threshold": profile.threshold,
+                "max_items": profile.max_items,
+                "max_age_days": profile.max_age_days,
+            },
         )
         if version == row.current_version:
             return profile_id, False
@@ -160,10 +172,11 @@ def _upsert_source(conn: Connection, source: SourceConfig) -> Any:
     return conn.execute(
         text(
             """
-            INSERT INTO sources (kind, name, url, url_normalised, host)
-            VALUES (:kind, :name, :url, :norm, :host)
+            INSERT INTO sources (kind, name, url, url_normalised, host, exclude_categories)
+            VALUES (:kind, :name, :url, :norm, :host, :exclude)
             ON CONFLICT (url_normalised) DO UPDATE
-               SET name = EXCLUDED.name, kind = EXCLUDED.kind, url = EXCLUDED.url
+               SET name = EXCLUDED.name, kind = EXCLUDED.kind, url = EXCLUDED.url,
+                   exclude_categories = EXCLUDED.exclude_categories
             RETURNING id
             """
         ),
@@ -173,6 +186,7 @@ def _upsert_source(conn: Connection, source: SourceConfig) -> Any:
             "url": source.url,
             "norm": normalised,
             "host": urlsplit(normalised).hostname,
+            "exclude": source.exclude_categories,
         },
     ).scalar_one()
 

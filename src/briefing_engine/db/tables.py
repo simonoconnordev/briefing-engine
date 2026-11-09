@@ -69,6 +69,7 @@ sources = Table(
     Column("extract_full_text", Boolean, nullable=False, server_default=text("false")),
     Column("status", Text, nullable=False, server_default="active"),
     Column("created_at", TS, nullable=False, server_default=text("now()")),
+    Column("exclude_categories", ARRAY(Text), nullable=False, server_default="{}"),
 )
 
 articles = Table(
@@ -107,6 +108,7 @@ profiles = Table(
     Column("threshold", REAL, nullable=False),
     Column("max_items", Integer, nullable=False, server_default="12"),
     Column("created_at", TS, nullable=False, server_default=text("now()")),
+    Column("max_age_days", Integer, nullable=False, server_default="7"),
     UniqueConstraint("user_id", "name"),
     UniqueConstraint("id", "user_id"),
 )
@@ -204,6 +206,19 @@ briefing_items = Table(
     Column("blurb", Text, nullable=False),
     Column("group_key", Text),
     UniqueConstraint("briefing_id", "rank"),
+)
+
+article_feedback = Table(
+    "article_feedback",
+    metadata,
+    Column("user_id", Uuid, ForeignKey("users.id"), primary_key=True),
+    Column("article_id", BigInteger, ForeignKey("articles.id"), primary_key=True),
+    Column("verdict", Text, nullable=False),
+    Column("note", Text, nullable=False, server_default=""),
+    Column("context", Text, nullable=False),
+    Column("created_at", TS, nullable=False, server_default=text("now()")),
+    Column("updated_at", TS, nullable=False, server_default=text("now()")),
+    Index("article_feedback_article", "article_id"),
 )
 
 jobs = Table(

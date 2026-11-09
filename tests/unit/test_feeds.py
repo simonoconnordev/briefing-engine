@@ -5,7 +5,13 @@ import httpx
 import pytest
 
 from briefing_engine.ingest import feeds
-from briefing_engine.ingest.feeds import FeedTooLarge, fetch_feed, make_http_client, parse_feed
+from briefing_engine.ingest.feeds import (
+    FeedTooLarge,
+    fetch_feed,
+    make_http_client,
+    parse_feed,
+    without_categories,
+)
 
 FEED = (Path(__file__).parent.parent / "fixtures" / "feed.atom").read_bytes()
 
@@ -27,6 +33,43 @@ def test_parse_feed_produces_plain_text_entries() -> None:
     assert first.author == "Alice"
     assert first.published_at == datetime(2026, 11, 9, 5, 0, tzinfo=UTC)
     assert entries[1].summary == "A funding round with no technical detail."  # from <content>
+
+
+NEWSLETTER_RSS = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+<channel><title>A newsletter</title>
+<item>
+  <title>What I learned using AI to write</title>
+  <link>https://newsletter.example/p/writing</link>
+  <description>A short teaser.</description>
+  <content:encoded><![CDATA[<p>The whole post, with <b>several</b> paragraphs of detail.</p>
+  <p>Second paragraph.</p>]]></content:encoded>
+</item>
+</channel></rss>"""
+
+
+def test_newsletter_feeds_use_the_full_post_not_the_teaser() -> None:
+    [entry] = parse_feed(NEWSLETTER_RSS)
+    assert entry.summary.startswith("The whole post, with several paragraphs of detail.")
+    assert "Second paragraph." in entry.summary
+    assert "teaser" not in entry.summary
+
+
+CATEGORISED_RSS = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>Mixed</title>
+<item><title>Deep dive</title><link>https://x.example/1</link><category>Podcast</category></item>
+<item><title>Daily roundup</title><link>https://x.example/2</link>
+  <category>AINews: Weekday Roundups</category></item>
+<item><title>Untagged</title><link>https://x.example/3</link></item>
+</channel></rss>"""
+
+
+def test_excluded_categories_are_dropped_case_insensitively() -> None:
+    entries = parse_feed(CATEGORISED_RSS)
+    assert entries[0].categories == ("Podcast",)
+    kept = without_categories(entries, ["ainews: weekday roundups"])
+    assert [e.title for e in kept] == ["Deep dive", "Untagged"]
+    assert without_categories(entries, []) == entries
 
 
 def test_fetch_sends_identifying_user_agent() -> None:

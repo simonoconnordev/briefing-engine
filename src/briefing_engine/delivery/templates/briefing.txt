@@ -15,6 +15,11 @@ Nothing scored {{ '%g' % b.threshold }} or more today ({{ b.scored }} articles s
    {{ item.href }}
 {% endif %}
 {% endfor %}
+{% if b.mark_href %}
+
+Mark these items as interesting or not for you (needs `briefing web` running):
+{{ b.mark_href }}
+{% endif %}
 
 --
 Scored by {{ b.model }}. Model cost in this window: {{ b.cost_micros | dollars }}.

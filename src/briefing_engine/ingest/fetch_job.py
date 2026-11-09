@@ -10,12 +10,13 @@ limiter, retries and syndicated-copy detection arrive in checkpoints 1.2 and 1.3
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import Connection, text
 
 from briefing_engine.context import Context
 from briefing_engine.hashing import sha256
-from briefing_engine.ingest.feeds import FeedEntry, fetch_feed, parse_feed
+from briefing_engine.ingest.feeds import FeedEntry, fetch_feed, parse_feed, without_categories
 from briefing_engine.ingest.text import canon_text
 from briefing_engine.ingest.urls import normalise_url, url_hash
 from briefing_engine.llm.scoring_input import input_hash, scoring_input
@@ -57,10 +58,12 @@ _UPSERT_ARTICLE = text(
 )
 
 # The rubrics this source's subscribers score with. For each rubric, the billed user is
-# the subscriber whose profile version using it was created first (§7.7).
+# the subscriber whose profile version using it was created first (§7.7). max_age_days is
+# the longest any profile using the rubric would still send, so older articles aren't scored.
 _SCORE_TARGETS = text(
     """
-    SELECT DISTINCT ON (pv.rubric_hash) pv.rubric_hash, p.user_id
+    SELECT DISTINCT ON (pv.rubric_hash) pv.rubric_hash, p.user_id,
+           max(p.max_age_days) OVER (PARTITION BY pv.rubric_hash) AS max_age_days
     FROM subscriptions s
     JOIN profiles p ON p.id = s.profile_id
     JOIN profile_versions pv ON pv.profile_id = p.id AND pv.version = p.current_version
@@ -88,6 +91,7 @@ def store_entries(
 ) -> tuple[int, int]:
     """Upsert the entries and enqueue scoring. Returns (articles inserted, jobs queued)."""
     targets = conn.execute(_SCORE_TARGETS, {"source_id": source_id}).all()
+    now = datetime.now(UTC)
     inserted = queued = 0
     for entry in entries:
         try:
@@ -118,6 +122,10 @@ def store_entries(
             {"a": row.id, "s": source_id},
         )
         for target in targets:
+            if entry.published_at and entry.published_at < now - timedelta(
+                days=target.max_age_days
+            ):
+                continue  # too old for any briefing that uses this rubric
             cached = conn.execute(
                 _ALREADY_SCORED,
                 {
@@ -151,11 +159,12 @@ def handle_fetch(ctx: Context, jobs: Sequence[Job]) -> None:
         source_id = int(job.payload["source_id"])
         with ctx.engine.connect() as conn:
             source = conn.execute(
-                text("SELECT id, name, url FROM sources WHERE id = :id"), {"id": source_id}
+                text("SELECT id, name, url, exclude_categories FROM sources WHERE id = :id"),
+                {"id": source_id},
             ).one()
         with ctx.http_client() as client:
             body = fetch_feed(client, source.url)
-        entries = parse_feed(body)
+        entries = without_categories(parse_feed(body), list(source.exclude_categories))
         with ctx.engine.begin() as conn:
             inserted, queued = store_entries(
                 conn,

@@ -24,3 +24,4 @@ class Context:
     http_client: Callable[[], httpx.Client]
     worker_id: str = field(default_factory=default_worker_id)
     prompt_version: int = PROMPT_VERSION
+    web_base_url: str | None = None  # where `briefing web` runs, for the email's marking link

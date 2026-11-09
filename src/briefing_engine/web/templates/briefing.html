@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}{{ view.profile_name }} · {{ view.briefing_date | long_date }}{% endblock %}
+{% block body %}
+<h1>{{ view.profile_name }} briefing</h1>
+<p class="sub">{{ view.briefing_date | long_date }} &middot; {{ view.items | length }} items. Mark each one; a few words on why helps most.</p>
+{% for item in view.items %}
+  {% with context="briefing", reveal=true %}{% include "_item.html" %}{% endwith %}
+{% else %}
+  <p class="empty">Nothing was sent in this briefing. The <a href="/review">review</a> shows everything that was scored.</p>
+{% endfor %}
+{% endblock %}

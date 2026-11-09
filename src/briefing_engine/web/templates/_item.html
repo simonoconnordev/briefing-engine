@@ -1,0 +1,22 @@
+{# One article with its marking form. Needs: item, back, context, reveal (show score). #}
+<article class="item {{ item.verdict or '' }}" id="a{{ item.article_id }}">
+  <p class="meta">
+    {% if item.rank %}#{{ item.rank }} &middot; {% endif %}{{ item.sources }}
+    {% if item.published_at %} &middot; {{ item.published_at | short_date }}{% endif %}
+    {% if reveal and item.score is not none %} &middot; Claude: <span class="score">{{ item.score }}/10</span>{% endif %}
+  </p>
+  <h2>
+    {% set link = item.url | href %}
+    {% if link %}<a href="{{ link }}" target="_blank" rel="noopener noreferrer">{{ item.title }}</a>{% else %}{{ item.title }}{% endif %}
+  </h2>
+  {% if item.excerpt %}<p class="excerpt">{{ item.excerpt }}</p>{% endif %}
+  {% if reveal and item.reason %}<p class="reason">Claude's reason: {{ item.reason }}</p>{% endif %}
+  <form class="mark" method="post" action="/feedback">
+    <input type="hidden" name="article_id" value="{{ item.article_id }}">
+    <input type="hidden" name="context" value="{{ context }}">
+    <input type="hidden" name="back" value="{{ back }}">
+    <button class="yes {{ 'on' if item.verdict == 'interesting' else '' }}" name="verdict" value="interesting">Interesting</button>
+    <button class="no {{ 'on' if item.verdict == 'not_for_me' else '' }}" name="verdict" value="not_for_me">Not for me</button>
+    <input type="text" name="note" value="{{ item.note }}" maxlength="1000" placeholder="Why? (optional, but it's what improves the rubric)" aria-label="Reason for {{ item.title }}">
+  </form>
+</article>

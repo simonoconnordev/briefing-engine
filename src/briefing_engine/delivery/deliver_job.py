@@ -74,6 +74,7 @@ def load_email_briefing(ctx: Context, briefing_id: uuid.UUID) -> tuple[str, Emai
         cost_micros=int(b.cost_micros),
         model=ctx.scorer.model,
         briefing_id=str(b.id),
+        mark_url=f"{ctx.web_base_url.rstrip('/')}/briefings/{b.id}" if ctx.web_base_url else None,
     )
 
 

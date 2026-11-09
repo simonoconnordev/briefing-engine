@@ -11,7 +11,7 @@ pytestmark = pytest.mark.integration
 def test_schema_version_is_recorded(engine: Engine) -> None:
     with engine.connect() as conn:
         version = conn.execute(text("SELECT schema_version FROM schema_meta")).scalar_one()
-    assert version == 1
+    assert version == 2
 
 
 def test_code_tables_match_migrated_schema(engine: Engine) -> None:

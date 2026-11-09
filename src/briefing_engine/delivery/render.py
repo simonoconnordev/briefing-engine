@@ -67,6 +67,11 @@ class EmailBriefing:
     cost_micros: int
     model: str
     briefing_id: str
+    mark_url: str | None = None  # the local page for marking these items
+
+    @property
+    def mark_href(self) -> str | None:
+        return safe_href(self.mark_url) if self.mark_url else None
 
 
 @dataclass(frozen=True)

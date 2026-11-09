@@ -21,6 +21,7 @@ from briefing_engine.queue.jobs import Job, complete, enqueue
 log = logging.getLogger(__name__)
 
 WINDOW_HOURS = 24
+COPIES_BONUS = 0.5
 
 
 @dataclass(frozen=True)
@@ -35,7 +36,9 @@ class Candidate:
 
     @property
     def rank_value(self) -> float:
-        return self.score * self.weight * (1 + math.log(self.n_sources))
+        # The score decides; a story several feeds carried gets a small nudge, enough to
+        # break near-ties but never to lift a 6 above a 7 (three copies add 0.55).
+        return self.score * self.weight + COPIES_BONUS * math.log(self.n_sources)
 
 
 def rank(candidates: Sequence[Candidate], max_items: int) -> list[Candidate]:
@@ -67,6 +70,8 @@ _CANDIDATES = text(
     JOIN llm_scores s ON s.input_hash = a.input_hash AND s.rubric_hash = :rubric_hash
                      AND s.model = :model AND s.prompt_version = :prompt_version
     WHERE a.first_seen_at >= :window_start AND s.score >= :threshold
+      AND (a.published_at IS NULL
+           OR a.published_at >= now() - make_interval(days => :max_age_days))
     GROUP BY a.id, s.score, s.reason
     """
 )
@@ -81,6 +86,8 @@ _WINDOW_STATS = text(
     LEFT JOIN llm_scores s ON s.input_hash = a.input_hash AND s.rubric_hash = :rubric_hash
                           AND s.model = :model AND s.prompt_version = :prompt_version
     WHERE a.first_seen_at >= :window_start
+      AND (a.published_at IS NULL
+           OR a.published_at >= now() - make_interval(days => :max_age_days))
     """
 )
 
@@ -132,7 +139,7 @@ def _build_one(
     profile = conn.execute(
         text(
             """
-            SELECT p.current_version, p.threshold, p.max_items, pv.rubric_hash
+            SELECT p.current_version, p.threshold, p.max_items, p.max_age_days, pv.rubric_hash
             FROM profiles p
             JOIN profile_versions pv ON pv.profile_id = p.id AND pv.version = p.current_version
             WHERE p.id = :p
@@ -147,6 +154,7 @@ def _build_one(
         "model": ctx.scorer.model,
         "prompt_version": ctx.prompt_version,
         "window_start": window_start,
+        "max_age_days": profile.max_age_days,
     }
     candidates = [
         Candidate(

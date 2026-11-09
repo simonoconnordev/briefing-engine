@@ -6,6 +6,7 @@ then review the diff before committing.
 
 import os
 import re
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -96,5 +97,15 @@ def test_subject_and_multipart_message() -> None:
 
 def test_html_templates_never_use_safe() -> None:
     """Nothing from a feed or a model may bypass escaping (plan §8.1)."""
-    for template in TEMPLATES.glob("*.html"):
+    web = TEMPLATES.parents[1] / "web" / "templates"
+    for template in [*TEMPLATES.glob("*.html"), *web.glob("*.html")]:
         assert not re.search(r"\|\s*safe\b", template.read_text("utf-8")), template.name
+
+
+def test_marking_link_appears_only_when_safe() -> None:
+    linked = replace(fixture_briefing(), mark_url="http://127.0.0.1:8000/briefings/x")
+    rendered = render_briefing(linked)
+    assert 'href="http://127.0.0.1:8000/briefings/x"' in rendered.html
+    assert "http://127.0.0.1:8000/briefings/x" in rendered.text
+    hostile = render_briefing(replace(fixture_briefing(), mark_url="javascript:alert(1)"))
+    assert "javascript:" not in hostile.html and "Mark these items" not in hostile.html

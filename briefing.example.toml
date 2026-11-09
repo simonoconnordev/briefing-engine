@@ -1,5 +1,5 @@
 # Copy to briefing.toml (ignored by git) and run `briefing load-config`.
-# Checkpoint 1.1 uses one feed and one profile.
+# Trial set-up: three feeds whose posts carry their full text, and one profile.
 
 [user]
 email = "you@example.com"          # Mailpit catches everything locally, so any address works
@@ -10,51 +10,54 @@ send_time = "06:30"
 [[profiles]]
 name = "ai-news"
 threshold = 6.0
-max_items = 12
+max_items = 8
+max_age_days = 7                   # older posts are neither scored nor sent
 
-# Adapted from Horizon's ai-news profile (analysis.md).
+# Aim: output that is relevant and interesting to me, about AI tools, developments and
+# practical uses. This is a starting point; marking items "interesting" or "not for me"
+# is what should reshape it.
 [profiles.rubric]
 description = """\
-A software developer who wants a daily briefing on what people are building with AI: \
-popular and interesting projects, apps, tools, demos and open-source repositories, and \
-practical techniques they could try or learn from. Industry news matters only when it is \
-big enough to change what builders can do. The item must be primarily about AI, machine \
-learning or LLMs: items not about AI score at most 3, and items that only mention AI in \
-passing score at most 4. For projects, judge how interesting and useful the project itself \
-is, and treat traction (stars, upvotes, comments) as supporting evidence, not proof."""
+A reader who wants a short daily briefing on AI: tools, developments and practical uses \
+that are worth their time. Most valued: things people have actually built or tried, with \
+enough detail to learn from or try; useful ways to work, research, write, learn or create \
+with AI; open-source releases and tools they could use today; and developments that change \
+what is possible or how people use AI. Industry news matters only when it changes what \
+people can build or do. The item must be primarily about AI, machine learning or LLMs: \
+items not about AI score at most 3, and items that only mention AI in passing score at most 4."""
 avoid = [
     "funding rounds, valuations, acquisitions, revenue and hiring news",
-    "lab politics, executive moves, lawsuits, policy and regulation, unless they directly change what developers can build or use",
-    "benchmark disputes, capability forecasts, AI safety research reports and speculation about future models",
+    "lab politics, executive moves, lawsuits, policy and regulation, unless they directly change what people can build or do",
+    "benchmark disputes, capability forecasts and speculation about future models",
     "routine product updates and announcements of plans with nothing to try yet",
     "memes, complaints without information, spam and purely promotional posts",
 ]
 scale_hint = """\
-9-10 must see: a breakout project everyone is talking about, a release that changes what \
-builders can do, or an exceptional build write-up. 7-8 high value: a popular or genuinely \
-novel project or tool, a useful open-source release, a strong how-I-built-it post, or a \
-significant model or API launch for developers. 5-6 worth a look: a promising smaller \
-project, a useful technique, an interesting demo. 3-4 low priority: industry and business \
-news, policy, forecasts, rumours, thin launches. 0-2 noise."""
+9-10 must see: a development that changes what people can do with AI, or an exceptional \
+hands-on write-up or tool. 7-8 high value: a genuinely useful or novel tool, technique or \
+release, a strong how-I-built-it or how-I-use-it post, or a clear explanation of an \
+important development. 5-6 worth a look: a promising smaller project, a useful tip, an \
+interesting demo or idea. 3-4 low priority: business news, policy, forecasts, thin \
+launches. 0-2 noise."""
 
 [[profiles.rubric.interests]]
-topic = "projects, apps, tools, demos and repositories built with AI, especially ones getting real attention or doing something new"
+topic = "hands-on accounts of building or using AI tools, with concrete details of what worked, what it cost or what went wrong"
 weight = 3
 
 [[profiles.rubric.interests]]
-topic = "open-source releases a developer could install or use today"
+topic = "practical ways to work, research, write, learn or create with AI that a person could adopt"
 weight = 3
 
 [[profiles.rubric.interests]]
-topic = "write-ups from people who built something, with concrete details of how it works, what it cost or what went wrong"
+topic = "new or notable AI tools, apps, open-source releases and repositories someone could try today"
 weight = 3
 
 [[profiles.rubric.interests]]
-topic = "practical techniques, patterns and workflows for building with LLMs and agents"
+topic = "developments in models and AI products that change what people can do, explained clearly"
 weight = 2
 
 [[profiles.rubric.interests]]
-topic = "major model or API launches that change what builders can do"
+topic = "techniques and patterns for building with LLMs and agents"
 weight = 2
 
 [[sources]]
@@ -62,3 +65,16 @@ name = "Simon Willison"
 url = "https://simonwillison.net/atom/everything/"
 kind = "atom"
 profiles = ["ai-news"]
+
+[[sources]]
+name = "One Useful Thing (Ethan Mollick)"
+url = "https://www.oneusefulthing.org/feed"
+kind = "rss"
+profiles = ["ai-news"]
+
+[[sources]]
+name = "Latent Space"
+url = "https://www.latent.space/feed"
+kind = "rss"
+profiles = ["ai-news"]
+exclude_categories = ["AINews: Weekday Roundups"]   # its daily news digest

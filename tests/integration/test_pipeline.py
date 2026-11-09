@@ -3,7 +3,7 @@ mail server replaced by in-process fakes."""
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -17,13 +17,23 @@ from briefing_engine.llm.pricing import TokenUsage
 from briefing_engine.llm.rubric import Rubric
 from briefing_engine.llm.scorer import BatchResult, ScoredItem, ScoreInput
 from briefing_engine.pipeline import run_daily
-from briefing_engine.setup_config import load_config, read_config
+from briefing_engine.setup_config import BriefingConfig, load_config, read_config
 
 pytestmark = pytest.mark.integration
 
 ROOT = Path(__file__).parents[2]
-FEED = (ROOT / "tests" / "fixtures" / "feed.atom").read_bytes()
-DAY = date(2026, 11, 9)
+TODAY = datetime.now(UTC).date()
+DAY = TODAY
+
+
+def feed_dated(today: date) -> bytes:
+    """The fixture feed with its dates moved to today, so the age limit doesn't age the test."""
+    raw = (ROOT / "tests" / "fixtures" / "feed.atom").read_bytes()
+    raw = raw.replace(b"2026-11-08", (today - timedelta(days=1)).isoformat().encode())
+    return raw.replace(b"2026-11-09", today.isoformat().encode())
+
+
+FEED = feed_dated(TODAY)
 
 
 @dataclass
@@ -61,10 +71,17 @@ class FakeMailer:
         return f"<msg{len(self.sent)}@test>"
 
 
+def one_feed_config() -> BriefingConfig:
+    """The example config cut to its first feed: the mock transport serves the same fixture
+    for every URL, so more feeds would only repeat it."""
+    config = read_config(ROOT / "briefing.example.toml")
+    config.sources = config.sources[:1]
+    return config
+
+
 @pytest.fixture
 def ctx(db: Engine) -> Context:
-    config = read_config(ROOT / "briefing.example.toml")
-    load_config(db, config)
+    load_config(db, one_feed_config())
     transport = httpx.MockTransport(lambda request: httpx.Response(200, content=FEED))
     return Context(
         engine=db,
@@ -124,6 +141,28 @@ def test_an_unscored_article_fails_its_job_without_blocking_the_briefing(ctx: Co
     [(_, email)] = ctx.mailer.sent
     assert "Building an agent" in email.text
     assert "eval harness" not in email.text
+
+
+def test_articles_older_than_the_age_limit_are_neither_scored_nor_sent(db: Engine) -> None:
+    config = one_feed_config()
+    config.profiles[0].max_age_days = 7
+    load_config(db, config)
+    old = feed_dated(TODAY - timedelta(days=30))
+    scorer, mailer = FakeScorer(), FakeMailer()
+    ctx = Context(
+        engine=db,
+        scorer=scorer,
+        mailer=mailer,
+        http_client=lambda: make_http_client(
+            httpx.MockTransport(lambda request: httpx.Response(200, content=old))
+        ),
+        worker_id="test-worker",
+    )
+    report = run_daily(ctx, DAY)
+    assert count(db, "SELECT count(*) FROM articles") == 3  # stored, so they're known
+    assert scorer.calls == [] and report.llm_calls == 0  # but never paid for
+    [(_, email)] = mailer.sent
+    assert "Building an agent" not in email.text
 
 
 def test_editing_the_rubric_creates_a_new_version(db: Engine) -> None:

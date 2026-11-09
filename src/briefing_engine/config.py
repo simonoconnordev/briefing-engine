@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     smtp_password: SecretStr | None = None
     mail_from: str = "Briefing Engine <briefing@briefing.test>"
 
+    # Where `briefing web` listens; the email links here so items can be marked.
+    web_base_url: str = "http://127.0.0.1:8000"
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Feeds report · {{ profile.name }}{% endblock %}
+{% block body %}
+<h1>Feeds report</h1>
+<p class="sub">{{ profile.name }}, articles first seen in the last {{ days }} days. Threshold {{ '%g' % profile.threshold }}.</p>
+<div class="tablewrap">
+<table>
+  <thead><tr><th>Feed</th><th>Fetched</th><th>Scored</th><th>≥ threshold</th><th>Hit rate</th><th>Sent</th><th>Interesting</th><th>Not for me</th></tr></thead>
+  <tbody>
+  {% for r in rows %}
+    <tr><td>{{ r.name }}</td><td class="n">{{ r.fetched }}</td><td class="n">{{ r.scored }}</td><td class="n">{{ r.above_threshold }}</td>
+        <td class="n">{{ '%d%%' % (r.hit_rate * 100) if r.hit_rate is not none else '–' }}</td><td class="n">{{ r.sent }}</td>
+        <td class="n">{{ r.interesting }}</td><td class="n">{{ r.not_for_me }}</td></tr>
+  {% else %}
+    <tr><td colspan="8" class="empty">No feeds yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+
+<h1 style="margin-top:28px">Claude and you</h1>
+{% if agree.marked %}
+<p class="sub">{{ agree.marked }} marked: {{ agree.interesting }} interesting, {{ agree.not_for_me }} not for you.
+  Claude agreed on {{ agree.agreed }}.
+  {% if agree.mean_score_interesting is not none %}Its average score for your "interesting" items is {{ '%.1f' % agree.mean_score_interesting }}{% endif %}{% if agree.mean_score_not_for_me is not none %}, and {{ '%.1f' % agree.mean_score_not_for_me }} for your "not for me" items{% endif %}.</p>
+  {% if agree.unwanted %}
+  <h2 style="font-size:17px">Claude would send these, you didn't want them</h2>
+  <ul>{% for d in agree.unwanted %}<li><span class="score">{{ d.score }}</span> {{ d.title }}{% if d.note %} <span class="reason">— {{ d.note }}</span>{% endif %}</li>{% endfor %}</ul>
+  {% endif %}
+  {% if agree.missed %}
+  <h2 style="font-size:17px">Claude would skip these, you found them interesting</h2>
+  <ul>{% for d in agree.missed %}<li><span class="score">{{ d.score }}</span> {{ d.title }}{% if d.note %} <span class="reason">— {{ d.note }}</span>{% endif %}</li>{% endfor %}</ul>
+  {% endif %}
+  <p class="sub">These two lists, and your notes on them, are what to change the rubric from.</p>
+{% else %}
+<p class="sub">Nothing marked yet. Mark items in the <a href="/review">review</a> or on a briefing, and the disagreements will show here.</p>
+{% endif %}
+{% endblock %}
