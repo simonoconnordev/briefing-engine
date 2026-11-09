@@ -4,6 +4,7 @@ briefing migrate                   apply database migrations
 briefing load-config [PATH]        load the user, profiles and sources (default briefing.toml)
 briefing run-daily [--date DATE]   fetch, score, build and send today's briefing
 briefing jobs                      job counts by queue and state, and recent failures
+briefing jobs replay ID            run a dead job again from its first attempt
 briefing usage                     model calls and cost by day
 briefing web [--port 8000]         local page for marking items interesting or not for you
 briefing report [--days 30]        what each feed contributes, and where Claude and you disagree
@@ -66,15 +67,35 @@ def cmd_load_config(settings: Settings, args: argparse.Namespace) -> None:
 def cmd_run_daily(settings: Settings, args: argparse.Namespace) -> None:
     engine = make_engine(settings.database_url)
     report = run_daily(_context(settings, engine), args.date)
-    print(f"Ingest jobs: {report.ingest.ran}   failed: {report.ingest.failed or 'none'}")
-    print(f"Build jobs:  {report.build.ran}   failed: {report.build.failed or 'none'}")
+    for label, stats in (("Ingest", report.ingest), ("Build", report.build)):
+        line = f"{label + ' jobs:':<13}{stats.ran}   failed: {stats.failed or 'none'}"
+        if stats.retried:
+            line += f"   waiting to retry: {stats.retried}"
+        if stats.reaped:
+            line += f"   recovered from a stopped worker: {stats.reaped}"
+        print(line)
     print(f"Model calls this run: {report.llm_calls}, cost {_dollars(report.cost_micros)}")
     if report.ingest.failed or report.build.failed:
-        print("Some jobs failed. `briefing jobs` shows the errors.")
+        print(
+            "Some jobs failed. `briefing jobs` shows the errors; "
+            "`briefing jobs replay ID` runs one again."
+        )
         sys.exit(1)
 
 
-def cmd_jobs(settings: Settings, _args: argparse.Namespace) -> None:
+def cmd_jobs(settings: Settings, args: argparse.Namespace) -> None:
+    if args.action == "replay":
+        from briefing_engine.queue.jobs import ReplayRefused
+        from briefing_engine.replay import replay_job
+
+        if args.job_id is None:
+            sys.exit("Usage: briefing jobs replay JOB_ID")
+        try:
+            job = replay_job(make_engine(settings.database_url), args.job_id)
+        except ReplayRefused as exc:
+            sys.exit(f"Not replayed: {exc}")
+        print(f"Job #{job.id} ({job.queue}) is queued again. `briefing run-daily` will run it.")
+        return
     with make_engine(settings.database_url).connect() as conn:
         rows = conn.execute(
             text(
@@ -95,6 +116,8 @@ def cmd_jobs(settings: Settings, _args: argparse.Namespace) -> None:
         print("\nMost recent dead jobs:")
         for d in dead:
             print(f"  #{d.id} {d.queue} at {d.finished_at:%Y-%m-%d %H:%M}: {d.last_error}")
+        print()
+        print("`briefing jobs replay ID` runs one again from its first attempt.")
 
 
 def cmd_usage(settings: Settings, _args: argparse.Namespace) -> None:
@@ -181,7 +204,10 @@ def main(argv: list[str] | None = None) -> None:
     daily = sub.add_parser("run-daily", help="fetch, score, build and send the briefing")
     daily.add_argument("--date", type=date.fromisoformat, default=None)
     daily.set_defaults(func=cmd_run_daily)
-    sub.add_parser("jobs", help="job counts and recent failures").set_defaults(func=cmd_jobs)
+    jobs = sub.add_parser("jobs", help="job counts and recent failures; replay a dead job")
+    jobs.add_argument("action", nargs="?", choices=["replay"], default=None)
+    jobs.add_argument("job_id", nargs="?", type=int, default=None)
+    jobs.set_defaults(func=cmd_jobs)
     sub.add_parser("usage", help="model calls and cost by day").set_defaults(func=cmd_usage)
     web = sub.add_parser("web", help="local page for marking items")
     web.add_argument("--port", type=int, default=8000)

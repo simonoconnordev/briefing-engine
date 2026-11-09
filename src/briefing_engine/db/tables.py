@@ -70,6 +70,33 @@ sources = Table(
     Column("status", Text, nullable=False, server_default="active"),
     Column("created_at", TS, nullable=False, server_default=text("now()")),
     Column("exclude_categories", ARRAY(Text), nullable=False, server_default="{}"),
+    Column("consecutive_failures", Integer, nullable=False, server_default="0"),
+)
+
+hosts = Table(
+    "hosts",
+    metadata,
+    Column("host", Text, primary_key=True),
+    Column("min_interval_ms", Integer, nullable=False, server_default="2000"),
+    Column("next_allowed_at", TS, nullable=False, server_default=text("now()")),
+    Column("blocked_until", TS),
+)
+
+fetch_log = Table(
+    "fetch_log",
+    metadata,
+    Column("id", BigInteger, Identity(always=True), primary_key=True),
+    Column("source_id", BigInteger, ForeignKey("sources.id"), nullable=False),
+    Column("job_id", BigInteger),
+    Column("host", Text, nullable=False),
+    Column("started_at", TS, nullable=False),
+    Column("finished_at", TS, nullable=False, server_default=text("now()")),
+    Column("status_code", Integer),
+    Column("outcome", Text, nullable=False),
+    Column("error", Text),
+    Column("bytes", Integer),
+    Index("fetch_log_host", "host", "started_at"),
+    Index("fetch_log_source", "source_id", "started_at"),
 )
 
 articles = Table(
@@ -206,6 +233,62 @@ briefing_items = Table(
     Column("blurb", Text, nullable=False),
     Column("group_key", Text),
     UniqueConstraint("briefing_id", "rank"),
+)
+
+deliveries = Table(
+    "deliveries",
+    metadata,
+    Column("id", Uuid, primary_key=True),
+    Column("briefing_id", Uuid, ForeignKey("briefings.id", ondelete="CASCADE"), nullable=False),
+    Column("briefing_revision", Integer, nullable=False),
+    Column("channel", Text, nullable=False),
+    Column("endpoint_id", Uuid),
+    Column("status", Text, nullable=False, server_default="pending"),
+    Column("attempts", Integer, nullable=False, server_default="0"),
+    Column("next_attempt_at", TS, nullable=False, server_default=text("now()")),
+    Column("last_error", Text),
+    Column("message_id", Text),
+    Column("created_at", TS, nullable=False, server_default=text("now()")),
+    Column("updated_at", TS, nullable=False, server_default=text("now()")),
+    Column("succeeded_at", TS),
+    UniqueConstraint(
+        "briefing_id",
+        "briefing_revision",
+        "channel",
+        "endpoint_id",
+        name="deliveries_once",
+        postgresql_nulls_not_distinct=True,
+    ),
+)
+
+delivery_attempts = Table(
+    "delivery_attempts",
+    metadata,
+    Column(
+        "delivery_id",
+        Uuid,
+        ForeignKey("deliveries.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("seq", Integer, primary_key=True),
+    Column("attempt", Integer, nullable=False),
+    Column("started_at", TS, nullable=False, server_default=text("now()")),
+    Column("finished_at", TS),
+    Column("outcome", Text),
+    Column("error", Text),
+)
+
+dead_letters = Table(
+    "dead_letters",
+    metadata,
+    Column("id", BigInteger, Identity(always=True), primary_key=True),
+    Column("job_id", BigInteger, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False),
+    Column("queue", Text, nullable=False),
+    Column("payload", JSONB, nullable=False),
+    Column("error", Text, nullable=False),
+    Column("created_at", TS, nullable=False, server_default=text("now()")),
+    Column("replayed_at", TS),
+    Index("dead_letters_job", "job_id"),
 )
 
 article_feedback = Table(

@@ -3,24 +3,59 @@
 Storing the articles and enqueueing their score jobs happen in one transaction, so an
 article can never be saved without the work that follows from it.
 
-Checkpoint 1.1 fetches unconditionally. Conditional GET, adaptive intervals, the per-host
-limiter, retries and syndicated-copy detection arrive in checkpoints 1.2 and 1.3.
+Each fetch first takes its host's turn (see politeness.py), and every request is written
+to `fetch_log`. What the response means follows the table in §6.3:
+
+| result                                   | what happens                                |
+|------------------------------------------|---------------------------------------------|
+| 200                                      | store the entries                           |
+| 304                                      | nothing new                                 |
+| 429 / 503 with Retry-After               | block the host until then, retry after it   |
+| 408, 425, 429, 5xx, connection errors    | retry with backoff                          |
+| 301 / 308 all the way                    | keep the new URL                            |
+| 401, 403, 404 (and other 4xx)            | count a failure; five in a row is broken    |
+| 410                                      | broken now                                  |
+| unparseable, or larger than 5 MB         | dead, and counts towards broken             |
+
+Conditional GET and adaptive intervals arrive in checkpoint 1.3.
 """
 
 import logging
+import random
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import partial
+from urllib.parse import urlsplit
 
+import httpx
 from sqlalchemy import Connection, text
 
 from briefing_engine.context import Context
 from briefing_engine.hashing import sha256
-from briefing_engine.ingest.feeds import FeedEntry, fetch_feed, parse_feed, without_categories
+from briefing_engine.ingest.feeds import (
+    FeedEntry,
+    FeedParseError,
+    FeedTooLarge,
+    parse_feed,
+    without_categories,
+)
+from briefing_engine.ingest.politeness import (
+    GIVE_UP_AFTER_S,
+    Outcome,
+    block_host,
+    claim_host,
+    classify,
+    fetch,
+    log_fetch,
+    retry_after_jitter,
+)
 from briefing_engine.ingest.text import canon_text
 from briefing_engine.ingest.urls import normalise_url, url_hash
 from briefing_engine.llm.scoring_input import input_hash, scoring_input
-from briefing_engine.queue.jobs import Job, complete, enqueue
+from briefing_engine.queue.jobs import Deferred, Fatal, Job, RetryLater, complete, enqueue
+
+BROKEN_AFTER = 5  # consecutive 401/403/404 runs before a source is marked broken
 
 log = logging.getLogger(__name__)
 
@@ -77,6 +112,15 @@ _ALREADY_SCORED = text(
     SELECT 1 FROM llm_scores
     WHERE input_hash = :input_hash AND rubric_hash = :rubric_hash
       AND model = :model AND prompt_version = :prompt_version
+    """
+)
+
+
+_DIED_TODAY = text(
+    """
+    SELECT 1 FROM jobs
+    WHERE dedupe_key = :k AND state = 'dead' AND finished_at > now() - interval '24 hours'
+    LIMIT 1
     """
 )
 
@@ -138,6 +182,11 @@ def store_entries(
             if cached:
                 continue
             rubric_hex = target.rubric_hash.hex()
+            dedupe_key = f"score:{rubric_hex}:{row.input_hash.hex()}"
+            # A score that died today stays dead until someone replays it: another feed
+            # carrying the same article mustn't quietly pay for the same failure again.
+            if conn.execute(_DIED_TODAY, {"k": dedupe_key}).first():
+                continue
             job_id = enqueue(
                 conn,
                 "score",
@@ -147,34 +196,180 @@ def store_entries(
                     "rubric_hash": rubric_hex,
                     "billed_user_id": str(target.user_id),
                 },
-                dedupe_key=f"score:{rubric_hex}:{row.input_hash.hex()}",
+                dedupe_key=dedupe_key,
                 group_key=rubric_hex,
             )
             queued += job_id is not None
     return inserted, queued
 
 
+_SOURCE = text(
+    """
+    SELECT id, name, url, status, exclude_categories, consecutive_failures
+    FROM sources WHERE id = :id
+    """
+)
+
+
+def _record_failure(conn: Connection, source_id: int, *, gone: bool) -> str:
+    """Count a failed run against the source (a 4xx, or a body that isn't a feed).
+
+    Five in a row, or one 410, marks it broken. Returns its status afterwards."""
+    return str(
+        conn.execute(
+            text(
+                """
+                UPDATE sources
+                SET consecutive_failures = consecutive_failures + 1,
+                    status = CASE WHEN :gone OR consecutive_failures + 1 >= :limit
+                                  THEN 'broken' ELSE status END
+                WHERE id = :id
+                RETURNING status
+                """
+            ),
+            {"id": source_id, "gone": gone, "limit": BROKEN_AFTER},
+        ).scalar_one()
+    )
+
+
+def _record_success(conn: Connection, source_id: int, moved_to: str | None) -> None:
+    conn.execute(
+        text("UPDATE sources SET consecutive_failures = 0 WHERE id = :id"), {"id": source_id}
+    )
+    if moved_to is not None:
+        # A permanent redirect: fetch the new address from now on, unless another source
+        # already has it.
+        try:
+            normalised = normalise_url(moved_to)
+        except ValueError:
+            return
+        moved = conn.execute(
+            text(
+                """
+                UPDATE sources SET url = :url, url_normalised = :norm, host = :host
+                WHERE id = :id
+                  AND NOT EXISTS (SELECT 1 FROM sources WHERE url_normalised = :norm)
+                """
+            ),
+            {
+                "id": source_id,
+                "url": moved_to,
+                "norm": normalised,
+                "host": (urlsplit(moved_to).hostname or "").lower(),
+            },
+        ).rowcount
+        if moved:
+            log.info("source %s moved permanently to %s", source_id, moved_to)
+
+
 def handle_fetch(ctx: Context, jobs: Sequence[Job]) -> None:
+    """Fetch jobs are claimed one at a time, so an exception here concerns just this one."""
     for job in jobs:
-        source_id = int(job.payload["source_id"])
-        with ctx.engine.connect() as conn:
-            source = conn.execute(
-                text("SELECT id, name, url, exclude_categories FROM sources WHERE id = :id"),
-                {"id": source_id},
-            ).one()
+        _fetch_one(ctx, job)
+
+
+def _fetch_one(ctx: Context, job: Job) -> None:
+    source_id = int(job.payload["source_id"])
+    with ctx.engine.connect() as conn:
+        source = conn.execute(_SOURCE, {"id": source_id}).one()
+    if source.status != "active":
+        with ctx.engine.begin() as conn:
+            complete(conn, job.id, ctx.worker_id)
+        log.info("skipped %s: source is %s", source.name, source.status)
+        return
+    host = (urlsplit(source.url).hostname or "").lower()
+    if not host:
+        raise Fatal(f"source {source_id} has no host in its URL {source.url!r}")
+
+    with ctx.engine.begin() as conn:
+        wait = claim_host(conn, host)
+    if wait > GIVE_UP_AFTER_S:
+        with ctx.engine.begin() as conn:
+            complete(conn, job.id, ctx.worker_id)
+        log.warning("fetch.skipped: %s is blocked for %.0f s more; skipped this run", host, wait)
+        return
+    if wait > 0:
+        # Not this host's turn yet: come back when it is, without using up an attempt.
+        raise Deferred(wait + random.uniform(0, min(1.0, 0.1 * wait + 0.05)), f"host {host}")
+
+    started_at = datetime.now(UTC)
+    record = partial(log_fetch, source_id=source_id, job_id=job.id, host=host,
+                     started_at=started_at)  # fmt: skip
+    try:
         with ctx.http_client() as client:
-            body = fetch_feed(client, source.url)
-        entries = without_categories(parse_feed(body), list(source.exclude_categories))
+            result = fetch(client, source.url)
+    except FeedTooLarge as exc:
+        with ctx.engine.begin() as conn:
+            _record_failure(conn, source_id, gone=False)
+            record(conn, outcome=Outcome.FATAL, status_code=200, error=str(exc))
+        raise Fatal(str(exc)) from exc
+    except httpx.TransportError as exc:  # timeouts, refused connections, DNS
+        error = f"{type(exc).__name__}: {exc}"
+        with ctx.engine.begin() as conn:
+            record(conn, outcome=Outcome.RETRYABLE, error=error)
+        raise RetryLater(error) from exc
+
+    outcome = classify(result.status_code, result.retry_after_s)
+    record = partial(record, status_code=result.status_code)
+    if outcome is Outcome.OK:
+        try:
+            parsed = parse_feed(result.body)
+        except FeedParseError as exc:
+            with ctx.engine.begin() as conn:
+                _record_failure(conn, source_id, gone=False)  # counts towards broken
+                record(conn, outcome=Outcome.FATAL, error=str(exc), size=len(result.body))
+            raise Fatal(str(exc)) from exc
+        entries = without_categories(parsed, list(source.exclude_categories))
         with ctx.engine.begin() as conn:
             inserted, queued = store_entries(
-                conn,
-                source_id,
-                entries,
-                model=ctx.scorer.model,
+                conn, source_id, entries, model=ctx.scorer.model,
                 prompt_version=ctx.prompt_version,
-            )
+            )  # fmt: skip
+            _record_success(conn, source_id, result.final_url if result.moved_permanently else None)
+            record(conn, outcome=outcome, size=len(result.body))
             complete(conn, job.id, ctx.worker_id)
         log.info(
             "fetched %s: %d entries, %d new articles, %d score jobs queued",
             source.name, len(entries), inserted, queued,
         )  # fmt: skip
+        return
+
+    if outcome is Outcome.NOT_MODIFIED:
+        with ctx.engine.begin() as conn:
+            _record_success(conn, source_id, None)
+            record(conn, outcome=outcome)
+            complete(conn, job.id, ctx.worker_id)
+        return
+
+    if outcome is Outcome.BLOCKED:
+        assert result.retry_after_s is not None
+        with ctx.engine.begin() as conn:
+            block_host(conn, host, result.retry_after_s)
+            record(conn, outcome=outcome)
+        if result.retry_after_s > GIVE_UP_AFTER_S:
+            with ctx.engine.begin() as conn:
+                complete(conn, job.id, ctx.worker_id)
+            log.warning("fetch.skipped: %s asked us to wait %.0f s; skipped this run", host,
+                        result.retry_after_s)  # fmt: skip
+            return
+        delay = result.retry_after_s + retry_after_jitter(result.retry_after_s)
+        raise RetryLater(f"HTTP {result.status_code}: Retry-After {result.retry_after_s:.0f} s",
+                         delay_s=delay)  # fmt: skip
+
+    if outcome is Outcome.RETRYABLE:
+        with ctx.engine.begin() as conn:
+            record(conn, outcome=outcome)
+        raise RetryLater(f"HTTP {result.status_code}")
+
+    if outcome in (Outcome.MISSING, Outcome.GONE):
+        with ctx.engine.begin() as conn:
+            now_status = _record_failure(conn, source_id, gone=outcome is Outcome.GONE)
+            record(conn, outcome=outcome)
+            complete(conn, job.id, ctx.worker_id)
+        log.warning("fetch.failed: %s returned HTTP %d; source is %s", source.name,
+                    result.status_code, now_status)  # fmt: skip
+        return
+
+    with ctx.engine.begin() as conn:
+        record(conn, outcome=Outcome.FATAL)
+    raise Fatal(f"HTTP {result.status_code} from {source.url}")

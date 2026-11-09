@@ -89,7 +89,9 @@ def test_unsafe_href_is_dropped() -> None:
 def test_subject_and_multipart_message() -> None:
     rendered = render_briefing(fixture_briefing())
     assert rendered.subject == "Your ai-news briefing for Monday 9 November 2026"
-    message = build_message("from@briefing.test", "to@briefing.test", rendered)
+    message = build_message(
+        "from@briefing.test", "to@briefing.test", rendered, "<d1@briefing-engine.local>"
+    )
     assert message.get_content_type() == "multipart/alternative"
     kinds = [part.get_content_type() for part in message.iter_parts()]
     assert kinds == ["text/plain", "text/html"]

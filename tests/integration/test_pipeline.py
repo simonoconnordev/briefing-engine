@@ -1,8 +1,6 @@
 """A whole day through the real queue and database, with the feed, the model and the
 mail server replaced by in-process fakes."""
 
-from collections.abc import Sequence
-from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -11,13 +9,14 @@ import pytest
 from sqlalchemy import Engine, text
 
 from briefing_engine.context import Context
-from briefing_engine.delivery.render import RenderedEmail
 from briefing_engine.ingest.feeds import make_http_client
-from briefing_engine.llm.pricing import TokenUsage
-from briefing_engine.llm.rubric import Rubric
-from briefing_engine.llm.scorer import BatchResult, ScoredItem, ScoreInput
+from briefing_engine.ingest.fetch_job import handle_fetch
+from briefing_engine.llm.score_job import handle_score
 from briefing_engine.pipeline import run_daily
+from briefing_engine.queue.jobs import LeaseLost, claim_score_batch, enqueue
+from briefing_engine.queue.worker import run_until_idle
 from briefing_engine.setup_config import BriefingConfig, load_config, read_config
+from tests.integration.fakes import FakeMailer, FakeScorer, no_host_spacing
 
 pytestmark = pytest.mark.integration
 
@@ -36,41 +35,6 @@ def feed_dated(today: date) -> bytes:
 FEED = feed_dated(TODAY)
 
 
-@dataclass
-class FakeScorer:
-    """Scores by keyword: agents and evals are interesting, funding is not."""
-
-    calls: list[list[str]] = field(default_factory=list)
-    fail_titles: set[str] = field(default_factory=set)
-
-    @property
-    def model(self) -> str:
-        return "claude-haiku-5-5"
-
-    def score(self, rubric: Rubric, articles: Sequence[ScoreInput]) -> BatchResult:
-        self.calls.append([a.title for a in articles])
-        result = BatchResult(
-            outcome="ok", usage=TokenUsage(500, 100), cost_micros=100, estimate_micros=900
-        )
-        for a in articles:
-            if a.title in self.fail_titles:
-                result.invalid[a.ref] = "ref missing from reply"
-                result.outcome = "invalid_output"
-                continue
-            score = 3 if "raises" in a.title else 8 if "agent" in a.title else 7
-            result.items[a.ref] = ScoredItem(a.ref, score, f"Why: {a.title}", ("ai",))
-        return result
-
-
-@dataclass
-class FakeMailer:
-    sent: list[tuple[str, RenderedEmail]] = field(default_factory=list)
-
-    def send(self, to: str, email: RenderedEmail) -> str:
-        self.sent.append((to, email))
-        return f"<msg{len(self.sent)}@test>"
-
-
 def one_feed_config() -> BriefingConfig:
     """The example config cut to its first feed: the mock transport serves the same fixture
     for every URL, so more feeds would only repeat it."""
@@ -82,6 +46,7 @@ def one_feed_config() -> BriefingConfig:
 @pytest.fixture
 def ctx(db: Engine) -> Context:
     load_config(db, one_feed_config())
+    no_host_spacing(db)
     transport = httpx.MockTransport(lambda request: httpx.Response(200, content=FEED))
     return Context(
         engine=db,
@@ -147,6 +112,7 @@ def test_articles_older_than_the_age_limit_are_neither_scored_nor_sent(db: Engin
     config = one_feed_config()
     config.profiles[0].max_age_days = 7
     load_config(db, config)
+    no_host_spacing(db)
     old = feed_dated(TODAY - timedelta(days=30))
     scorer, mailer = FakeScorer(), FakeMailer()
     ctx = Context(
@@ -175,3 +141,19 @@ def test_editing_the_rubric_creates_a_new_version(db: Engine) -> None:
     assert again.profiles_new_version == []
     assert edited.profiles_new_version == ["ai-news"]
     assert count(db, "SELECT count(*) FROM profile_versions") == 2
+
+
+def test_a_paid_call_stays_in_the_ledger_when_the_lease_is_lost(ctx: Context) -> None:
+    """The worker scores, but another worker took the jobs meanwhile: the scores are
+    discarded, the money spent is not forgotten."""
+    with ctx.engine.begin() as conn:
+        enqueue(conn, "fetch", "fetch_source", {"source_id": 1})
+    run_until_idle(ctx, {"fetch": handle_fetch})
+    batch = claim_score_batch(ctx.engine, ctx.worker_id)
+    assert len(batch) == 3
+    with ctx.engine.begin() as conn:  # the lease is lost: the reaper gave the jobs away
+        conn.execute(text("UPDATE jobs SET locked_by = 'someone-else' WHERE queue = 'score'"))
+    with pytest.raises(LeaseLost):
+        handle_score(ctx, batch)
+    assert count(ctx.engine, "SELECT count(*) FROM llm_calls") == 1
+    assert count(ctx.engine, "SELECT count(*) FROM llm_scores") == 0

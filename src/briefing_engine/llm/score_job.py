@@ -1,8 +1,9 @@
 """The score job: score up to 10 articles that share a rubric in one call (§7.3, §9.1).
 
 The cache is checked again before calling, because another worker may have filled it.
-The ledger row, the scores and the job states are written in one transaction, so a
-recorded score always has its cost recorded next to it.
+The ledger row is committed as soon as the call returns. The scores and the job states
+follow in one transaction, which rolls back if the lease was lost meanwhile; the cost
+stays recorded either way, because it was paid either way.
 """
 
 import logging
@@ -12,10 +13,11 @@ from collections.abc import Sequence
 from sqlalchemy import Connection, text
 
 from briefing_engine.context import Context
+from briefing_engine.llm.client import ErrorKind, LlmApiError
 from briefing_engine.llm.rubric import Rubric
 from briefing_engine.llm.scorer import BatchResult, ScoreInput
 from briefing_engine.llm.scoring_input import input_hash, scoring_input
-from briefing_engine.queue.jobs import Job, complete, fail
+from briefing_engine.queue.jobs import Fatal, Job, RetryLater, complete, fail
 
 log = logging.getLogger(__name__)
 
@@ -111,7 +113,23 @@ def handle_score(ctx: Context, jobs: Sequence[Job]) -> None:
         to_score[ref] = (job, ihash)
         inputs.append(ScoreInput(ref=ref, title=fields["title"], text=fields["text"]))
 
-    result = ctx.scorer.score(rubric, inputs) if inputs else None
+    try:
+        result = ctx.scorer.score(rubric, inputs) if inputs else None
+    except LlmApiError as exc:
+        # Rate limits, overload and 5xx come back later (after Retry-After when the API
+        # sends one); a rejected request or key would fail the same way every time.
+        if exc.kind is ErrorKind.RETRYABLE:
+            raise RetryLater(str(exc), delay_s=exc.retry_after_s) from exc
+        raise Fatal(str(exc)) from exc
+
+    # The call has been paid for, so its ledger row commits on its own: if this worker
+    # has lost its lease, the scores below roll back but the cost is still recorded.
+    call_id = None
+    if result is not None:
+        with ctx.engine.begin() as conn:
+            call_id = record_call(
+                conn, user_id=billed_user, purpose="score", model=model, result=result
+            )
 
     with ctx.engine.begin() as conn:
         for job in missing:
@@ -120,9 +138,6 @@ def handle_score(ctx: Context, jobs: Sequence[Job]) -> None:
             complete(conn, job.id, ctx.worker_id)
         if result is None:
             return
-        call_id = record_call(
-            conn, user_id=billed_user, purpose="score", model=model, result=result
-        )
         for ref, (job, ihash) in to_score.items():
             item = result.items.get(ref)
             if item is None:

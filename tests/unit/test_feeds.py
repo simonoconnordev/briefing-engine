@@ -1,17 +1,9 @@
 from datetime import UTC, datetime
 from pathlib import Path
 
-import httpx
 import pytest
 
-from briefing_engine.ingest import feeds
-from briefing_engine.ingest.feeds import (
-    FeedTooLarge,
-    fetch_feed,
-    make_http_client,
-    parse_feed,
-    without_categories,
-)
+from briefing_engine.ingest.feeds import FeedParseError, parse_feed, without_categories
 
 FEED = (Path(__file__).parent.parent / "fixtures" / "feed.atom").read_bytes()
 
@@ -72,27 +64,7 @@ def test_excluded_categories_are_dropped_case_insensitively() -> None:
     assert without_categories(entries, []) == entries
 
 
-def test_fetch_sends_identifying_user_agent() -> None:
-    seen: dict[str, str] = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["ua"] = request.headers["user-agent"]
-        return httpx.Response(200, content=FEED)
-
-    with make_http_client(httpx.MockTransport(handler)) as client:
-        assert fetch_feed(client, "https://feed.example/atom") == FEED
-    assert seen["ua"].startswith("briefing-engine/")
-    assert "github.com/simonoconnordev/briefing-engine" in seen["ua"]
-
-
-def test_fetch_raises_on_http_errors() -> None:
-    transport = httpx.MockTransport(lambda request: httpx.Response(500))
-    with make_http_client(transport) as client, pytest.raises(httpx.HTTPStatusError):
-        fetch_feed(client, "https://feed.example/atom")
-
-
-def test_fetch_aborts_oversized_responses(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(feeds, "MAX_BYTES", 10)
-    transport = httpx.MockTransport(lambda request: httpx.Response(200, content=b"x" * 50))
-    with make_http_client(transport) as client, pytest.raises(FeedTooLarge):
-        fetch_feed(client, "https://feed.example/atom")
+def test_a_body_that_is_not_a_feed_is_a_parse_error() -> None:
+    with pytest.raises(FeedParseError):
+        parse_feed(b"<html><body>Service temporarily unavailable")
+    assert parse_feed(b'<?xml version="1.0"?><rss version="2.0"><channel></channel></rss>') == []

@@ -21,6 +21,10 @@ class FeedTooLarge(Exception):
     pass
 
 
+class FeedParseError(Exception):
+    """The body isn't a feed at all (an HTML error page, a truncated download)."""
+
+
 @dataclass(frozen=True)
 class FeedEntry:
     url: str
@@ -39,20 +43,6 @@ def make_http_client(transport: httpx.BaseTransport | None = None) -> httpx.Clie
         max_redirects=5,
         transport=transport,
     )
-
-
-def fetch_feed(client: httpx.Client, url: str) -> bytes:
-    """GET the feed, reading at most 5 MB. Raises httpx.HTTPStatusError on 4xx/5xx."""
-    with client.stream("GET", url) as response:
-        response.raise_for_status()
-        chunks: list[bytes] = []
-        size = 0
-        for chunk in response.iter_bytes():
-            size += len(chunk)
-            if size > MAX_BYTES:
-                raise FeedTooLarge(f"{url} is larger than {MAX_BYTES} bytes")
-            chunks.append(chunk)
-    return b"".join(chunks)
 
 
 def _text_field(entry: Any, name: str) -> str:
@@ -87,6 +77,10 @@ def _published(entry: Any) -> datetime | None:
 
 def parse_feed(content: bytes) -> list[FeedEntry]:
     parsed = feedparser.parse(content)
+    # feedparser is lenient: `bozo` alone flags many feeds that read fine. Only a body with
+    # no feed in it at all (no version, no entries) is an error.
+    if parsed.bozo and not parsed.entries and not parsed.get("version"):
+        raise FeedParseError(f"not a feed: {parsed.get('bozo_exception')!r}"[:300])
     entries: list[FeedEntry] = []
     for entry in parsed.entries:
         link = entry.get("link")

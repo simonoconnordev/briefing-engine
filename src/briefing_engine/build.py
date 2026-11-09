@@ -16,7 +16,8 @@ from sqlalchemy import Connection, text
 
 from briefing_engine.context import Context
 from briefing_engine.db.ids import new_id
-from briefing_engine.queue.jobs import Job, complete, enqueue
+from briefing_engine.delivery.deliver_job import create_email_delivery
+from briefing_engine.queue.jobs import Job, complete
 
 log = logging.getLogger(__name__)
 
@@ -221,13 +222,7 @@ def _build_one(
                 "blurb": candidate.reason,
             },
         )
-    enqueue(
-        conn,
-        "deliver",
-        "deliver_email",
-        {"briefing_id": str(briefing_id)},
-        dedupe_key=f"deliver:{briefing_id}:email",
-    )
+    create_email_delivery(conn, briefing_id)
     complete(conn, job.id, ctx.worker_id)
     log.info(
         "built briefing %s for %s: %d of %d candidates placed",

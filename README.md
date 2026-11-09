@@ -52,6 +52,20 @@ Planned stack: Python, FastAPI, PostgreSQL, a Postgres-backed job queue and work
 
 Running `run-daily` again for the same date makes no LLM calls and sends no email: scores come from the cache and the briefing already exists. `uv run briefing jobs` shows the queue.
 
+### When something fails
+
+- **A feed or the model API has a temporary problem** (a timeout, a 5xx, a rate limit): the job is retried with backoff. `run-daily` waits for retries due within two minutes; later ones run on the next `run-daily`.
+- **A site asks us to slow down** (429 or 503 with `Retry-After`): every feed on that host waits until then. Requests to one host are spaced at least 2 s apart (10 s for Reddit), however many workers run.
+- **A feed keeps failing** (401, 403 or 404 five runs in a row, or one 410): it's marked `broken` and no longer fetched.
+- **An email fails to send:** it's retried after 1 min, 5 min, 30 min, 2 h, 6 h and 12 h. An SMTP 5xx (a rejected address, say) stops it at once.
+- **A job runs out of attempts:** it's `dead`, and `uv run briefing jobs` lists it with its error. After fixing the cause, run it again from its first attempt:
+
+  ```bash
+  uv run briefing jobs replay 123
+  ```
+
+If the worker is killed partway through, the next run picks its jobs up once their lease expires (60 s). An email is marked as being sent before it goes and as sent after, so the only crash that can send it twice is one between the two; the copy carries the same Message-ID.
+
 ## Teach it what you find interesting
 
 The briefing improves from your verdicts, not from guesses about your taste.

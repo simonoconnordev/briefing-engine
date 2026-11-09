@@ -20,7 +20,7 @@ from briefing_engine.context import Context
 from briefing_engine.delivery.deliver_job import handle_deliver
 from briefing_engine.ingest.fetch_job import handle_fetch
 from briefing_engine.llm.score_job import handle_score
-from briefing_engine.queue.jobs import enqueue
+from briefing_engine.queue.jobs import enqueue, purge
 from briefing_engine.queue.worker import Handler, RunStats, run_until_idle
 
 HANDLERS: dict[str, Handler] = {
@@ -42,6 +42,7 @@ class DailyReport:
 def run_daily(ctx: Context, briefing_date: date | None = None) -> DailyReport:
     with ctx.engine.begin() as conn:
         started_at: datetime = conn.execute(text("SELECT now()")).scalar_one()
+        purge(conn)  # retention: succeeded jobs 7 days, dead ones 30
         sources = conn.execute(
             text(
                 """
