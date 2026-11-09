@@ -31,6 +31,15 @@ class Settings(BaseSettings):
     # Where `briefing web` listens; the email links here so items can be marked.
     web_base_url: str = "http://127.0.0.1:8000"
 
+    # `briefing api`. In a container, API_HOST=0.0.0.0 (the port is still published only
+    # on 127.0.0.1 by compose.yaml).
+    api_host: str = "127.0.0.1"
+    api_port: int = 8080
+    # Signs pagination cursors. Without it a random key is made at start-up, so cursors
+    # stop working when the API restarts.
+    cursor_hmac_key: SecretStr | None = None
+    log_format: str = "text"  # or "json", for the API and worker in a container
+
 
 @lru_cache
 def get_settings() -> Settings:

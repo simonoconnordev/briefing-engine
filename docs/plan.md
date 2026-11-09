@@ -1,6 +1,6 @@
 # briefing-engine: design plan
 
-**Status:** revision 3. Checkpoints 1.1, 1.2 and most of 1.3 are built; see [Checkpoint 1.1: as built](#checkpoint-11-as-built), [the trial set-up](#trial-set-up-between-11-and-12), [Checkpoint 1.2: as built](#checkpoint-12-as-built) and [Checkpoint 1.3: as built](#checkpoint-13-as-built). What 1.3 still needs is a week of reading-log evidence and my decisions on Q2, Q3 and Q5.
+**Status:** revision 3. Checkpoints 1.1, 1.2 and most of 1.3 are built; see [Checkpoint 1.1: as built](#checkpoint-11-as-built), [the trial set-up](#trial-set-up-between-11-and-12), [Checkpoint 1.2: as built](#checkpoint-12-as-built) and [Checkpoint 1.3: as built](#checkpoint-13-as-built). What 1.3 still needs is a week of reading-log evidence and my decisions on Q2, Q3 and Q5. Stage 2's local half is built too ([Stage 2: as built, locally](#stage-2-as-built-locally)); its AWS half waits for my go-ahead.
 **Author:** Simon O'Connor
 **Last updated:** 2026-11-09 (as-built notes for 1.2; Q16 settled). Revision 3 was made on 2026-11-08. Revision 3 splits stage 1 into four checkpoints, adds a reading-quality routine, and corrects the budget, rate-limit, score-input and subscription rules after two design reviews; see the [revision history](#17-revision-history).
 
@@ -1136,6 +1136,22 @@ Built 2026-11-09. Where the code settles or differs from this plan:
 - My own briefing runs from AWS for 7 days in a row, on time.
 - CI is green on every merge to `main`, and deploys happen with no manual steps after approval.
 - An alarm has fired at least once in a test (for example by stopping the worker) and the email arrived.
+
+#### Stage 2: as built, locally
+
+Built 2026-11-09, everything that doesn't need an AWS account:
+
+- **Migration 0005:** `api_keys`, `idempotency_keys`, and the `subscriptions (user_id, created_at, id)` index for paging.
+- **Keys (§5.3)** as designed: `bek_<prefix>_<secret>`, SHA-256 of the secret, constant-time compare, one indistinguishable 401 for missing, wrong, revoked and expired keys, `last_used_at` at most once a minute, `read` and `write` scopes. A key can only mint keys with scopes it has. A logging filter redacts anything that looks like a key.
+- **The §5.2 endpoints,** except the webhook endpoints (stage 3) and unsubscribe (needs SES): `me`, `api-keys`, `subscriptions`, `profiles` and rubric versions, `articles`, `briefings` (by id or date; `POST` queues a build), `jobs`, `deliveries` and replay, `usage` with cache savings, `healthz` and `readyz`. Problems are RFC 9457 with a `request_id`; validation errors name each field; OpenAPI is at `/docs`.
+- **Cursors (§5.4)** are signed and bound to their resource and filters. A changed filter, an edited cursor or another key gives 400 `invalid-cursor`.
+- **Idempotency-Key (§5.1)** on `POST /v1/briefings` and `/v1/deliveries/{id}/replay`, with all five steps, including 409 with `Retry-After: 1` for a concurrent request and take-over after a crash. Without a key, a build for the same (user, profile, date) still maps to the same job through its dedupe key.
+- **SSRF guard (§6.1):** a subscription URL must be http(s) with no credentials, on a host whose every address is globally routable (IPv4-mapped IPv6 included). The worker's HTTP client runs the same check before every request and redirect, and a refused feed is marked `broken`. **Known gap:** the check resolves the name and httpx then resolves it again, so a DNS-rebinding host could still slip through between the two. Pinning the connection to the checked address needs a custom transport; it's recorded for before the service is public.
+- **Scheduler (§9.1):** `briefing worker` runs a tick every 30 s. A source is fetched when its last fetch is over an hour old, or 15 minutes within 30 minutes of a reader's send time. Each profile's build is queued 5 minutes before the user's local send time, once per day, and caught up the same day if the worker was down. DST rules: a time in the spring gap moves forward by the gap; in the autumn overlap it's the first occurrence. SIGTERM lets the current batch finish.
+- **Processes and image:** `briefing api` and `briefing worker`; one `Dockerfile` (Python 3.14 slim, uv, non-root user); compose's `app` profile adds `migrate` (one-shot), `api` (readiness health check) and `worker`. `LOG_FORMAT=json` writes one JSON line per log record with the request id.
+- **Admin CLI:** `create-user`, `create-key` (prints the key once) and `set-budget`. Budgets are shown by `/v1/me` and `/v1/usage` but not yet enforced; that's §7.7, stage 3.
+- **Not built (needs AWS or my decision):** SES and one-click unsubscribe, Terraform, the OIDC deploy pipeline, EMF metrics and alarms. Also deferred: per-key API rate limits (stage 3) and the system user for shared work (ADR-013), which is only needed once one user's fetch is charged to another.
+- 206 tests pass (40 new: the API, the scheduler, the guard, the cursors), with ruff and mypy strict clean. A smoke test ran the image under compose against the development database.
 
 ### Stage 3: shared caching, cost budgets, webhooks, load test
 

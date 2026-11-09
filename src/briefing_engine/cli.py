@@ -8,6 +8,13 @@ briefing jobs replay ID            run a dead job again from its first attempt
 briefing usage                     model calls and cost by day
 briefing web [--port 8000]         local page for marking items interesting or not for you
 briefing report [--days 30]        what each feed contributes, and where Claude and you disagree
+
+Stage 2 (multi-user):
+briefing api                       the REST API (docs at /docs)
+briefing worker                    fetch, score, build and send at each user's send time
+briefing create-user EMAIL NAME    add a user (admin; there is no sign-up endpoint)
+briefing create-key EMAIL NAME     make an API key; the secret is printed once
+briefing set-budget EMAIL DOLLARS  a user's monthly model budget
 """
 
 import argparse
@@ -15,6 +22,7 @@ import logging
 import sys
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import Engine, text
 
@@ -22,7 +30,7 @@ from briefing_engine.config import Settings, get_settings
 from briefing_engine.context import Context
 from briefing_engine.db.engine import make_engine, upgrade_to_head
 from briefing_engine.delivery.email import SmtpMailer
-from briefing_engine.ingest.feeds import make_http_client
+from briefing_engine.ingest.feeds import guarded_http_client
 from briefing_engine.llm.client import AnthropicClient
 from briefing_engine.llm.scorer import ClaudeScorer
 from briefing_engine.llm.writer import ClaudeWriter
@@ -45,7 +53,7 @@ def _context(settings: Settings, engine: Engine) -> Context:
         engine=engine,
         scorer=ClaudeScorer(client, settings.score_model),
         mailer=SmtpMailer(settings),
-        http_client=make_http_client,
+        http_client=guarded_http_client,
         web_base_url=settings.web_base_url,
         writer=ClaudeWriter(client, settings.writeup_model) if settings.writeup_model else None,
     )
@@ -200,6 +208,100 @@ def cmd_report(settings: Settings, args: argparse.Namespace) -> None:
                         print(f"  [{d.score}] {d.title}" + (f"  ({d.note})" if d.note else ""))
 
 
+def _user_id(engine: Engine, email: str) -> Any:
+    with engine.connect() as conn:
+        user_id = conn.execute(
+            text("SELECT id FROM users WHERE email = :e"), {"e": email}
+        ).scalar_one_or_none()
+    if user_id is None:
+        sys.exit(f"No user with email {email}.")
+    return user_id
+
+
+def cmd_api(settings: Settings, _args: argparse.Namespace) -> None:
+    import secrets
+
+    import uvicorn
+
+    from briefing_engine.api.app import create_app
+
+    if settings.cursor_hmac_key is None:
+        logging.getLogger(__name__).warning(
+            "CURSOR_HMAC_KEY is not set: using a random key, so cursors end at restart"
+        )
+        cursor_key = secrets.token_bytes(32)
+    else:
+        cursor_key = settings.cursor_hmac_key.get_secret_value().encode("utf-8")
+    app = create_app(make_engine(settings.database_url), cursor_key)
+    print(f"API on http://{settings.api_host}:{settings.api_port}  (docs at /docs)")
+    uvicorn.run(
+        app, host=settings.api_host, port=settings.api_port, log_config=None, access_log=False
+    )
+
+
+def cmd_worker(settings: Settings, _args: argparse.Namespace) -> None:
+    import signal
+    import threading
+
+    from briefing_engine.scheduler import run_worker
+
+    stop = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: stop.set())
+    run_worker(_context(settings, make_engine(settings.database_url)), stop)
+
+
+def cmd_create_user(settings: Settings, args: argparse.Namespace) -> None:
+    from datetime import time as dtime
+    from zoneinfo import ZoneInfo
+
+    from briefing_engine.db.ids import new_id
+
+    ZoneInfo(args.timezone)  # raises on a wrong name
+    with make_engine(settings.database_url).begin() as conn:
+        user_id = conn.execute(
+            text(
+                """
+                INSERT INTO users (id, email, display_name, timezone, send_time)
+                VALUES (:id, :e, :n, :tz, :st)
+                ON CONFLICT (email) DO NOTHING RETURNING id
+                """
+            ),
+            {
+                "id": new_id(),
+                "e": args.email,
+                "n": args.name,
+                "tz": args.timezone,
+                "st": dtime.fromisoformat(args.send_time),
+            },
+        ).scalar_one_or_none()
+    if user_id is None:
+        sys.exit(f"A user with email {args.email} already exists.")
+    print(f"Created user {user_id}. Next: briefing create-key {args.email} my-key")
+
+
+def cmd_create_key(settings: Settings, args: argparse.Namespace) -> None:
+    from briefing_engine.api.keys import create_key
+
+    engine = make_engine(settings.database_url)
+    user_id = _user_id(engine, args.email)
+    with engine.begin() as conn:
+        key = create_key(conn, user_id, args.name, args.scopes.split(","))
+    print(f"Key {key.id} ({args.scopes}). This is the only time the secret is shown:")
+    print(key.token)
+
+
+def cmd_set_budget(settings: Settings, args: argparse.Namespace) -> None:
+    engine = make_engine(settings.database_url)
+    user_id = _user_id(engine, args.email)
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE users SET monthly_budget_micros = :b WHERE id = :u"),
+            {"b": round(args.dollars * 1_000_000), "u": user_id},
+        )
+    print(f"Monthly budget for {args.email}: ${args.dollars:.2f}")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="briefing", description="Daily news briefing engine")
     parser.add_argument("-v", "--verbose", action="store_true", help="log every job")
@@ -225,13 +327,36 @@ def main(argv: list[str] | None = None) -> None:
     rep.add_argument("--profile", default=None)
     rep.add_argument("--email", default=None)
     rep.set_defaults(func=cmd_report)
+    sub.add_parser("api", help="serve the REST API").set_defaults(func=cmd_api)
+    sub.add_parser("worker", help="run the queue and the per-user schedule").set_defaults(
+        func=cmd_worker
+    )
+    cu = sub.add_parser("create-user", help="add a user")
+    cu.add_argument("email")
+    cu.add_argument("name")
+    cu.add_argument("--timezone", default="Europe/Dublin")
+    cu.add_argument("--send-time", default="06:30")
+    cu.set_defaults(func=cmd_create_user)
+    ck = sub.add_parser("create-key", help="make an API key for a user")
+    ck.add_argument("email")
+    ck.add_argument("name")
+    ck.add_argument("--scopes", default="read,write")
+    ck.set_defaults(func=cmd_create_key)
+    sb = sub.add_parser("set-budget", help="set a user's monthly model budget in dollars")
+    sb.add_argument("email")
+    sb.add_argument("dollars", type=float)
+    sb.set_defaults(func=cmd_set_budget)
 
     args = parser.parse_args(argv)
-    logging.basicConfig(
-        level=logging.INFO if args.verbose else logging.WARNING,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    settings = get_settings()
+    from briefing_engine import logs
+
+    long_running = args.command in ("api", "worker")
+    logs.configure(
+        logging.INFO if args.verbose or long_running else logging.WARNING,
+        settings.log_format,
     )
-    args.func(get_settings(), args)
+    args.func(settings, args)
 
 
 if __name__ == "__main__":

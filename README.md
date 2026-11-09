@@ -2,7 +2,7 @@
 
 A multi-user news-ingestion and LLM-scoring service: it fetches feeds politely, deduplicates articles, scores them against each user's own rubric with Claude, and delivers a daily briefing by email or signed webhook.
 
-**Status: checkpoint 1.3 (a daily briefing I can live with).** Five feeds and one profile; a Postgres job queue with retries, leases and dead letters; polite fetching (per-host spacing, `Retry-After`, conditional GET); Claude Haiku scores each article against the rubric, and Claude Sonnet writes the briefing's headline, introduction and a short paragraph per item; a cost ledger; an email sent exactly once; and a local page for marking what was worth reading. A script runs it daily from Windows Task Scheduler. The design and the remaining checkpoints are in [docs/plan.md](docs/plan.md).
+**Status: checkpoint 1.3 built, and stage 2 built locally (the REST API, per-user schedules, one container image); not yet on AWS.** Five feeds and one profile; a Postgres job queue with retries, leases and dead letters; polite fetching (per-host spacing, `Retry-After`, conditional GET); Claude Haiku scores each article against the rubric, and Claude Sonnet writes the briefing's headline, introduction and a short paragraph per item; a cost ledger; an email sent exactly once; and a local page for marking what was worth reading. A script runs it daily from Windows Task Scheduler. The design and the remaining checkpoints are in [docs/plan.md](docs/plan.md).
 
 Planned stack: Python, FastAPI, PostgreSQL, a Postgres-backed job queue and worker, Docker, GitHub Actions, AWS (ECS Fargate, RDS), Anthropic API.
 
@@ -77,6 +77,44 @@ The task runs as you while you're signed in, and if the PC was asleep at 06:00 i
   ```
 
 If the worker is killed partway through, the next run picks its jobs up once their lease expires (60 s). An email is marked as being sent before it goes and as sent after, so the only crash that can send it twice is one between the two; the copy carries the same Message-ID.
+
+## The API and the worker (stage 2, local)
+
+For more than one user, the daily script gives way to two long-running processes, both from one Docker image:
+
+- `briefing api`: the REST API on <http://127.0.0.1:8080>. Interactive docs are at [/docs](http://127.0.0.1:8080/docs).
+- `briefing worker`: fetches feeds hourly (every 15 minutes just before someone's send time), builds each user's briefing at their own local send time, and sends it.
+
+Run both in containers, beside Postgres and Mailpit:
+
+```bash
+docker compose --profile app up -d --build
+```
+
+A one-shot `migrate` container runs the migrations first. Run either the worker or the daily scheduled task, not both. Running both is safe (each briefing is built and sent once), but it's confusing.
+
+Users and keys are admin commands, not endpoints:
+
+```bash
+uv run briefing create-user friend@example.com "A friend" --timezone Europe/London --send-time 07:00
+uv run briefing create-key friend@example.com laptop          # prints the key once
+uv run briefing set-budget friend@example.com 5
+```
+
+The new user then does everything else through the API:
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/v1/profiles -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "ai-news", "threshold": 6, "rubric": {"description": "Practical AI engineering", "interests": [{"topic": "agents", "weight": 5}], "scale_hint": "10 means read it today"}}'
+curl -s -X POST http://127.0.0.1:8080/v1/subscriptions -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" -d '{"url": "https://simonwillison.net/atom/everything/", "profile": "ai-news"}'
+curl -s http://127.0.0.1:8080/v1/briefings -H "Authorization: Bearer $KEY"
+```
+
+A feed already in the system is shared, so it's fetched once for everyone who reads it. Each user sees only their own profiles, scores, briefings, jobs and costs. A URL that resolves to a private or internal address is refused (422), and so is a redirect to one at fetch time.
+
+Set `CURSOR_HMAC_KEY` in `.env` to any long random string; it signs the pagination cursors. Without it, cursors stop working whenever the API restarts.
 
 ## Teach it what you find interesting
 

@@ -2,6 +2,7 @@
 
 import calendar
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -35,14 +36,31 @@ class FeedEntry:
     categories: tuple[str, ...] = ()
 
 
-def make_http_client(transport: httpx.BaseTransport | None = None) -> httpx.Client:
+def make_http_client(
+    transport: httpx.BaseTransport | None = None,
+    url_guard: Callable[[str], None] | None = None,
+) -> httpx.Client:
+    """`url_guard` runs before every request, redirects included, and raises to refuse one
+    (the SSRF guard, so a public feed can't redirect the worker into our own network)."""
+    hooks: dict[str, list[Callable[..., Any]]] = {}
+    if url_guard is not None:
+        guard = url_guard
+        hooks["request"] = [lambda request: guard(str(request.url))]
     return httpx.Client(
         headers={"User-Agent": USER_AGENT},
         timeout=TIMEOUT,
         follow_redirects=True,
         max_redirects=5,
         transport=transport,
+        event_hooks=hooks,
     )
+
+
+def guarded_http_client() -> httpx.Client:
+    """The worker's client: every request and redirect must go to a public address."""
+    from briefing_engine.api.ssrf import check_url
+
+    return make_http_client(url_guard=lambda url: check_url(url, allow_unresolved=True))
 
 
 def _text_field(entry: Any, name: str) -> str:

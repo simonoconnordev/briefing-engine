@@ -166,6 +166,7 @@ subscriptions = Table(
     UniqueConstraint("profile_id", "source_id"),
     ForeignKeyConstraint(["profile_id", "user_id"], ["profiles.id", "profiles.user_id"]),
     Index("subscriptions_source", "source_id"),
+    Index("subscriptions_user", "user_id", "created_at", "id"),
 )
 
 llm_calls = Table(
@@ -354,4 +355,35 @@ jobs = Table(
     ),
     Index("jobs_group", "queue", "group_key", "run_at", postgresql_where=text("state = 'queued'")),
     Index("jobs_lease", "lease_expires_at", postgresql_where=text("state = 'running'")),
+)
+
+api_keys = Table(
+    "api_keys",
+    metadata,
+    Column("id", Uuid, primary_key=True),
+    Column("user_id", Uuid, ForeignKey("users.id"), nullable=False),
+    Column("prefix", Text, nullable=False, unique=True),
+    Column("secret_hash", LargeBinary, nullable=False),
+    Column("name", Text, nullable=False),
+    Column("scopes", ARRAY(Text), nullable=False),
+    Column("created_at", TS, nullable=False, server_default=text("now()")),
+    Column("last_used_at", TS),
+    Column("expires_at", TS),
+    Column("revoked_at", TS),
+    Index("api_keys_user", "user_id"),
+)
+
+idempotency_keys = Table(
+    "idempotency_keys",
+    metadata,
+    Column("user_id", Uuid, ForeignKey("users.id"), primary_key=True),
+    Column("key", Text, primary_key=True),
+    Column("request_hash", LargeBinary, nullable=False),
+    Column("state", Text, nullable=False),
+    Column("response_status", SmallInteger),
+    Column("response_body", JSONB),
+    Column("locked_until", TS, nullable=False),
+    Column("created_at", TS, nullable=False, server_default=text("now()")),
+    Column("expires_at", TS, nullable=False),
+    Index("idempotency_keys_expires", "expires_at"),
 )

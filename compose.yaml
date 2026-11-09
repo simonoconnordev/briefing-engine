@@ -35,6 +35,52 @@ services:
       - "127.0.0.1:1025:1025"
       - "127.0.0.1:8025:8025"
 
+  # Stage 2: the API and the worker from the Dockerfile. They start only when asked for:
+  #   docker compose --profile app up -d --build
+  # They read secrets (the Anthropic key, CURSOR_HMAC_KEY) from .env; compose overrides
+  # the addresses so they reach Postgres and Mailpit by service name.
+  migrate:
+    profiles: [app]
+    build: .
+    command: ["migrate"]
+    env_file: .env
+    environment: &in_compose
+      DATABASE_URL: postgresql+psycopg://briefing:briefing@postgres:5432/briefing
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    profiles: [app]
+    build: .
+    command: ["api"]
+    env_file: .env
+    environment: *in_compose
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  worker:
+    profiles: [app]
+    build: .
+    command: ["worker"]
+    env_file: .env
+    environment: *in_compose
+    stop_grace_period: 90s  # lets the current batch finish after SIGTERM
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
 volumes:
   pgdata:
   mailpit:

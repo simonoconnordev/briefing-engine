@@ -32,6 +32,7 @@ from urllib.parse import urlsplit
 import httpx
 from sqlalchemy import Connection, text
 
+from briefing_engine.api.ssrf import UrlNotAllowed
 from briefing_engine.context import Context
 from briefing_engine.hashing import sha256
 from briefing_engine.ingest.feeds import (
@@ -321,6 +322,11 @@ def _fetch_one(ctx: Context, job: Job) -> None:
             _record_failure(conn, source_id, gone=False)
             record(conn, outcome=Outcome.FATAL, status_code=200, error=str(exc))
         raise Fatal(str(exc)) from exc
+    except UrlNotAllowed as exc:  # the feed, or a redirect from it, points inside
+        with ctx.engine.begin() as conn:
+            _record_failure(conn, source_id, gone=True)
+            record(conn, outcome=Outcome.FATAL, error=f"url not allowed: {exc}")
+        raise Fatal(f"url not allowed: {exc}") from exc
     except httpx.TransportError as exc:  # timeouts, refused connections, DNS
         error = f"{type(exc).__name__}: {exc}"
         with ctx.engine.begin() as conn:
