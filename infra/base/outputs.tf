@@ -37,8 +37,12 @@ output "mail_from_address" {
   value = "briefing@${var.domain}"
 }
 
+output "parameter_names" {
+  value = local.parameters
+}
+
 output "parameter_arns" {
-  value = { for k, p in aws_ssm_parameter.app : k => p.arn }
+  value = local.parameter_arns
 }
 
 output "github_deploy_role_arn" {

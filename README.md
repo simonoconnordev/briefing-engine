@@ -1,8 +1,8 @@
 # briefing-engine
 
-A multi-user news-ingestion and LLM-scoring service: it fetches feeds politely, deduplicates articles, scores them against each user's own rubric with Claude, and delivers a daily briefing by email or signed webhook.
+A multi-user news-ingestion and LLM-scoring service: it fetches feeds politely, deduplicates articles, scores them against each user's own rubric with Claude, and delivers a daily briefing by email (signed webhooks are planned for stage 3).
 
-**Status: checkpoint 1.3 built, and stage 2 built locally (the REST API, per-user schedules, one container image). The AWS half (Terraform for demo mode, SES email) is written and validated but not yet applied: it waits for the domain. See [infra/README.md](infra/README.md).** Five feeds and one profile; a Postgres job queue with retries, leases and dead letters; polite fetching (per-host spacing, `Retry-After`, conditional GET); Claude Haiku scores each article against the rubric, and Claude Sonnet writes the briefing's headline, introduction and a short paragraph per item; a cost ledger; an email sent exactly once; and a local page for marking what was worth reading. A script runs it daily from Windows Task Scheduler. The design and the remaining checkpoints are in [docs/plan.md](docs/plan.md).
+**Status: checkpoint 1.3 built, and stage 2 built locally (the REST API, per-user schedules, one container image). The AWS half (Terraform for demo mode, SES email) is written and validated but not yet applied: it waits for the domain. See [infra/README.md](infra/README.md).** Five feeds and one profile; a Postgres job queue with retries, leases and dead letters; polite fetching (per-host spacing, `Retry-After`, conditional GET); Claude Haiku scores each article against the rubric, and Claude Sonnet writes the briefing's headline, introduction and a short paragraph per item; a cost ledger; one email per day however often a run is repeated (see "When something fails" for the one crash that can send it twice); and a local page for marking what was worth reading. A script runs it daily from Windows Task Scheduler. The design and the remaining checkpoints are in [docs/plan.md](docs/plan.md).
 
 Planned stack: Python, FastAPI, PostgreSQL, a Postgres-backed job queue and worker, Docker, GitHub Actions, AWS (ECS Fargate, RDS), Anthropic API.
 
@@ -41,7 +41,7 @@ Planned stack: Python, FastAPI, PostgreSQL, a Postgres-backed job queue and work
 5. Run a day:
 
    ```bash
-   uv run briefing run-daily -v
+   uv run briefing -v run-daily
    ```
 
 6. Read the email in Mailpit at <http://127.0.0.1:8025>, and check what it cost:

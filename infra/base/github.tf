@@ -120,3 +120,31 @@ resource "aws_iam_role_policy" "github_plan_lock" {
   role   = aws_iam_role.github_plan.id
   policy = data.aws_iam_policy_document.github_plan_lock.json
 }
+
+# ReadOnlyAccess includes ssm:Get*, and the default aws/ssm key decrypts for anyone allowed
+# to call SSM in the account, so without this a plan job could read the app's secrets.
+# Plans don't need them: Terraform knows only the parameter names (secrets.tf).
+data "aws_iam_policy_document" "github_plan_no_secrets" {
+  statement {
+    sid    = "NoAppSecrets"
+    effect = "Deny"
+    actions = [
+      "ssm:GetParameter",
+      "ssm:GetParameters",
+      "ssm:GetParametersByPath",
+      "ssm:GetParameterHistory",
+    ]
+    resources = ["arn:aws:ssm:${var.region}:${local.account_id}:parameter/briefing-engine/*"]
+  }
+  statement {
+    sid       = "NoSecretsManagerValues"
+    effect    = "Deny"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "github_plan_no_secrets" {
+  role   = aws_iam_role.github_plan.id
+  policy = data.aws_iam_policy_document.github_plan_no_secrets.json
+}

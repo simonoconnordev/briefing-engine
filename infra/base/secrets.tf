@@ -1,6 +1,11 @@
 # Application secrets, as SSM Parameter Store SecureStrings (free, unlike Secrets Manager).
-# Terraform creates each parameter with a placeholder and then never touches its value, so
-# the real secret is never in Terraform state: infra/scripts/put-secrets.ps1 sets it.
+# Terraform knows only their names. infra/scripts/put-secrets.ps1 creates them and sets
+# their values, so the secrets are never in Terraform state.
+#
+# Managing them as aws_ssm_parameter resources with `ignore_changes = [value]` is not
+# enough: ignore_changes only stops Terraform changing the value, and every refresh still
+# reads the decrypted value back into state.
+#
 # The database password is not here: RDS manages it in Secrets Manager (demo/database.tf).
 
 locals {
@@ -8,16 +13,9 @@ locals {
     anthropic_api_key = "/briefing-engine/anthropic-api-key"
     cursor_hmac_key   = "/briefing-engine/cursor-hmac-key"
   }
-}
-
-resource "aws_ssm_parameter" "app" {
-  for_each    = local.parameters
-  name        = each.value
-  type        = "SecureString"
-  value       = "set-me-with-put-secrets.ps1"
-  description = "Set by infra/scripts/put-secrets.ps1; Terraform ignores the value."
-
-  lifecycle {
-    ignore_changes = [value]
+  # A parameter's ARN is "parameter" followed by its name, which starts with "/".
+  parameter_arns = {
+    for k, name in local.parameters :
+    k => "arn:aws:ssm:${var.region}:${local.account_id}:parameter${name}"
   }
 }

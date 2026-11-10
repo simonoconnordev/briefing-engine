@@ -17,6 +17,18 @@ param(
 Use-AwsSession
 Use-CloudflareToken
 
+# The services read their secrets from SSM at start-up; without them every task fails.
+if (-not (Test-Path (Join-Path $RepoRoot 'infra\base\.terraform\terraform.tfstate'))) {
+    Initialize-TerraformRoot base
+}
+$names = (Get-TerraformOutput base parameter_names).PSObject.Properties.Value
+$found = [int](Invoke-Native aws ssm describe-parameters `
+        --parameter-filters "Key=Name,Option=Equals,Values=$($names -join ',')" `
+        --query 'length(Parameters)' --output text).Trim()
+if ($found -ne @($names).Count) {
+    throw 'The app secrets are not in SSM yet. Run .\infra\scripts\put-secrets.ps1 first.'
+}
+
 if (-not $ImageTag) {
     $ImageTag = & "$PSScriptRoot\push-image.ps1" | Select-Object -Last 1
 }

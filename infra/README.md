@@ -14,8 +14,9 @@ Region: `eu-west-1`. Credentials come from `aws login` (no access keys on disk).
 
 - PowerShell 7, the AWS CLI 2.32 or later, Terraform 1.10 or later, and Docker Desktop running.
 - `aws login --profile briefing-admin` done in the last 12 hours.
-- The domain at Cloudflare, and a Cloudflare API token with **Zone → DNS → Edit** on that zone
-  only, in `.env` as `CLOUDFLARE_API_TOKEN`.
+- The domain at Cloudflare, and a Cloudflare API token with **Zone → Zone → Read** and
+  **Zone → DNS → Edit**, both limited to that one zone, in `.env` as `CLOUDFLARE_API_TOKEN`.
+  Terraform needs the read permission to look the zone up by name.
 - `ANTHROPIC_API_KEY` in `.env`.
 
 ## Once: the base
@@ -23,8 +24,12 @@ Region: `eu-west-1`. Credentials come from `aws login` (no access keys on disk).
 ```powershell
 Copy-Item infra\base\terraform.tfvars.example infra\base\terraform.tfvars   # then edit it
 .\infra\scripts\bootstrap.ps1      # applies base with local state, then moves it into S3
-.\infra\scripts\put-secrets.ps1    # copies the Anthropic key (and a cursor key) into SSM
+.\infra\scripts\put-secrets.ps1    # creates the Anthropic key and a cursor key in SSM
 ```
+
+If bootstrap stops partway (a failed apply, a lost session), fix the cause and run it again:
+it works out from where the state is (local, S3, or both) whether to resume, tidy up or stop
+and explain. It keeps the local state until the copy in S3 is confirmed.
 
 AWS emails each address in `ses_verified_recipients`; click the link in it. SES is in its
 sandbox, so it delivers only to verified addresses (up to 200 a day).
@@ -51,9 +56,11 @@ key printed by `create-key` isn't kept in the logs.
 
 - **One image** (`Dockerfile`) runs as `api`, `worker` and one-off `admin` tasks (migrate,
   create-user, create-key). Images are tagged with the git commit; tags are immutable.
-- **Secrets.** The Anthropic key and the cursor key are SSM SecureStrings; Terraform creates
-  them with a placeholder and ignores the value, so the real values are never in Terraform
-  state. RDS keeps the database password in Secrets Manager itself. ECS injects all three into
+- **Secrets.** The Anthropic key and the cursor key are SSM SecureStrings. `put-secrets.ps1`
+  creates them, and Terraform knows only their names and ARNs, so the values are never in
+  Terraform state. (A Terraform-managed parameter with `ignore_changes` would not do: every
+  refresh reads the decrypted value back into state.) The CI plan role is denied reading
+  them. RDS keeps the database password in Secrets Manager itself. ECS injects all three into
   the containers; the app builds its database URL from `DB_HOST`, `DB_USER`, `DB_PASSWORD` and
   so on, with `sslmode=require`.
 - **Email** goes through the SES API with the worker's task role. No SMTP password exists.

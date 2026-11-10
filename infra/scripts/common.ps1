@@ -51,7 +51,7 @@ function Use-CloudflareToken {
     if (-not $env:CLOUDFLARE_API_TOKEN) {
         $token = Get-DotEnvValue 'CLOUDFLARE_API_TOKEN'
         if (-not $token) {
-            throw 'CLOUDFLARE_API_TOKEN is not set. Add it to .env (a token with DNS:Edit on your zone).'
+            throw 'CLOUDFLARE_API_TOKEN is not set. Add it to .env (a token with Zone:Read and DNS:Edit on your zone).'
         }
         $env:CLOUDFLARE_API_TOKEN = $token
     }

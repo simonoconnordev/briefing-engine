@@ -29,5 +29,6 @@ provider "aws" {
 }
 
 # Reads CLOUDFLARE_API_TOKEN from the environment (tf.ps1 loads it from .env). The token
-# only needs "DNS: Edit" on this one zone.
+# needs "Zone: Read" (to look the zone up by name in email.tf) and "DNS: Edit", both on
+# this one zone only.
 provider "cloudflare" {}
