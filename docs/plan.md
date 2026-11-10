@@ -1165,6 +1165,8 @@ Written 2026-11-09 after the AWS account was set up (Free plan, `eu-west-1`, an 
 - **CI roles exist, workflows don't yet:** the deploy role can push to ECR and roll ECS services (passing only `briefing-engine-ecs-*` roles); the plan role is read-only plus the lock file. Both are trusted only for this repository's `production` environment and pull requests. The workflows come with the GitHub repository.
 - **Changed from §11.2:** no NAT, as planned; backups 1 day instead of 7 and no final snapshot (demo data is disposable); Container Insights off; CloudWatch alarms, EMF metrics and the synthetic `/readyz` check are not written yet.
 - **Credentials for Terraform and Docker** come from `aws configure export-credentials` on the `aws login` session, so no access keys exist anywhere.
+- **Checked before the first apply:** `terraform validate` passes for both roots. Provider versions are pinned in committed lock files (aws 6.72.0, cloudflare 5.28.1) with checksums for every platform, so CI and every machine use the same verified plugins. The image builds with `SesMailer`. 218 tests pass, with ruff and mypy strict clean.
+- **Next, in order:** buy the domain at Cloudflare; create a token with Zone → DNS → Edit on that zone only, as `CLOUDFLARE_API_TOKEN` in `.env`; fill in `infra/base/terraform.tfvars`; run `bootstrap.ps1` and `put-secrets.ps1`; run the first demo (`demo-up.ps1`, a user and key, the API at `https://api.<domain>/docs`, a briefing through SES, `demo-down.ps1`); then the GitHub repository with the CI and deploy workflows, checkpoint 1.4 (the shadow week against Horizon), CloudWatch alarms and the DNS-rebinding fix.
 
 ### Stage 3: shared caching, cost budgets, webhooks, load test
 
