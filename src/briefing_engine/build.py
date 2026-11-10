@@ -1,7 +1,9 @@
 """The build job: choose and rank today's articles for one profile, then write them up (§7.6).
 
 Three steps, so the model call never runs inside a database transaction:
-1. choose and rank the items (read only);
+1. choose and rank the items (read only), first waiting a few minutes at most for this
+   profile's own fetches and scores, so a new reader's first briefing isn't built before
+   their feeds have been read;
 2. write the headline, intro and blurbs, from the write-up cache if these exact items were
    written up before, otherwise with one model call whose cost is recorded at once;
 3. store the briefing, its items and its delivery, and complete the job, together.
@@ -29,13 +31,38 @@ from briefing_engine.llm.client import ErrorKind
 from briefing_engine.llm.rubric import Rubric
 from briefing_engine.llm.score_job import record_call
 from briefing_engine.llm.writer import WRITE_PROMPT_VERSION, WriteInput, WriteResult
-from briefing_engine.queue.jobs import Job, RetryLater, complete
+from briefing_engine.queue.jobs import Deferred, Job, RetryLater, complete
 
 log = logging.getLogger(__name__)
 
 WINDOW_HOURS = 24
 COPIES_BONUS = 0.5
 WRITEUP_TRIES = 3  # a temporary API failure retries the build this often, then degrades
+# Builds run before fetches and scores (worker.QUEUE_ORDER), so a build queued in the same
+# tick as its profile's first fetch would otherwise find nothing. It waits while that
+# profile's fetches or scores are due, for INGEST_WAIT_S at most from when it was queued,
+# so a slow or failing feed can delay a briefing but never stop it.
+INGEST_WAIT_S = 600
+INGEST_POLL_S = 15.0
+INGEST_HORIZON_S = 120  # a fetch or score retrying later than this isn't waited for
+
+_PENDING_INGEST = text(
+    """
+    SELECT
+        EXISTS (
+            SELECT 1 FROM jobs j
+            WHERE j.state IN ('queued', 'running')
+              AND j.run_at <= now() + make_interval(secs => :horizon)
+              AND (
+                  (j.queue = 'fetch' AND j.payload->>'source_id' IN (
+                      SELECT CAST(sub.source_id AS text) FROM subscriptions sub
+                      WHERE sub.profile_id = :p))
+                  OR (j.queue = 'score' AND j.payload->>'rubric_hash' = :rubric_hex)
+              )
+        ) AS pending,
+        (SELECT extract(epoch FROM now() - created_at) FROM jobs WHERE id = :job) AS waited_s
+    """
+)
 
 
 @dataclass(frozen=True)
@@ -289,6 +316,24 @@ def _writeup(
     return (writeup if result.items else None), "degraded"
 
 
+def _wait_for_ingest(conn: Connection, job: Job, profile_id: uuid.UUID, rubric_hash: bytes) -> None:
+    """Raises Deferred while the profile's fetches or scores are due, within the limit."""
+    row = conn.execute(
+        _PENDING_INGEST,
+        {"p": profile_id, "rubric_hex": bytes(rubric_hash).hex(), "job": job.id,
+         "horizon": INGEST_HORIZON_S},
+    ).one()  # fmt: skip
+    if not row.pending:
+        return
+    if row.waited_s is not None and row.waited_s >= INGEST_WAIT_S:
+        log.warning(
+            "briefing.ingest_timeout: building profile %s after %.0f s with fetches or "
+            "scores still due", profile_id, row.waited_s,
+        )  # fmt: skip
+        return
+    raise Deferred(INGEST_POLL_S, "waiting for this profile's fetches and scores")
+
+
 def _build_one(
     ctx: Context, job: Job, user_id: uuid.UUID, profile_id: uuid.UUID, briefing_date: date
 ) -> None:
@@ -301,6 +346,7 @@ def _build_one(
             complete(conn, job.id, ctx.worker_id)
             return
         plan = _choose(ctx, conn, user_id, profile_id)
+        _wait_for_ingest(conn, job, profile_id, plan.profile.rubric_hash)
 
     writeup, status = _writeup(ctx, job, user_id, plan)
 

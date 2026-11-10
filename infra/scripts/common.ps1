@@ -72,6 +72,32 @@ function Initialize-TerraformRoot {
     Invoke-Native terraform "-chdir=$dir" init -input=false "-backend-config=bucket=$(Get-StateBucket)"
 }
 
+function Wait-Ready {
+    # Polls a readiness URL until it answers 200, or throws once the time is up. A stable
+    # ECS service only means the load balancer's liveness check passes; /readyz also checks
+    # the database and the schema.
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [int]$TimeoutSec = 180,
+        [int]$IntervalSec = 5
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $last = 'no response'
+    while ($true) {
+        try {
+            $r = Invoke-WebRequest -Uri $Url -SkipHttpErrorCheck -TimeoutSec 10 -UseBasicParsing
+            if ($r.StatusCode -eq 200) { return }
+            $last = "HTTP $($r.StatusCode)"
+        } catch {
+            $last = $_.Exception.Message
+        }
+        if ((Get-Date) -ge $deadline) {
+            throw "$Url wasn't ready after $TimeoutSec s (last: $last). Check the api service's logs."
+        }
+        Start-Sleep -Seconds $IntervalSec
+    }
+}
+
 function Get-TerraformOutput {
     param([Parameter(Mandatory)][ValidateSet('base', 'demo')][string]$Root, [Parameter(Mandatory)][string]$Name)
     $dir = Join-Path $script:RepoRoot "infra\$Root"

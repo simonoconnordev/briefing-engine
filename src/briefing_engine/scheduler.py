@@ -109,6 +109,7 @@ def tick(conn: Connection, now: datetime) -> Tick:
                 """
                 SELECT p.id FROM profiles p
                 WHERE p.user_id = :u
+                  AND EXISTS (SELECT 1 FROM subscriptions sub WHERE sub.profile_id = p.id)
                   AND NOT EXISTS (SELECT 1 FROM briefings b WHERE b.profile_id = p.id
                                   AND b.briefing_date = :d)
                   AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.dedupe_key =

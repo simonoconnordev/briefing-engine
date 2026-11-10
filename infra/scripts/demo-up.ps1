@@ -54,5 +54,7 @@ Write-Host 'Waiting for the services to settle...'
 Invoke-Native aws ecs wait services-stable --cluster $cluster --services api worker
 
 $url = Get-TerraformOutput demo api_url
-Write-Host "The demo is up: $url/docs   (readiness: $url/readyz)"
+Write-Host "Waiting for $url/readyz (the database and schema)..."
+Wait-Ready "$url/readyz"
+Write-Host "The demo is up: $url/docs"
 Write-Host 'First time? Create a user and an API key with run-admin.ps1 (see infra/README.md).'

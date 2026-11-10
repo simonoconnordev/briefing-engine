@@ -41,7 +41,7 @@ Later changes to base: `.\infra\scripts\tf.ps1 base plan`, then `... base apply`
 ```powershell
 .\infra\scripts\demo-up.ps1        # push the image, apply demo, migrate, restart services
 .\infra\scripts\run-admin.ps1 create-user you@example.com "Your Name" --timezone Europe/Dublin
-.\infra\scripts\run-admin.ps1 -Secret create-key you@example.com laptop --scopes read,write
+.\infra\scripts\run-admin.ps1 -Secret create-key you@example.com laptop   # read,write by default
 # ... use https://api.<domain>/docs with the key ...
 .\infra\scripts\demo-down.ps1      # destroy everything in demo/
 ```

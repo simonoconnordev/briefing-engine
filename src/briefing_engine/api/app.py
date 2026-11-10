@@ -16,9 +16,10 @@ from typing import Annotated, Any
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import Depends, FastAPI, Header, Query, Request, Response
+from fastapi import Depends, FastAPI, Header, Query, Request, Response, Security
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Connection, Engine, text
 
@@ -88,13 +89,24 @@ def _engine(request: Request) -> Engine:
     return engine
 
 
-def principal(request: Request) -> Principal:
-    header = request.headers.get("authorization", "")
-    scheme, _, token = header.partition(" ")
+# Declared through FastAPI's security machinery so the OpenAPI document advertises it and
+# /docs offers an Authorize button. auto_error=False: a missing or malformed header gets
+# the same 401 as a wrong key, below.
+_bearer = HTTPBearer(
+    auto_error=False,
+    scheme_name="apiKey",
+    description="An API key from `briefing create-key`, sent as `Authorization: Bearer bek_...`.",
+)
+
+
+def principal(
+    request: Request,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Security(_bearer)],
+) -> Principal:
     found = None
-    if scheme.lower() == "bearer" and token:
+    if credentials is not None and credentials.credentials.strip():
         with _engine(request).begin() as conn:
-            found = keys.authenticate(conn, token.strip())
+            found = keys.authenticate(conn, credentials.credentials.strip())
     if found is None:
         raise Problem(
             401,

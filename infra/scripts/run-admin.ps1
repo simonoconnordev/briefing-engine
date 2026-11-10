@@ -9,6 +9,9 @@
   .\infra\scripts\run-admin.ps1 create-user you@example.com "Your Name" --timezone Europe/Dublin
   .\infra\scripts\run-admin.ps1 -Secret create-key you@example.com laptop
 
+  Quote a comma-separated value (--scopes 'read,write'): unquoted, PowerShell turns it into
+  a list and the command receives "read write".
+
 .PARAMETER Secret
   The command prints a secret (create-key prints an API key once). Its log stream is
   deleted from CloudWatch after it has been shown here, so the key isn't kept there.
@@ -54,13 +57,35 @@ $reason = (Invoke-Native aws ecs describe-tasks --cluster $cluster --tasks $task
         --query 'tasks[0].stoppedReason' --output text).Trim()
 
 $stream = "admin/admin/$taskId"
-Write-Host "--- output ---"
-& aws logs get-log-events --log-group-name $logGroup --log-stream-name $stream `
+$output = & aws logs get-log-events --log-group-name $logGroup --log-stream-name $stream `
     --start-from-head --query 'events[].message' --output text
-Write-Host "--------------"
+$shown = $LASTEXITCODE -eq 0
+if ($shown) {
+    Write-Host "--- output ---"
+    $output
+    Write-Host "--------------"
+} else {
+    Write-Warning "Couldn't read the task's output from $logGroup/$stream (exit code $LASTEXITCODE)."
+}
 
 if ($Secret) {
+    if (-not $shown) {
+        # Deleting now would destroy the only copy before anyone has seen it, and the key
+        # (if one was made) would be valid but unknown. Leave both for a person to decide.
+        throw @"
+The secret wasn't shown, so the log stream is kept. Either read it in the CloudWatch console
+($logGroup / $stream) and then delete the stream, or leave it, create another key, and revoke
+this one with GET /v1/api-keys and DELETE /v1/api-keys/{id}.
+"@
+    }
     & aws logs delete-log-stream --log-group-name $logGroup --log-stream-name $stream
+    if ($LASTEXITCODE -ne 0) {
+        throw @"
+Couldn't delete the log stream $logGroup/$stream (exit code $LASTEXITCODE), so the secret
+printed above is still in CloudWatch. Delete the stream in the console, or revoke the key with
+DELETE /v1/api-keys/{id} and create another.
+"@
+    }
     Write-Host 'Deleted the log stream, so the secret printed above is not kept in CloudWatch.'
 }
 

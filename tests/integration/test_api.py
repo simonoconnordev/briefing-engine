@@ -4,6 +4,7 @@ the SSRF guard and, above all, that one user never sees another's data."""
 import logging
 from collections.abc import Iterable
 from typing import Any
+from unittest.mock import ANY
 
 import httpx
 import pytest
@@ -408,6 +409,28 @@ def test_patch_me_checks_the_timezone(api: Api, db: Engine) -> None:
 def test_the_openapi_document_lists_the_api(api: Api) -> None:
     paths = api.client.get("/openapi.json").json()["paths"]
     assert {"/v1/me", "/v1/subscriptions", "/v1/briefings", "/v1/usage"} <= set(paths)
+
+
+def test_the_openapi_document_advertises_bearer_auth(api: Api) -> None:
+    doc = api.client.get("/openapi.json").json()
+    assert doc["components"]["securitySchemes"]["apiKey"] == {
+        "type": "http",
+        "scheme": "bearer",
+        "description": ANY,
+    }
+    assert doc["paths"]["/v1/me"]["get"]["security"] == [{"apiKey": []}]
+    assert doc["paths"]["/v1/subscriptions"]["post"]["security"] == [{"apiKey": []}]
+    assert "security" not in doc["paths"]["/healthz"]["get"]
+    assert "security" not in doc["paths"]["/readyz"]["get"]
+
+
+def test_a_malformed_authorization_header_gets_the_same_401(api: Api, db: Engine) -> None:
+    key = api.key_for(new_user(db, "a@example.com"), ["read"])
+    for header in ("Bearer", "Bearer ", "Basic abc", key, f"Token {key}"):
+        r = api.client.get("/v1/me", headers={"Authorization": header})
+        assert r.status_code == 401, header
+        assert r.headers["WWW-Authenticate"] == 'Bearer realm="briefing-engine"'
+    assert api.client.get("/v1/me", headers={"Authorization": f"bearer {key}"}).status_code == 200
 
 
 _ = ROOT  # the example config lives at the repo root
