@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+# Actions are pinned to full commit SHAs, with the release in a comment, so a moved tag
+# can't change what runs here.
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -28,8 +31,10 @@ jobs:
     env:
       TEST_DATABASE_URL: postgresql+psycopg://briefing:briefing@127.0.0.1:5432/briefing_test
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - run: uv sync --locked
       - name: Lint and format
         run: |
@@ -39,3 +44,33 @@ jobs:
         run: uv run mypy
       - name: Tests (unit and integration against Postgres 17)
         run: uv run pytest
+
+  # After the tests pass on main: push the image to ECR and, if the demo is up, roll it out
+  # (infra/ci/deploy.sh). The job runs in the production environment, which requires my
+  # approval and allows only main, and the deploy role trusts nothing else
+  # (infra/base/github.tf). A deployment left waiting for approval does nothing.
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: deploy
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write # to request the OIDC token the deploy role is assumed with
+    env:
+      AWS_REGION: eu-west-1
+      API_BASE_URL: ${{ vars.API_BASE_URL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: eu-west-1
+          mask-aws-account-id: true
+      - name: Push the image and roll it out
+        run: bash infra/ci/deploy.sh
