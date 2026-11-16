@@ -1,9 +1,8 @@
 # Shared by the infra scripts (dot-source it: `. $PSScriptRoot\common.ps1`).
 #
 # Credentials come from `aws login --profile briefing-admin`: short-lived, from the console
-# sign-in, with no access keys on disk. They're exported into this process's environment,
-# so Terraform and Docker use the same session. CLOUDFLARE_API_TOKEN comes from .env.
-# Nothing here prints a secret.
+# sign-in, with no access keys on disk. Terraform, its S3 backend and the AWS CLI all read
+# that profile themselves. CLOUDFLARE_API_TOKEN comes from .env. Nothing here prints a secret.
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -11,6 +10,13 @@ Set-StrictMode -Version Latest
 $script:RepoRoot = (Resolve-Path "$PSScriptRoot\..\..").Path
 $script:AwsProfile = if ($env:BRIEFING_AWS_PROFILE) { $env:BRIEFING_AWS_PROFILE } else { 'briefing-admin' }
 $script:Region = 'eu-west-1'
+
+# Downloaded providers are kept between runs. bootstrap.ps1 deletes .terraform every time, and
+# the AWS provider alone is about 180 MB.
+if (-not $env:TF_PLUGIN_CACHE_DIR) {
+    $env:TF_PLUGIN_CACHE_DIR = Join-Path $env:LOCALAPPDATA 'terraform-plugin-cache'
+}
+New-Item -ItemType Directory -Force $env:TF_PLUGIN_CACHE_DIR | Out-Null
 
 function Invoke-Native {
     # Runs a native command and stops on a non-zero exit code.
@@ -20,19 +26,20 @@ function Invoke-Native {
 }
 
 function Use-AwsSession {
-    $lines = & aws configure export-credentials --profile $script:AwsProfile --format env-no-export 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $lines) {
-        throw "No AWS session. Run:  aws login --profile $($script:AwsProfile)"
+    # Points Terraform and the AWS CLI at the `aws login` profile. They renew its 15-minute keys
+    # as they go, for as long as the login lasts (up to 12 hours). Copying the keys into the
+    # environment instead made them expire partway through long steps.
+    foreach ($name in 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_CREDENTIAL_EXPIRATION') {
+        # Keys left in this window by an older run would override the profile.
+        Remove-Item "Env:$name" -ErrorAction SilentlyContinue
     }
-    foreach ($line in $lines) {
-        $name, $value = $line -split '=', 2
-        if ($name -in 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_CREDENTIAL_EXPIRATION') {
-            Set-Item -Path "Env:$name" -Value $value
-        }
-    }
+    $env:AWS_PROFILE = $script:AwsProfile
     $env:AWS_REGION = $script:Region
     $env:AWS_DEFAULT_REGION = $script:Region
-    Remove-Item Env:AWS_PROFILE -ErrorAction SilentlyContinue  # the exported keys win
+    & aws sts get-caller-identity --query Account --output text *> $null
+    if ($LASTEXITCODE -ne 0) {
+        throw "No AWS session. Run:  aws login --profile $($script:AwsProfile)"
+    }
 }
 
 function Get-DotEnvValue {
