@@ -60,6 +60,54 @@ shows scores, then call `POST /v1/briefings`.
 `run-admin.ps1 -Secret` deletes the task's CloudWatch log stream after showing it, so an API
 key printed by `create-key` isn't kept in the logs.
 
+## GitHub Actions
+
+Two workflows use the CI roles in base. Neither needs AWS keys: each job asks GitHub for an
+OIDC token and exchanges it for a role that trusts only that kind of job.
+
+- **Deploy** (the `deploy` job in `.github/workflows/ci.yml`). After the tests pass on
+  `main`, it waits for approval in the `production` environment, then pushes the image for
+  that commit to ECR. If the demo is up, it also migrates the database and rolls the image
+  out to both services, as `demo-up.ps1` does, and checks `/readyz`. If the demo is down it
+  stops after the push, and the next `demo-up.ps1` finds the image already there. It can't
+  run Terraform, so a rollout registers new task-definition revisions that change only the
+  image (`infra/ci/deploy.sh`). A deployment left unapproved does nothing.
+- **Terraform plan** (`.github/workflows/terraform-plan.yml`). On a pull request that
+  changes `infra/base` or `infra/demo`, it plans both roots with the read-only plan role.
+  The logs of a public repository are public, so Terraform's output, which includes the
+  account ID and the SES recipients, stays out of them. The job summary lists only the
+  resources that would change. While the demo is down, the demo plan shows its 46 resources
+  to add.
+
+**Setting them up, once.** Run these from the repository root after `aws login`. Repository
+settings are the owner's to change, so these are done by hand.
+
+1. Create the `production` environment. In the repository's **Settings → Environments**, add
+   `production`, tick **Required reviewers** and add yourself, and under **Deployment
+   branches and tags** choose **Selected branches and tags** and add `main`.
+2. Give the workflows the role ARNs and the values from `terraform.tfvars`. The ARNs contain
+   the account ID, so they go in as secrets, which GitHub masks in logs:
+
+   ```powershell
+   .\infra\scripts\tf.ps1 base output -raw github_deploy_role_arn | gh secret set AWS_DEPLOY_ROLE_ARN --env production
+   .\infra\scripts\tf.ps1 base output -raw github_plan_role_arn | gh secret set AWS_PLAN_ROLE_ARN
+   gh secret set TF_VAR_SES_VERIFIED_RECIPIENTS   # paste the list as in terraform.tfvars: ["you@example.com"]
+   gh variable set TF_VAR_DOMAIN --body example.com
+   gh variable set API_BASE_URL --body https://api.example.com
+   ```
+
+3. Create a second Cloudflare API token for the plans, with **Zone → Zone → Read** and
+   **Zone → DNS → Read** on the one zone, and store it with
+   `gh secret set CLOUDFLARE_API_TOKEN_READ`. The token in `.env` can edit DNS, and CI only
+   ever needs to read it.
+
+Both roles trust this one repository only, by the subject GitHub puts in its OIDC tokens
+(`github_oidc_subject` in base). New repositories use GitHub's immutable form, which names the
+owner and repository by their permanent IDs as well as their names:
+`repo:simonoconnordev@195565840/briefing-engine@1460610921`. A fork, or the code pushed to a
+new repository, needs that variable set to its own subject and base applied again. Read it with
+`gh api repos/<owner>/<name>/actions/oidc/customization/sub --jq .sub_claim_prefix`.
+
 ## How the pieces fit
 
 - **One image** (`Dockerfile`) runs as `api`, `worker` and one-off `admin` tasks (migrate,
@@ -79,7 +127,7 @@ key printed by `create-key` isn't kept in the logs.
   deploy step and for people.
 - **CI roles** exist in base (`briefing-engine-github-deploy`, `-plan`), trusted only for the
   `production` environment and pull requests of `simonoconnordev/briefing-engine`. The
-  workflows come with the GitHub repository.
+  workflows that use them are described under [GitHub Actions](#github-actions).
 
 ## Known gaps
 

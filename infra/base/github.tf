@@ -1,8 +1,9 @@
 # CI on GitHub Actions assumes these roles through OIDC: no long-lived AWS keys in GitHub.
 #
-# The token's `sub` claim depends on how the job runs:
-#   a job with `environment: production`  ->  repo:<owner/name>:environment:production
-#   a pull_request job                    ->  repo:<owner/name>:pull_request
+# The token's `sub` claim starts with the repository (var.github_oidc_subject) and ends with
+# how the job runs:
+#   a job with `environment: production`  ->  <subject>:environment:production
+#   a pull_request job                    ->  <subject>:pull_request
 # The production environment requires my approval and allows only `main`, so that check
 # happens in GitHub and can't be skipped by a workflow edit.
 
@@ -13,8 +14,8 @@ resource "aws_iam_openid_connect_provider" "github" {
 
 data "aws_iam_policy_document" "github_trust" {
   for_each = {
-    deploy = "repo:${var.github_repository}:environment:production"
-    plan   = "repo:${var.github_repository}:pull_request"
+    deploy = "${var.github_oidc_subject}:environment:production"
+    plan   = "${var.github_oidc_subject}:pull_request"
   }
 
   statement {

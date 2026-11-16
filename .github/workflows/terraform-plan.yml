@@ -1,0 +1,97 @@
+name: Terraform plan
+
+# On pull requests that touch the infrastructure, plans both roots against the real account
+# with the read-only plan role (infra/base/github.tf), so it can never apply anything.
+# Pull requests from forks get no OIDC token and no secrets, so the job is skipped for them.
+#
+# This repository's Actions logs are public. Terraform's own output shows the account ID,
+# ARNs and the SES recipients, so it is kept out of the log. The job summary lists only which
+# resources would change and how. Run `tf.ps1 <root> plan` locally to see the full diff.
+
+on:
+  pull_request:
+    paths:
+      - "infra/base/**"
+      - "infra/demo/**"
+      - ".github/workflows/terraform-plan.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-plan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # to request the OIDC token the plan role is assumed with
+    strategy:
+      fail-fast: false
+      matrix:
+        root: [base, demo]
+    env:
+      ROOT: ${{ matrix.root }}
+      AWS_REGION: eu-west-1
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0"
+      # A Cloudflare token that can only read the zone and its DNS records.
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN_READ }}
+      # The values in infra/base/terraform.tfvars, which isn't committed. Each root ignores
+      # the variables it doesn't declare.
+      TF_VAR_domain: ${{ vars.TF_VAR_DOMAIN }}
+      TF_VAR_ses_verified_recipients: ${{ secrets.TF_VAR_SES_VERIFIED_RECIPIENTS }}
+      # infra/demo needs an image tag; a plan doesn't check that it exists.
+      TF_VAR_image_tag: plan
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.17.0
+          terraform_wrapper: false
+      - id: aws
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: eu-west-1
+          mask-aws-account-id: true
+      - name: Init
+        env:
+          ACCOUNT_ID: ${{ steps.aws.outputs.aws-account-id }}
+        run: |
+          terraform -chdir="infra/$ROOT" init -backend-config="bucket=briefing-engine-tfstate-$ACCOUNT_ID" >init.log ||
+            { cat init.log; exit 1; }
+      - name: Plan
+        run: |
+          if ! terraform -chdir="infra/$ROOT" plan -lock-timeout=5m -no-color -out=tfplan >plan.log 2>plan.err; then
+            echo "::error::terraform plan failed for infra/$ROOT. Its errors are below; the rest of its output is kept out of this public log."
+            cat plan.err
+            exit 1
+          fi
+      - name: Summarise
+        run: |
+          terraform -chdir="infra/$ROOT" show -json tfplan >plan.json
+          jq -r --arg root "$ROOT" '
+            [.resource_changes[]? | select(.change.actions != ["no-op"] and .change.actions != ["read"])
+              | {address, action: (.change.actions
+                  | if . == ["create"] then "create"
+                    elif . == ["update"] then "update"
+                    elif . == ["delete"] then "destroy"
+                    else "replace" end)}] as $changes
+            | "### infra/\($root)",
+              "",
+              (if ($changes | length) == 0 then "No changes."
+               else ([$changes[] | select(.action == "create")] | length) as $add
+                 | ([$changes[] | select(.action == "update")] | length) as $change
+                 | ([$changes[] | select(.action == "destroy")] | length) as $destroy
+                 | ([$changes[] | select(.action == "replace")] | length) as $replace
+                 | "\($add) to add, \($change) to change, \($destroy) to destroy, \($replace) to replace.",
+                   "",
+                   ($changes[] | "- \(.action) `\(.address)`")
+               end)
+          ' plan.json | tee -a "$GITHUB_STEP_SUMMARY"
