@@ -49,6 +49,14 @@ Later changes to base: `.\infra\scripts\tf.ps1 base plan`, then `... base apply`
 The demo database is fresh each time (no final snapshot): profiles and subscriptions are set
 up through the API. My real reading history stays in the local Postgres.
 
+**The first briefing comes by itself.** The worker sends each day's briefing once the
+user's send time has passed (06:30 by default), and a demo usually starts later than that.
+So a build is queued as soon as the profile has its first subscription. It waits up to
+10 minutes for that profile's fetches and scores, then sends with whatever is ready, and
+that is the day's only briefing. Add all the subscriptions within those 10 minutes. To build
+it by hand instead, create the user with `--send-time 23:55`, wait until `GET /v1/articles`
+shows scores, then call `POST /v1/briefings`.
+
 `run-admin.ps1 -Secret` deletes the task's CloudWatch log stream after showing it, so an API
 key printed by `create-key` isn't kept in the logs.
 
