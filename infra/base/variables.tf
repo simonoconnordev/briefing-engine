@@ -36,8 +36,15 @@ variable "dmarc_report_address" {
   default     = ""
 }
 
-variable "github_repository" {
-  description = "owner/name of the GitHub repository whose workflows may assume the CI roles."
+variable "github_oidc_subject" {
+  description = <<-EOT
+    The start of the `sub` claim in the GitHub OIDC tokens of the repository whose workflows
+    may assume the CI roles. This repository uses GitHub's immutable form,
+    repo:<owner>@<owner id>/<name>@<repository id>, which names the account and repository by
+    their permanent IDs, so a deleted repository re-created under the same name can't inherit
+    the roles. Read it with:
+      gh api repos/<owner>/<name>/actions/oidc/customization/sub --jq .sub_claim_prefix
+  EOT
   type        = string
-  default     = "simonoconnordev/briefing-engine"
+  default     = "repo:simonoconnordev@195565840/briefing-engine@1460610921"
 }

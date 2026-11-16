@@ -101,8 +101,12 @@ settings are the owner's to change, so these are done by hand.
    `gh secret set CLOUDFLARE_API_TOKEN_READ`. The token in `.env` can edit DNS, and CI only
    ever needs to read it.
 
-The deploy role trusts `simonoconnordev/briefing-engine` only (`github_repository` in base).
-A fork or a renamed repository needs that variable changed and base applied again.
+Both roles trust this one repository only, by the subject GitHub puts in its OIDC tokens
+(`github_oidc_subject` in base). New repositories use GitHub's immutable form, which names the
+owner and repository by their permanent IDs as well as their names:
+`repo:simonoconnordev@195565840/briefing-engine@1460610921`. A fork, or the code pushed to a
+new repository, needs that variable set to its own subject and base applied again. Read it with
+`gh api repos/<owner>/<name>/actions/oidc/customization/sub --jq .sub_claim_prefix`.
 
 ## How the pieces fit
 
