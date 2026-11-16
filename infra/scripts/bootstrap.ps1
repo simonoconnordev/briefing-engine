@@ -68,6 +68,14 @@ function Get-RemoteState {
     }
 }
 
+function Test-SameState {
+    # True when two states record the same resources and outputs. Lineage and serial aren't
+    # compared: Terraform 1.17 gives the copy in S3 a new lineage and starts its serial at 1.
+    param([Parameter(Mandatory)]$A, [Parameter(Mandatory)]$B)
+    $json = { param($s) ConvertTo-Json -InputObject @($s.resources, $s.outputs) -Depth 100 -Compress }
+    (& $json $A) -eq (& $json $B)
+}
+
 function Remove-LocalState {
     Remove-Item (Join-Path $dir 'terraform.tfstate*') -Force -ErrorAction SilentlyContinue
 }
@@ -98,7 +106,7 @@ if ($hasRemote -and -not $hasLocal) {
 
 if ($hasRemote -and $hasLocal) {
     $remote = Get-RemoteState
-    if ($local.lineage -eq $remote.lineage -and $local.serial -eq $remote.serial) {
+    if (Test-SameState $local $remote) {
         Write-Host 'The state had already been moved to S3; removing the local copy.'
         Remove-LocalState
         Write-Host 'Done. Next: .\infra\scripts\put-secrets.ps1'
@@ -106,7 +114,7 @@ if ($hasRemote -and $hasLocal) {
     }
     throw @"
 base's state exists both in s3://$bucket/$stateKey and in $localState, and they differ
-(local serial $($local.serial), S3 serial $($remote.serial)). Bootstrap won't choose between them.
+(they record different resources or outputs). Bootstrap won't choose between them.
 Compare the two, keep the one that matches what's in AWS, and move the other out of the way.
 "@
 }
@@ -143,7 +151,7 @@ Invoke-Native terraform "-chdir=$dir" init -input=false -migrate-state -force-co
 
 Write-Host '3/3  Checking the copy in S3, then removing the local state...'
 $remote = Get-RemoteState
-if ($local.lineage -ne $remote.lineage -or $local.serial -ne $remote.serial) {
+if (-not (Test-SameState $local $remote)) {
     throw "The state in S3 doesn't match $localState. The local copy is kept; run bootstrap again."
 }
 Remove-LocalState
