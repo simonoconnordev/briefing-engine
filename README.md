@@ -6,6 +6,15 @@ A multi-user news-ingestion and LLM-scoring service: it fetches feeds politely, 
 
 Planned stack: Python, FastAPI, PostgreSQL, a Postgres-backed job queue and worker, Docker, GitHub Actions, AWS (ECS Fargate, RDS), Anthropic API.
 
+## Read the write-up
+
+I wrote up the project as a four-part guide on my website, Endpoint 51. Each part follows on from the one before:
+
+1. [How I built Briefing Engine](https://www.endpoint51.com/briefing-engine/): why I built a second daily AI news briefing when Horizon already sent me one, and how the project took shape.
+2. [Inside Briefing Engine](https://www.endpoint51.com/briefing-engine/inside/): one article followed from a publisher's feed through scoring and selection to a reader's inbox, and why each step is built the way it is.
+3. [Running Briefing Engine locally](https://www.endpoint51.com/briefing-engine/running-locally/): installing it on Windows, starting Postgres and Mailpit, and reading the first briefing in Mailpit.
+4. [Briefing Engine's first AWS deployment](https://www.endpoint51.com/briefing-engine/first-aws-deployment/): what the first deployment to AWS revealed, up to the first briefing reaching Gmail.
+
 ## Run it locally
 
 **Prerequisites:** Docker Desktop (on Windows, with WSL 2) and [uv](https://docs.astral.sh/uv/). uv installs Python 3.14 for the project, so your system Python doesn't matter.
