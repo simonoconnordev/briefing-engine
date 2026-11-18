@@ -102,13 +102,21 @@ echo "Waiting for the services to settle ..."
 aws ecs wait services-stable --cluster "$cluster" --services api worker
 
 # A failed rollout is undone by the circuit breaker, and a rolled-back service is stable too,
-# so check that the new revision is the one running.
+# so check that the new revision is the one running. ECS can mark a rollout COMPLETED some
+# time after the service is stable (25 seconds after the wait returned, for the worker on
+# 18 November), so a rollout still IN_PROGRESS is waited for, up to 10 minutes.
 for service in api worker; do
-    read -r running state < <(aws ecs describe-services --cluster "$cluster" --services "$service" \
-        --query 'services[0].deployments[?status==`PRIMARY`] | [0].[taskDefinition, rolloutState]' \
-        --output text)
-    [[ $running == "${next[$service]}" && $state == COMPLETED ]] ||
-        fail "The $service service didn't take the new image (rollout state: $state). ECS rolled it back to the previous one."
+    for _ in $(seq 60); do
+        read -r running state < <(aws ecs describe-services --cluster "$cluster" --services "$service" \
+            --query 'services[0].deployments[?status==`PRIMARY`] | [0].[taskDefinition, rolloutState]' \
+            --output text)
+        [[ $state == IN_PROGRESS ]] || break
+        sleep 10
+    done
+    [[ $running == "${next[$service]}" ]] ||
+        fail "The $service service is running ${running##*/}, not the new revision. ECS rolled it back to the previous one."
+    [[ $state == COMPLETED ]] ||
+        fail "The $service service's rollout of the new revision ended as $state, not COMPLETED, after 10 minutes. Check its events in the ECS console."
 done
 note "Rolled out \`$tag\` to the api and worker services."
 
