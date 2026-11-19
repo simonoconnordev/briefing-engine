@@ -1111,7 +1111,7 @@ Built 2026-11-09. Where the code settles or differs from this plan:
 - **Scope:** shadow mode next to Horizon for 7 days, the Haiku-vs-Sonnet scoring evaluation (§7.1, Q14), the cost comparison, and fixes for weaknesses the reading log has found.
 
 **Definition of done for stage 1** (checked at the end of checkpoint 1.4):
-- 7 days in a row with the briefing in my inbox by 06:30, at quality I judge equal to or better than Horizon's, recorded in the reading log.
+- 7 days in a row with the briefing in my inbox by 06:30, at quality I judge equal to or better than Horizon's, recorded in the reading log. For the shadow week the inbox is Mailpit (<http://127.0.0.1:8025>), where the scheduled local run sends it (decided 2026-11-19).
 - `run-daily` re-run for the same date: 0 LLM calls, 0 emails sent (an automated test, and checked on the real data).
 - Regression tests exist for all three Horizon bug classes and pass in CI.
 - Cost per briefing is measured and compared with Horizon's.
